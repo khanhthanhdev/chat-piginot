@@ -4631,13 +4631,13 @@ export function FloorplanPanel({
   const hasAmbientBuildingLevel = useScene((state) => {
     if (levelId || !ambientBuildingId) return false
     const building = state.nodes[ambientBuildingId]
-    if (!building || building.type !== 'building') return false
+    if (building?.type !== 'building') return false
     return building.children.some((cid) => state.nodes[cid]?.type === 'level')
   })
   const elevators = useScene(
     useShallow((state) => {
       const building = currentBuildingId ? state.nodes[currentBuildingId] : null
-      if (!building || building.type !== 'building') {
+      if (building?.type !== 'building') {
         return [] as ElevatorNode[]
       }
 
@@ -8221,7 +8221,7 @@ export function FloorplanPanel({
     }
 
     const wallNode = useScene.getState().nodes[wallId as AnyNodeId]
-    if (!wallNode || wallNode.type !== 'wall') {
+    if (wallNode?.type !== 'wall') {
       return
     }
 
@@ -8294,7 +8294,7 @@ export function FloorplanPanel({
   const emitFloorplanCeilingLeave = useCallback((ceilingId: string | null) => {
     if (!ceilingId) return
     const ceilingNode = useScene.getState().nodes[ceilingId as AnyNodeId]
-    if (!ceilingNode || ceilingNode.type !== 'ceiling') return
+    if (ceilingNode?.type !== 'ceiling') return
 
     emitter.emit('ceiling:leave', {
       node: ceilingNode,
@@ -10198,7 +10198,7 @@ export function FloorplanPanel({
             }
 
             const buildingNode = sceneNodes[nextBuildingId]
-            if (!buildingNode || buildingNode.type !== 'building') {
+            if (buildingNode?.type !== 'building') {
               return null
             }
 
@@ -10438,7 +10438,7 @@ export function FloorplanPanel({
           </form>
         )}
 
-        {(!levelNode || levelNode.type !== 'level') && !hasAmbientBuildingLevel ? (
+        {levelNode?.type !== 'level' && !hasAmbientBuildingLevel ? (
           <div className="flex h-full items-center justify-center px-6 text-center text-muted-foreground text-sm">
             Switch to a building level to view and edit the floorplan.
           </div>

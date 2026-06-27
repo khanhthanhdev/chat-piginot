@@ -135,7 +135,7 @@ export const DoorSystem = () => {
 
     dirtyNodes.forEach((id) => {
       const node = nodes[id]
-      if (!node || node.type !== 'door') return
+      if (node?.type !== 'door') return
       dirtyDoorIds.push(id as AnyNodeId)
     })
 
@@ -157,7 +157,7 @@ export const DoorSystem = () => {
       }
 
       const node = nodes[id]
-      if (!node || node.type !== 'door') continue
+      if (node?.type !== 'door') continue
       const mesh = sceneRegistry.nodes.get(id) as THREE.Mesh
       if (!mesh) continue // Keep dirty until mesh mounts
 

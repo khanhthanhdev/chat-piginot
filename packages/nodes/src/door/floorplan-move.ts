@@ -240,7 +240,7 @@ export const doorFloorplanMoveTarget: FloorplanMoveTarget<DoorNode> = ({ node })
       // nothing.
       if (!onWall) return false
       const live = useScene.getState().nodes[node.id as AnyNodeId] as DoorNode | undefined
-      if (!live || live.type !== 'door') return false
+      if (live?.type !== 'door') return false
       // Block commit if the door overlaps another wall child — UNLESS Shift
       // force-places (same `placeable` rule as the 3D move + the shared
       // `resolveOpeningPlacement`).

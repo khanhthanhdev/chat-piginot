@@ -166,7 +166,7 @@ export const FloorplanRegistryLayer = memo(function FloorplanRegistryLayer() {
   const ambientLevelId = useMemo<AnyNodeId | null>(() => {
     if (selectedLevelId || !ambientBuildingSourceId) return null
     const building = nodes[ambientBuildingSourceId]
-    if (!building || building.type !== 'building') return null
+    if (building?.type !== 'building') return null
     let zero: AnyNodeId | null = null
     let lowestId: AnyNodeId | null = null
     let lowestIdx = Number.POSITIVE_INFINITY

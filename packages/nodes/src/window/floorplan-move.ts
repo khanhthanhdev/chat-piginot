@@ -225,7 +225,7 @@ export const windowFloorplanMoveTarget: FloorplanMoveTarget<WindowNode> = ({ nod
       // reverts to the pre-move snapshot. Matches the 3D move.
       if (!onWall) return false
       const live = useScene.getState().nodes[node.id as AnyNodeId] as WindowNode | undefined
-      if (!live || live.type !== 'window') return false
+      if (live?.type !== 'window') return false
       // Block on overlap UNLESS Shift force-places — same `placeable` rule as
       // the 3D move + the shared `resolveOpeningPlacement`.
       const collides = hasWallChildOverlap(

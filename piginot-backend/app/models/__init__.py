@@ -1,0 +1,2 @@
+from .ginot import GINOTModel
+

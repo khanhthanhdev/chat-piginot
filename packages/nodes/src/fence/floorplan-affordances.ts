@@ -1,0 +1,212 @@
+import {
+  type AnyNode,
+  type AnyNodeId,
+  type FenceNode,
+  type FloorplanAffordance,
+  type FloorplanAffordanceSession,
+  getMaxWallCurveOffset,
+  getWallChordFrame,
+  normalizeWallCurveOffset,
+  useLiveNodeOverrides,
+  useScene,
+  type WallNode,
+} from '@pascal-app/core'
+import {
+  alignFloorplanDraftPoint,
+  type FencePlanPoint,
+  getSegmentGridStep,
+  isSegmentLongEnough,
+  snapBuildingLocalToWorldGrid,
+  snapFenceDraftPoint,
+  snapScalarToGrid,
+  useAlignmentGuides,
+  WALL_GRID_STEP,
+} from '@pascal-app/editor'
+
+/**
+ * Floor-plan 2D drag affordances for fence — sister to the 3D
+ * `actions/move-endpoint.ts` `DragAction`. Same legacy interaction
+ * (endpoint snap pipeline + linked-fence cascade via `endpoint-match`
+ * with an epsilon, ALT-detach), driven from SVG pointer events instead
+ * of R3F grid events.
+ *
+ * Why not share the `DragAction`? The 3D code goes through
+ * `createDragSession` which assumes a `SceneApi`-style helper bag
+ * (snapshot, restoreAll, pauseHistory, resumeHistory). The 2D registry
+ * layer owns those semantics directly via the dispatcher's snapshot +
+ * pause/resume dance, so the affordance only needs the pure mutation
+ * logic. The shape is intentionally close to the legacy fence drag —
+ * 1:1 behaviorally.
+ */
+
+const LINKED_FENCE_ENDPOINT_EPSILON = 0.025
+
+type FenceEndpointPayload = { fenceId: AnyNodeId; endpoint: 'start' | 'end' }
+
+function pointsNearlyEqual(a: FencePlanPoint, b: FencePlanPoint): boolean {
+  return (
+    Math.abs(a[0] - b[0]) <= LINKED_FENCE_ENDPOINT_EPSILON &&
+    Math.abs(a[1] - b[1]) <= LINKED_FENCE_ENDPOINT_EPSILON
+  )
+}
+
+function collectLevel(
+  nodes: Record<AnyNodeId, AnyNode>,
+  parentId: string | null,
+): { walls: WallNode[]; fences: FenceNode[] } {
+  const walls: WallNode[] = []
+  const fences: FenceNode[] = []
+  for (const node of Object.values(nodes)) {
+    if (!node) continue
+    if ((node.parentId ?? null) !== parentId) continue
+    if (node.type === 'wall') walls.push(node as WallNode)
+    else if (node.type === 'fence') fences.push(node as FenceNode)
+  }
+  return { walls, fences }
+}
+
+function collectLinkedFences(
+  fences: FenceNode[],
+  draggedFenceId: AnyNodeId,
+  linkedPoint: FencePlanPoint,
+): Array<{ id: AnyNodeId; start: FencePlanPoint; end: FencePlanPoint }> {
+  const out: Array<{ id: AnyNodeId; start: FencePlanPoint; end: FencePlanPoint }> = []
+  for (const fence of fences) {
+    if (fence.id === draggedFenceId) continue
+    if (!pointsNearlyEqual(fence.start, linkedPoint) && !pointsNearlyEqual(fence.end, linkedPoint))
+      continue
+    out.push({
+      id: fence.id,
+      start: [fence.start[0], fence.start[1]],
+      end: [fence.end[0], fence.end[1]],
+    })
+  }
+  return out
+}
+
+/**
+ * Fence curve sagitta drag — 1:1 mirror of `wallCurveAffordance`. Drag
+ * projects the pointer onto the chord normal to compute `curveOffset`,
+ * snaps to grid (Shift bypasses), clamps to `getMaxWallCurveOffset`,
+ * normalizes via `normalizeWallCurveOffset`. Same single-undo dance — the
+ * dispatcher handles snapshot / pause / resume around `apply`. Lives in
+ * the same file as the endpoint affordance to keep the two fence
+ * floor-plan drags side-by-side (both publish to `useLiveNodeOverrides`,
+ * both committed on pointer-up).
+ */
+export const fenceCurveAffordance: FloorplanAffordance<FenceNode> = {
+  start({ node }): FloorplanAffordanceSession {
+    const chord = getWallChordFrame(node)
+    const maxOffset = getMaxWallCurveOffset(node)
+    const fenceId = node.id as AnyNodeId
+    let lastCurveOffset = node.curveOffset ?? 0
+
+    return {
+      affectedIds: [node.id],
+      apply({ planPoint, modifiers }) {
+        const snapStep = getSegmentGridStep()
+        const x = modifiers.shiftKey ? planPoint[0] : snapScalarToGrid(planPoint[0], snapStep)
+        const y = modifiers.shiftKey ? planPoint[1] : snapScalarToGrid(planPoint[1], snapStep)
+
+        const offsetFromMidpoint = -(
+          (x - chord.midpoint.x) * chord.normal.x +
+          (y - chord.midpoint.y) * chord.normal.y
+        )
+        const snappedOffset = modifiers.shiftKey
+          ? offsetFromMidpoint
+          : snapScalarToGrid(offsetFromMidpoint, snapStep)
+        const nextCurveOffset = normalizeWallCurveOffset(
+          node,
+          Math.max(-maxOffset, Math.min(maxOffset, snappedOffset)),
+        )
+        lastCurveOffset = nextCurveOffset
+
+        useLiveNodeOverrides.getState().set(fenceId, { curveOffset: nextCurveOffset })
+        useScene.getState().markDirty(fenceId)
+      },
+      canCommit() {
+        return true
+      },
+      commit() {
+        useScene.getState().updateNodes([{ id: fenceId, data: { curveOffset: lastCurveOffset } }])
+        useLiveNodeOverrides.getState().clear(fenceId)
+      },
+    }
+  },
+}
+
+export const fenceMoveEndpointAffordance: FloorplanAffordance<FenceNode> = {
+  start({ node, payload, nodes }): FloorplanAffordanceSession {
+    const { endpoint } = payload as FenceEndpointPayload
+    const originalStart: FencePlanPoint = [node.start[0], node.start[1]]
+    const originalEnd: FencePlanPoint = [node.end[0], node.end[1]]
+    const originalMovingPoint = endpoint === 'start' ? originalStart : originalEnd
+    const fixedPoint: FencePlanPoint = endpoint === 'start' ? originalEnd : originalStart
+
+    const parentId = node.parentId ?? null
+    const { walls, fences } = collectLevel(nodes, parentId)
+    const linkedOriginals = collectLinkedFences(fences, node.id, originalMovingPoint)
+
+    const affectedIds: AnyNodeId[] = [node.id, ...linkedOriginals.map((l) => l.id)]
+
+    return {
+      affectedIds,
+      apply({ planPoint, modifiers }) {
+        // Re-collect siblings each tick: the user might be dragging a
+        // fence whose sibling positions changed (the dragged fence
+        // itself is excluded via `ignoreFenceIds`).
+        const sceneNodes = useScene.getState().nodes
+        const { walls: nextWalls, fences: nextFences } = collectLevel(sceneNodes, parentId)
+        // Endpoint move = grid snap only; the 45°-from-start angle
+        // snap is draft-only. Shift bypasses grid, magnetic, and alignment snap.
+        const snapped = snapFenceDraftPoint({
+          point: planPoint as FencePlanPoint,
+          walls: nextWalls,
+          fences: nextFences,
+          ignoreFenceIds: [node.id],
+          bypassSnap: modifiers.shiftKey,
+          magnetic: !modifiers.shiftKey,
+          gridSnap: (p) => snapBuildingLocalToWorldGrid(p, WALL_GRID_STEP) as FencePlanPoint,
+        })
+        // Figma-style alignment on the dragged endpoint — snaps it onto
+        // another object's edge / wall face and publishes a guide, matching
+        // the 3D fence endpoint action. The dragged fence and its linked
+        // siblings (which cascade with the endpoint) are excluded from the
+        // candidate pool. Alt is reserved for detach here, NOT bypass.
+        const aligned = alignFloorplanDraftPoint(snapped, {
+          bypass: modifiers.shiftKey,
+          excludeIds: [node.id, ...linkedOriginals.map((l) => l.id)],
+        }) as FencePlanPoint
+        const nextStart = endpoint === 'start' ? aligned : fixedPoint
+        const nextEnd = endpoint === 'end' ? aligned : fixedPoint
+
+        const linkedUpdates = modifiers.altKey
+          ? []
+          : linkedOriginals.map((l) => ({
+              id: l.id,
+              start: pointsNearlyEqual(l.start, originalMovingPoint) ? aligned : l.start,
+              end: pointsNearlyEqual(l.end, originalMovingPoint) ? aligned : l.end,
+            }))
+
+        useScene.getState().updateNodes([
+          { id: node.id, data: { start: nextStart, end: nextEnd } },
+          ...linkedUpdates.map((u) => ({
+            id: u.id,
+            data: { start: u.start, end: u.end },
+          })),
+        ])
+      },
+      canCommit() {
+        // Pointer-up always runs canCommit — drop the alignment guide here
+        // so it doesn't linger after a commit / reject.
+        useAlignmentGuides.getState().clear()
+        const finalFence = useScene.getState().nodes[node.id] as FenceNode | undefined
+        return (
+          !!finalFence &&
+          finalFence.type === 'fence' &&
+          isSegmentLongEnough(finalFence.start, finalFence.end)
+        )
+      },
+    }
+  },
+}

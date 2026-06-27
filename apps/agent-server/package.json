@@ -1,0 +1,24 @@
+{
+  "name": "agent-server",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "mastra dev",
+    "build": "mastra build",
+    "start": "mastra start",
+    "test": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mastra/core": "^1.46.0",
+    "@mastra/mcp": "^1.12.0",
+    "@pascal-app/mcp": "*",
+    "zod": "^4.3.5"
+  },
+  "devDependencies": {
+    "@pascal/typescript-config": "*",
+    "@types/node": "^22.19.12",
+    "mastra": "^1.15.1",
+    "typescript": "6.0.3"
+  }
+}

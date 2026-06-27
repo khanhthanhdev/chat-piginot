@@ -17,6 +17,15 @@ export const ductTerminalParametrics: ParametricDescriptor<DuctTerminalNode> = {
           options: ['floor', 'ceiling', 'wall'],
           display: 'segmented',
         },
+        {
+          key: 'airSpeed',
+          kind: 'number',
+          unit: 'm/s',
+          min: 0.1,
+          max: 20,
+          step: 0.1,
+          visibleIf: (n) => n.terminalType !== 'return-grille',
+        },
       ],
     },
     {

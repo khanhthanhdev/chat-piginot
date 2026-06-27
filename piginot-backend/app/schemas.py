@@ -216,6 +216,12 @@ class ResponseMetadata(BaseModel):
         description="Source of the model used for inference (e.g., 'checkpoint', 'fallback').",
     )
 
+class Grid3D(BaseModel):
+    dimensions: tuple[int, int, int]
+    origin: tuple[float, float, float]
+    spacing: tuple[float, float, float]
+    indices: list[int]
+
 
 class GinotInferenceResponse(BaseModel):
     """Response payload containing CFD simulation results."""
@@ -260,3 +266,4 @@ class GinotInferenceResponse(BaseModel):
         default=None,
         description="Optional path to the generated visualization image showing pressure and velocity distributions.",
     )
+    grid: Grid3D | None = None

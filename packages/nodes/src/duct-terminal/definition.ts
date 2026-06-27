@@ -29,6 +29,7 @@ export const ductTerminalDefinition: NodeDefinition<typeof DuctTerminalNode> = {
     position: [0, 0, 0],
     rotation: 0,
     terminalType: 'supply-register',
+    airSpeed: 1,
     mount: 'floor',
     width: 0.3,
     depth: 0.15,
@@ -63,6 +64,7 @@ export const ductTerminalDefinition: NodeDefinition<typeof DuctTerminalNode> = {
   geometryKey: (n) =>
     JSON.stringify([
       n.terminalType,
+      n.airSpeed,
       n.mount,
       n.width,
       n.depth,

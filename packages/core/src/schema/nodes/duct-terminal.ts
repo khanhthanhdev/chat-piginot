@@ -22,6 +22,7 @@ export const DuctTerminalNode = BaseNode.extend({
   // Yaw in radians.
   rotation: z.number().default(0),
   terminalType: z.enum(['supply-register', 'diffuser', 'return-grille']).default('supply-register'),
+  airSpeed: z.number().positive().default(1),
   // Which surface the terminal mounts on. Drives face orientation and
   // which way the collar (and its port) points.
   mount: z.enum(['floor', 'ceiling', 'wall']).default('floor'),
@@ -45,6 +46,7 @@ export const DuctTerminalNode = BaseNode.extend({
   - position: [x, y, z] level-local meters, center of the face
   - rotation: yaw radians
   - terminalType: supply-register | diffuser | return-grille (grille = return side)
+  - airSpeed: supply air speed in m/s
   - mount: floor | ceiling | wall - face orientation + collar direction
   - width / depth: face size in meters
   - collarShape: round | rect | oval - duct-side collar cross-section

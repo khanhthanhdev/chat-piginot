@@ -26,6 +26,7 @@ def build_inference_response(
     compute_time_ms: float,
     visualization_path: str | None = None,
     inference_id: str | None = None,
+    grid: dict | None = None,
 ) -> GinotInferenceResponse:
     if inference_id is None:
         inference_id = f"ginot_{uuid.uuid4().hex[:8]}"
@@ -40,6 +41,7 @@ def build_inference_response(
         timestamp=int(time.time() * 1000),
         computeTimeMs=compute_time_ms,
         visualizationPath=visualization_path,
+        grid=grid,
     )
 
 

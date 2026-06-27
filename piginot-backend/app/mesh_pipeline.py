@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from .mesh import MeshData, denormalize_points, load_mesh, normalize_mesh, normalize_points, sample_interior_points, sample_surface_points
+from .mesh import MeshData, denormalize_points, load_mesh, normalize_mesh, normalize_points, points_inside_mesh, sample_interior_points, sample_surface_points
 from .schemas import DiffuserInput, MeshInferenceOptions, MeshInferenceRequest
 
 
@@ -41,6 +41,35 @@ class MeshInferenceInputs:
     positions_world: np.ndarray
     sampling: ResolvedSamplingOptions
     diffusers: ResolvedDiffusers
+    grid: dict | None
+
+
+def sample_regular_grid(mesh: MeshData, target_count: int) -> tuple[np.ndarray, dict]:
+    extent = mesh.bounds_max - mesh.bounds_min
+    scale = (target_count / float(np.prod(extent))) ** (1 / 3)
+    dimensions = np.maximum(2, np.floor(extent * scale).astype(int))
+    while int(np.prod(dimensions)) > target_count * 2:
+        # Only shrink axes that stay >= 2; stop if none can be reduced further.
+        reducible = np.where(dimensions > 2, dimensions, -1)
+        if int(reducible.max()) <= 2:
+            break
+        dimensions[int(np.argmax(reducible))] -= 1
+    spacing = extent / dimensions
+    axes = [
+        mesh.bounds_min[i] + spacing[i] * (np.arange(dimensions[i], dtype=np.float32) + 0.5)
+        for i in range(3)
+    ]
+    dense = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    mask = points_inside_mesh(dense, mesh.triangles)
+    indices = np.flatnonzero(mask)
+    if not len(indices):
+        raise ValueError("Regular grid contains no points inside mesh")
+    return dense[mask], {
+        "dimensions": tuple(int(v) for v in dimensions),
+        "origin": tuple(float(v) for v in (mesh.bounds_min + spacing * 0.5)),
+        "spacing": tuple(float(v) for v in spacing),
+        "indices": indices.tolist(),
+    }
 
 
 def resolve_sampling_options(options: MeshInferenceOptions | None) -> ResolvedSamplingOptions:
@@ -68,7 +97,13 @@ def preprocess_mesh_inference(
     diffusers = collapse_diffusers(request.diffusers)
 
     pc_points = sample_surface_points(mesh_norm, sampling.boundary_count, rng)
-    xyt_points = sample_interior_points(mesh_norm, sampling.interior_count, rng)
+    grid = None
+    if request.options.returnGrid3D:
+        positions_world, grid = sample_regular_grid(mesh, sampling.interior_count)
+        xyt_points = normalize_points(positions_world, mesh.center, mesh.scale)
+    else:
+        xyt_points = sample_interior_points(mesh_norm, sampling.interior_count, rng)
+        positions_world = denormalize_points(xyt_points, mesh.center, mesh.scale)
 
     inlet_center_normalized = normalize_points(diffusers.inlet_center_world[None, :], mesh.center, mesh.scale)[0]
     outlet_center_normalized = normalize_points(diffusers.outlet_center_world[None, :], mesh.center, mesh.scale)[0]
@@ -82,9 +117,10 @@ def preprocess_mesh_inference(
         load=torch.from_numpy(load_vector).unsqueeze(0),
         pc=torch.from_numpy(pc_points).unsqueeze(0),
         xyt=torch.from_numpy(xyt_points).unsqueeze(0),
-        positions_world=denormalize_points(xyt_points, mesh.center, mesh.scale),
+        positions_world=positions_world,
         sampling=sampling,
         diffusers=diffusers,
+        grid=grid,
     )
 
 

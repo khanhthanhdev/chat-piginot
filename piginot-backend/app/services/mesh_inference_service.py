@@ -117,4 +117,5 @@ def execute_mesh_inference(
         compute_time_ms=compute_time_ms,
         visualization_path=visualization_path,
         inference_id=inference_id,
+        grid=preprocessed.grid,
     )

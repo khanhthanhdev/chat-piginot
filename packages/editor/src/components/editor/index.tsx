@@ -27,6 +27,12 @@ import {
 } from '../../lib/scene'
 import { initSFXBus } from '../../lib/sfx-bus'
 import useEditor from '../../store/use-editor'
+import {
+  CfdVisualization,
+  ConfiguredCfdAnalysisPanel,
+  cfdTabIcon,
+  useCfdAnalysis,
+} from '../cfd-analysis'
 import { CeilingSelectionAffordanceSystem } from '../systems/ceiling/ceiling-selection-affordance-system'
 import { CeilingSystem } from '../systems/ceiling/ceiling-system'
 import { RoofEditSystem } from '../systems/roof/roof-edit-system'
@@ -166,6 +172,7 @@ export interface EditorProps {
 
   // Command palette fallback when no commands match
   commandPaletteEmptyAction?: CommandPaletteEmptyAction
+  cfdAnalysis?: { apiBaseUrl: string }
 }
 
 function EditorSceneCrashFallback() {
@@ -810,6 +817,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
   sceneReadyKey,
   onSceneReadyChange,
   onThumbnailCapture,
+  showCfdAnalysis,
 }: {
   isVersionPreviewMode: boolean
   isLoading: boolean
@@ -820,6 +828,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
   sceneReadyKey: number
   onSceneReadyChange: (ready: boolean) => void
   onThumbnailCapture?: (blob: Blob, cameraData: SnapshotCameraData) => void
+  showCfdAnalysis: boolean
 }) {
   const viewMode = useEditor((s) => s.viewMode)
   const floorplanPaneRatio = useEditor((s) => s.floorplanPaneRatio)
@@ -944,6 +953,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
               isVersionPreviewMode={isVersionPreviewMode}
               onThumbnailCapture={onThumbnailCapture}
             />
+            {showCfdAnalysis && <CfdVisualization />}
           </Viewer>
         </div>
       </div>
@@ -976,6 +986,7 @@ export default function Editor({
   sitePanelProps,
   extraSidebarPanels,
   commandPaletteEmptyAction,
+  cfdAnalysis,
 }: EditorProps) {
   const isFirstPersonMode = useEditor((s) => s.isFirstPersonMode)
   const isStudioMode = useEditor((s) => s.workspaceMode === 'studio')
@@ -1006,17 +1017,22 @@ export default function Editor({
 
   useEffect(() => {
     useViewer.getState().setProjectId(projectId ?? null)
+    useCfdAnalysis.setState({
+      apiBaseUrl: cfdAnalysis?.apiBaseUrl ?? '',
+      projectId: projectId ?? null,
+    })
 
     return () => {
       useViewer.getState().setProjectId(null)
     }
-  }, [projectId])
+  }, [projectId, cfdAnalysis?.apiBaseUrl])
 
   // Load scene on mount (or when onLoad identity changes, e.g. project switch)
   useEffect(() => {
     let cancelled = false
 
     async function load() {
+      useCfdAnalysis.getState().clear()
       isLoadingSceneRef.current = true
       setHasLoadedInitialScene(false)
       setIsViewerSceneReady(false)
@@ -1165,12 +1181,25 @@ export default function Editor({
       onThumbnailCapture={onThumbnailCapture}
       sceneReadyKey={sceneReadyKey}
       showLoader={showLoader}
+      showCfdAnalysis={Boolean(cfdAnalysis)}
     />
   )
 
   // ── V2 layout ──
   if (layoutVersion === 'v2') {
-    const tabMap = new Map(sidebarTabs?.map((t) => [t.id, t]) ?? [])
+    const configuredTabs: (SidebarTab & { component: React.ComponentType })[] | undefined =
+      cfdAnalysis
+        ? [
+            ...(sidebarTabs ?? []),
+            {
+              id: 'analysis',
+              label: 'Analysis',
+              icon: cfdTabIcon,
+              component: ConfiguredCfdAnalysisPanel,
+            },
+          ]
+        : sidebarTabs
+    const tabMap = new Map(configuredTabs?.map((t) => [t.id, t]) ?? [])
 
     const renderTabContent = (tabId: string) => {
       // Built-in panels
@@ -1188,7 +1217,7 @@ export default function Editor({
     }
 
     const tabBarTabs =
-      sidebarTabs?.map(({ id, label, mobileDefaultSnap, mobileIcon, icon }) => ({
+      configuredTabs?.map(({ id, label, mobileDefaultSnap, mobileIcon, icon }) => ({
         id,
         label,
         mobileDefaultSnap,
@@ -1266,6 +1295,17 @@ export default function Editor({
   const LAYOUT_PADDING = 12
   const LAYOUT_GAP = 12
   const overlayLeft = LAYOUT_PADDING + (isSidebarCollapsed ? 8 : sidebarWidth) + LAYOUT_GAP
+  const configuredExtraPanels = cfdAnalysis
+    ? [
+        ...(extraSidebarPanels ?? []),
+        {
+          id: 'analysis',
+          label: 'Analysis',
+          icon: cfdTabIcon,
+          component: ConfiguredCfdAnalysisPanel,
+        },
+      ]
+    : extraSidebarPanels
 
   return (
     <div className="dark flex h-full w-full gap-3 bg-neutral-100 p-3 text-foreground">
@@ -1293,7 +1333,7 @@ export default function Editor({
             <AppSidebar
               appMenuButton={appMenuButton}
               commandPaletteEmptyAction={commandPaletteEmptyAction}
-              extraPanels={extraSidebarPanels}
+              extraPanels={configuredExtraPanels}
               settingsPanelProps={settingsPanelProps}
               sidebarTop={sidebarTop}
               sitePanelProps={sitePanelProps}

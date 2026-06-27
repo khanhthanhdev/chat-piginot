@@ -148,6 +148,44 @@ class MeshUtilityTests(unittest.TestCase):
         self.assertEqual(preprocessed.sampling.boundary_count, 100)
         self.assertEqual(preprocessed.sampling.interior_count, 12)
 
+    def test_grid_sampling_is_deterministic_and_row_major(self):
+        request = MeshInferenceRequest.model_validate(
+            {
+                "diffusers": [
+                    {"id": "s", "kind": "supply", "center": [0, 0, 0], "direction": [1, 0, 0]},
+                    {"id": "r", "kind": "return", "center": [1, 1, 1]},
+                ],
+                "options": {"quality": "preview", "interiorCount": 64, "returnGrid3D": True},
+            }
+        )
+        first = preprocess_mesh_inference(
+            request, mesh_bytes=_build_cube_stl(), filename="cube.stl", rng=np.random.default_rng(1)
+        )
+        second = preprocess_mesh_inference(
+            request, mesh_bytes=_build_cube_stl(), filename="cube.stl", rng=np.random.default_rng(2)
+        )
+
+        self.assertEqual(first.grid, second.grid)
+        self.assertTrue(np.array_equal(first.positions_world, second.positions_world))
+        self.assertEqual(first.grid["indices"], sorted(first.grid["indices"]))
+        self.assertEqual(len(first.grid["indices"]), len(first.positions_world))
+
+    def test_grid_dimensions_stay_at_least_two(self):
+        request = MeshInferenceRequest.model_validate(
+            {
+                "diffusers": [
+                    {"id": "s", "kind": "supply", "center": [0, 0, 0], "direction": [1, 0, 0]},
+                    {"id": "r", "kind": "return", "center": [1, 1, 1]},
+                ],
+                "options": {"quality": "preview", "interiorCount": 1, "returnGrid3D": True},
+            }
+        )
+        preprocessed = preprocess_mesh_inference(
+            request, mesh_bytes=_build_cube_stl(), filename="cube.stl", rng=np.random.default_rng(0)
+        )
+
+        self.assertTrue(all(dim >= 2 for dim in preprocessed.grid["dimensions"]))
+
 
 class MeshInferenceRouteTests(unittest.TestCase):
     def setUp(self):

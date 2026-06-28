@@ -11,7 +11,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "biome lint",
-    "check-types": "next typegen && tsc --noEmit"
+    "check-types": "next typegen && node_modules/typescript-7/bin/tsc --noEmit"
   },
   "dependencies": {
     "@pascal-app/core": "*",
@@ -39,6 +39,7 @@
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.3",
     "@types/three": "^0.184.0",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "typescript-7": "npm:typescript@7.0.1-rc"
   }
 }

@@ -7,7 +7,7 @@ import {
   sceneRegistry,
   useScene,
 } from '@pascal-app/core'
-import { Canvas, extend, type ThreeToJSXElements, useFrame, useThree } from '@react-three/fiber'
+import { Canvas, extend, type ThreeElement, useFrame, useThree } from '@react-three/fiber'
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef } from 'react'
 import * as THREE from 'three/webgpu'
 import { hasDrawableGeometry } from '../../lib/drawable-geometry'
@@ -31,7 +31,9 @@ import { SelectionManager } from './selection-manager'
 import { ViewerCamera } from './viewer-camera'
 
 declare module '@react-three/fiber' {
-  interface ThreeElements extends ThreeToJSXElements<typeof THREE> {}
+  interface ThreeElements {
+    lineBasicNodeMaterial: ThreeElement<typeof THREE.LineBasicNodeMaterial>
+  }
 }
 
 extend(THREE as any)

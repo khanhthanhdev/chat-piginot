@@ -17,8 +17,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc --build",
-    "dev": "tsc --build --watch",
+    "build": "node_modules/typescript-7/bin/tsc --build",
+    "dev": "node_modules/typescript-7/bin/tsc --build --watch",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
@@ -38,7 +38,8 @@
     "@types/node": "^22",
     "@types/react": "^19.2.2",
     "@types/three": "^0.184.0",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "typescript-7": "npm:typescript@7.0.1-rc"
   },
   "keywords": [
     "3d",

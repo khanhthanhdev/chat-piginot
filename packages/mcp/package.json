@@ -47,8 +47,8 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc --build",
-    "dev": "tsc --build --watch",
+    "build": "node_modules/typescript-7/bin/tsc --build",
+    "dev": "node_modules/typescript-7/bin/tsc --build --watch",
     "start": "bun dist/bin/pascal-mcp.js",
     "test": "bun test",
     "smoke": "bun run scripts/smoke.ts",
@@ -65,7 +65,8 @@
     "@pascal-app/core": "^0.9.1",
     "@pascal/typescript-config": "*",
     "@types/node": "^22.19.20",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "typescript-7": "npm:typescript@7.0.1-rc"
   },
   "keywords": [
     "mcp",

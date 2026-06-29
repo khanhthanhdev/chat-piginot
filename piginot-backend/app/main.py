@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import router as api_router
+from .api_batch import router as api_batch_router
 from .api_mesh import router as api_mesh_router
 from .errors import request_validation_exception_handler
 from .inference import get_inference_runtime
@@ -77,6 +78,7 @@ app.add_middleware(
 app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 
 app.include_router(api_router)
+app.include_router(api_batch_router)
 app.include_router(api_mesh_router)
 
 

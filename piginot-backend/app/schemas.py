@@ -267,3 +267,53 @@ class GinotInferenceResponse(BaseModel):
         description="Optional path to the generated visualization image showing pressure and velocity distributions.",
     )
     grid: Grid3D | None = None
+
+
+class BatchRoom(BaseModel):
+    id: str = Field(..., min_length=1)
+    minimum: tuple[float, float, float]
+    maximum: tuple[float, float, float]
+
+
+class BatchGrid(BaseModel):
+    shape: tuple[int, int, int]
+    origin: tuple[float, float, float]
+    spacing: tuple[float, float, float]
+
+
+class BatchTerminal(BaseModel):
+    id: str = Field(..., min_length=1)
+    role: Literal["supply", "return"]
+    centre: tuple[float, float, float]
+    direction: tuple[float, float, float]
+    faceVelocity: float = Field(..., gt=0)
+
+
+class BatchCandidate(BaseModel):
+    id: str = Field(..., min_length=1)
+    terminals: list[BatchTerminal] = Field(..., min_length=6, max_length=6)
+
+
+class HvacInferenceBatchRequest(BaseModel):
+    room: BatchRoom
+    grid: BatchGrid
+    candidates: list[BatchCandidate] = Field(..., min_length=1, max_length=25)
+
+
+class BatchModelIdentity(BaseModel):
+    id: str
+    version: str
+    source: str
+
+
+class BatchCandidateResult(BaseModel):
+    id: str
+    status: Literal["succeeded", "failed"]
+    velocityMagnitudeBase64: str | None = None
+    error: str | None = None
+
+
+class HvacInferenceBatchResponse(BaseModel):
+    model: BatchModelIdentity
+    grid: BatchGrid
+    candidates: list[BatchCandidateResult]

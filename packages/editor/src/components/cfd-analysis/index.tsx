@@ -12,15 +12,7 @@ import {
 import { useFrame } from '@react-three/fiber'
 import { Activity } from 'lucide-react'
 import { useEffect, useMemo, useRef } from 'react'
-import {
-  BufferGeometry,
-  Color,
-  Float32BufferAttribute,
-  type Group,
-  Quaternion,
-  ShapeUtils,
-  Vector3,
-} from 'three'
+import { BufferGeometry, Color, Float32BufferAttribute, type Group } from 'three'
 import { create } from 'zustand'
 import useEditor from '../../store/use-editor'
 
@@ -115,59 +107,6 @@ function levelOffsets(nodes: Record<string, AnyNode>) {
   return offsets
 }
 
-export function roomStl(polygon: Array<[number, number]>, floorY: number, height: number) {
-  const triangles = ShapeUtils.triangulateShape(
-    polygon.map(([x, z]) => ({ x, y: z })),
-    [],
-  )
-  const faces: Array<
-    [[number, number, number], [number, number, number], [number, number, number]]
-  > = []
-  for (const triangle of triangles) {
-    const a = triangle[0]!
-    const b = triangle[1]!
-    const c = triangle[2]!
-    faces.push(
-      [
-        [polygon[c]![0], floorY, polygon[c]![1]],
-        [polygon[b]![0], floorY, polygon[b]![1]],
-        [polygon[a]![0], floorY, polygon[a]![1]],
-      ],
-      [
-        [polygon[a]![0], floorY + height, polygon[a]![1]],
-        [polygon[b]![0], floorY + height, polygon[b]![1]],
-        [polygon[c]![0], floorY + height, polygon[c]![1]],
-      ],
-    )
-  }
-  polygon.forEach((a, i) => {
-    const b = polygon[(i + 1) % polygon.length]!
-    faces.push(
-      [
-        [a[0], floorY, a[1]],
-        [b[0], floorY, b[1]],
-        [b[0], floorY + height, b[1]],
-      ],
-      [
-        [a[0], floorY, a[1]],
-        [b[0], floorY + height, b[1]],
-        [a[0], floorY + height, a[1]],
-      ],
-    )
-  })
-  return new Blob(
-    [
-      `solid room\n${faces
-        .map(
-          (face) =>
-            `facet normal 0 0 0\nouter loop\n${face.map((v) => `vertex ${v.join(' ')}`).join('\n')}\nendloop\nendfacet`,
-        )
-        .join('\n')}\nendsolid room`,
-    ],
-    { type: 'model/stl' },
-  )
-}
-
 export function validateCfdResponse(value: unknown): CfdResult {
   const result = value as CfdResult
   const count = result?.positions?.length
@@ -197,27 +136,11 @@ export function validateCfdResponse(value: unknown): CfdResult {
   return result
 }
 
-function terminalDirection(node: DuctTerminalNode): [number, number, number] {
-  // Air-out (face-normal) direction in level-local space, matching the node's
-  // mount convention: floor +Y, ceiling -Y (blows down into the room), wall +Z.
-  const direction =
-    node.mount === 'ceiling'
-      ? new Vector3(0, -1, 0)
-      : node.mount === 'wall'
-        ? new Vector3(0, 0, 1)
-        : new Vector3(0, 1, 0)
-  direction.applyQuaternion(new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), node.rotation))
-  return [direction.x, direction.y, direction.z]
-}
-
-const MAX_RATE_LIMIT_RETRIES = 5
-
 async function runRoom(
   apiBaseUrl: string,
   projectId: string | null,
   space: Space,
   signal: AbortSignal,
-  attempt = 0,
 ) {
   const nodes = useScene.getState().nodes as Record<string, AnyNode>
   const offsets = levelOffsets(nodes)
@@ -234,54 +157,142 @@ async function runRoom(
       node.parentId === space.levelId &&
       pointInPolygon([node.position[0], node.position[2]], space.polygon),
   )
-  if (
-    !terminals.some((node) => node.terminalType !== 'return-grille') ||
-    !terminals.some((node) => node.terminalType === 'return-grille')
+  const supplies = terminals.filter((node) => node.terminalType !== 'return-grille')
+  const returns = terminals.filter((node) => node.terminalType === 'return-grille')
+  if (supplies.length !== 3 || returns.length !== 3)
+    throw new Error('HVAC optimization requires exactly three supplies and three returns')
+
+  const xs = space.polygon.map(([x]) => x)
+  const zs = space.polygon.map(([, z]) => z)
+  const minimum: [number, number, number] = [Math.min(...xs), Math.min(...zs), 0]
+  const maximum: [number, number, number] = [Math.max(...xs), Math.max(...zs), height]
+  const length = maximum[0] - minimum[0]
+  const width = maximum[1] - minimum[1]
+  const centreZ = (minimum[1] + maximum[1]) / 2
+  const quality = useCfdAnalysis.getState().quality
+  const shape: [number, number, number] =
+    quality === 'preview' ? [20, 16, 8] : quality === 'high' ? [50, 40, 20] : [40, 32, 16]
+  const spacing: [number, number, number] = [length / shape[0], width / shape[1], height / shape[2]]
+  const terminalSize = (group: DuctTerminalNode[]): [number, number] => [
+    group.reduce((sum, node) => sum + node.width, 0) / group.length,
+    group.reduce((sum, node) => sum + node.depth, 0) / group.length,
+  ]
+  const variableRange = (extent: number, offset = false) =>
+    offset
+      ? { min: -extent / 10, max: extent / 10, step: extent / 10 }
+      : { min: extent / 8, max: extent / 4, step: extent / 16 }
+  const totalFlowM3s = supplies.reduce(
+    (sum, node) => sum + node.airSpeed * node.width * node.depth,
+    0,
   )
-    return null
-  const form = new FormData()
-  form.append('meshFile', roomStl(space.polygon, baseY, height), `${space.id}.stl`)
-  form.append(
-    'diffusers',
-    JSON.stringify(
-      terminals.map((node) => ({
-        id: node.id,
-        kind: node.terminalType === 'return-grille' ? 'return' : 'supply',
-        center: [node.position[0], baseY + node.position[1], node.position[2]],
-        ...(node.terminalType === 'return-grille'
-          ? {}
-          : {
-              direction: terminalDirection(node),
-              airflowRate: (node as DuctTerminalNode & { airSpeed?: number }).airSpeed ?? 1,
-            }),
-      })),
-    ),
-  )
-  form.append(
-    'options',
-    JSON.stringify({ quality: useCfdAnalysis.getState().quality, returnGrid3D: true }),
-  )
-  form.append('context', JSON.stringify({ projectId, levelId: space.levelId, zoneId: space.id }))
-  const response = await fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/hvac-inference-mesh`, {
+  const response = await fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs`, {
     method: 'POST',
-    body: form,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      room: { id: `${projectId ?? 'project'}:${space.id}`, minimum, maximum },
+      installationLines: {
+        supply: {
+          start: [minimum[0], centreZ - width / 6, height],
+          end: [maximum[0], centreZ - width / 6, height],
+          offsetDirection: [0, 1, 0],
+        },
+        return: {
+          start: [minimum[0], centreZ + width / 6, height],
+          end: [maximum[0], centreZ + width / 6, height],
+          offsetDirection: [0, 1, 0],
+        },
+      },
+      terminalDimensions: { supply: terminalSize(supplies), return: terminalSize(returns) },
+      directions: { supply: [0, 0, -1], return: [0, 0, 1] },
+      totalFlowM3s,
+      minimumClearanceM: 0.1,
+      candidateLimit: 100,
+      variables: {
+        supplySpacingM: variableRange(length),
+        supplyOffsetM: variableRange(width, true),
+        returnSpacingM: variableRange(length),
+        returnOffsetM: variableRange(width, true),
+      },
+      grid: {
+        shape,
+        origin: [minimum[0] + spacing[0] / 2, minimum[1] + spacing[1] / 2, spacing[2] / 2],
+        spacing,
+        occupiedPlaneZ: Math.min(1.5, height),
+      },
+    }),
     signal,
   })
-  if (response.status === 429) {
-    if (attempt >= MAX_RATE_LIMIT_RETRIES)
-      throw new Error('Rate limited — too many retries, try again later')
-    const delay = Number(response.headers.get('retry-after') ?? 1) * 1000
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, delay)
-      signal.addEventListener('abort', () => {
-        clearTimeout(timer)
-        reject(signal.reason)
-      })
-    })
-    return runRoom(apiBaseUrl, projectId, space, signal, attempt + 1)
-  }
   if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`)
-  return { levelId: space.levelId, baseY, result: validateCfdResponse(await response.json()) }
+  const { runId } = (await response.json()) as { runId: string }
+  signal.addEventListener(
+    'abort',
+    () => {
+      void fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs/${runId}/cancel`, {
+        method: 'POST',
+      })
+    },
+    { once: true },
+  )
+  while (true) {
+    const statusResponse = await fetch(
+      `${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs/${runId}/status`,
+      { signal },
+    )
+    if (!statusResponse.ok) throw new Error(await statusResponse.text())
+    const status = (await statusResponse.json()) as { status: string; errorSummary?: string }
+    if (status.status === 'failed' || status.status === 'canceled')
+      throw new Error(status.errorSummary ?? `Optimization ${status.status}`)
+    if (status.status === 'completed') break
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 250)
+      signal.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(timer)
+          reject(signal.reason)
+        },
+        { once: true },
+      )
+    })
+  }
+  const rankingResponse = await fetch(
+    `${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs/${runId}/ranking`,
+    { signal },
+  )
+  if (!rankingResponse.ok) throw new Error(await rankingResponse.text())
+  const [best] = (await rankingResponse.json()) as Array<{ id: string }>
+  if (!best) throw new Error('Optimization returned no ranked candidate')
+  const fieldResponse = await fetch(
+    `${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs/${runId}/candidates/${best.id}/field`,
+    { signal },
+  )
+  if (!fieldResponse.ok) throw new Error(await fieldResponse.text())
+  const speed = Array.from(new Float32Array(await fieldResponse.arrayBuffer()))
+  const positions: [number, number, number][] = []
+  for (let x = 0; x < shape[0]; x++)
+    for (let z = 0; z < shape[1]; z++)
+      for (let y = 0; y < shape[2]; y++)
+        positions.push([
+          minimum[0] + spacing[0] * (x + 0.5),
+          baseY + spacing[2] * (y + 0.5),
+          minimum[1] + spacing[1] * (z + 0.5),
+        ])
+  return {
+    levelId: space.levelId,
+    baseY,
+    result: validateCfdResponse({
+      positions,
+      velocities: positions.map(() => [0, 0, 0]),
+      pressure: positions.map(() => 0),
+      speed,
+      grid: {
+        dimensions: [shape[0], shape[2], shape[1]],
+        origin: [minimum[0] + spacing[0] / 2, baseY + spacing[2] / 2, minimum[1] + spacing[1] / 2],
+        spacing: [spacing[0], spacing[2], spacing[1]],
+        indices: positions.map((_, index) => index),
+      },
+    }),
+  }
 }
 
 export function CfdAnalysisPanel({

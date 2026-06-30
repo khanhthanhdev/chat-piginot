@@ -18,6 +18,9 @@ candidate status, and raw velocity magnitude.
 `apps/editor` calls only the agent server. Mastra uses REST for workflow
 prediction; conversational diagnostics may use PiGINOT through MCP.
 
+The analytic six-terminal implementation is a fail-closed test fixture.
+Production requires a separately supplied real 3+3 checkpoint adapter.
+
 ## Consequences
 
 - Engineering values have one deterministic owner.
@@ -25,3 +28,5 @@ prediction; conversational diagnostics may use PiGINOT through MCP.
 - Editor chat and structured triggers execute the same workflow.
 - Legacy PiGINOT endpoints can remain during migration without becoming
   optimizer dependencies.
+- Local LibSQL remains the only workflow snapshot store; JSON and filesystem
+  artifacts remain the only run-data store.

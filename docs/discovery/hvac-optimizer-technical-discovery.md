@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Historical — superseded by manager PRD v1.0 |
+| Status | Historical — superseded by canonical PRD v2.0 |
 | Discovery date | 2026-06-28 |
 | Superseded | 2026-06-29 |
 | Intended implementation team | 2–3 engineers plus a model owner |
@@ -25,20 +25,20 @@ The manager later replaced that scope with the narrower velocity-only MVP in
 
 ## Supersession map
 
-The following discovery choices no longer apply to the MVP:
+The following discovery choices no longer apply to the active contract:
 
 | Historical choice | Current decision |
 | --- | --- |
-| Current PiGINOT checkpoint or retrained model | Deterministic analytical source/sink predictor |
-| Independent 3+3 terminals | Fixed 4+4 terminals in centred 2×2 groups |
+| Current PiGINOT checkpoint or retrained model | Real 3+3 adapter deferred; analytic fixture is opt-in and fail-closed |
+| Independent arbitrary terminals | Fixed 3+3 terminals on two directed installation lines |
 | Variable terminal area | Fixed terminal size |
 | User-defined occupied volume | Fixed occupied plane at `z = 1.5 m` |
 | Threshold-first ranking | PRD weighted score plus Pareto set |
 | Seeded Latin hypercube | Deterministic bounded candidate generation; exact search implementation belongs to M2 |
-| Durable Mastra workflow | Sequential in-process typed workflow |
+| Durable Mastra workflow | Seven typed stages with local LibSQL snapshots and resumable artifacts |
 | Baseline comparison and scene apply | Not required by the current PRD |
 | Pressure visualization | Velocity magnitude only |
-| External model-validation gate | Synthetic, golden, and invariance tests; no physical-validation claim |
+| External model-validation gate | Still required before production or physical-validation claims |
 
 Repository findings below remain useful only as evidence about the existing
 checkpoint and editor integration. They do not change the current scope.
@@ -122,9 +122,9 @@ It does not contain:
 - Contaminant concentration.
 - Model confidence or out-of-domain status.
 
-### Existing editor integration
+### Discovery-time editor integration
 
-`packages/editor/src/components/cfd-analysis/index.tsx` already:
+At discovery time, `packages/editor/src/components/cfd-analysis/index.tsx`:
 
 - Builds an empty prismatic room STL from the room polygon and height.
 - Reads duct-terminal nodes from the scene.
@@ -132,16 +132,20 @@ It does not contain:
 - Calls `POST /api/hvac-inference-mesh`.
 - Renders velocity and pressure results.
 
-Current limitations:
+Limitations found at discovery time:
 
 - Furniture, openings, and internal obstacles are excluded from the generated room mesh.
 - `airflowRate` in the backend API is actually interpreted as speed in m/s.
 - The editor calls the model backend directly.
 - No optimization workflow exists.
 
-### Model fallback
+### Discovery-time model fallback
 
-The backend defaults `GINOT_ALLOW_FALLBACK_MODEL` to true. When checkpoint loading fails, it silently uses `AnalyticFallbackGINOT`, which produces synthetic smooth fields and is explicitly not CFD-accurate.
+At discovery time, the backend defaulted `GINOT_ALLOW_FALLBACK_MODEL` to true.
+When checkpoint loading failed, it silently used `AnalyticFallbackGINOT`, which
+produced synthetic smooth fields and was explicitly not CFD-accurate. The active
+implementation now identifies this as `analytic-test-fixture`, requires
+`PIGINOT_ALLOW_SYNTHETIC=true`, and otherwise fails closed.
 
 Decision: fallback is permitted only in tests. Product and internal prototype runs must fail closed when the real checkpoint cannot load.
 

@@ -44,6 +44,10 @@ def execute_legacy_inference(request: GinotInferenceRequest) -> GinotInferenceRe
         settings.inference_engine,
         str(settings.onnx_model_path),
     )
+    if runtime.normalization is not None:
+        raise ValueError(
+            "Physics-boundary checkpoints require POST /api/hvac-inference-mesh"
+        )
     prediction = run_inference(
         load=load,
         pc=pc,

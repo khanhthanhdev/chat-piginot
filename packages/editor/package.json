@@ -8,7 +8,8 @@
     "./catalog": "./src/components/ui/item-catalog/catalog-items.tsx"
   },
   "scripts": {
-    "check-types": "node_modules/typescript-7/bin/tsc --noEmit"
+    "check-types": "node_modules/typescript-7/bin/tsc --noEmit",
+    "test": "bun test src/components/cfd-analysis"
   },
   "peerDependencies": {
     "@pascal-app/core": "^0.9.1",

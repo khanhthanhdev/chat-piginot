@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type {
   OptimizationContext,
@@ -12,6 +12,7 @@ export const dataRoot = path.resolve(
   'agent-server',
 )
 export const runsRoot = path.join(dataRoot, 'hvac-runs')
+const pendingWrites = new Map<string, Promise<void>>()
 
 export function runRoot(runId: string) {
   return path.join(runsRoot, runId)
@@ -39,11 +40,45 @@ export async function loadRun(runId: string): Promise<RunRecord> {
 }
 
 export async function saveRun(record: RunRecord) {
-  record.updatedAt = new Date().toISOString()
   const target = path.join(runRoot(record.runId), 'run.json')
-  const temporary = `${target}.tmp`
-  await writeFile(temporary, JSON.stringify(record, null, 2))
-  await rename(temporary, target)
+  const previous = pendingWrites.get(target) ?? Promise.resolve()
+  const write = previous
+    .catch(() => undefined)
+    .then(async () => {
+      if (record.status !== 'canceled') {
+        try {
+          const current = JSON.parse(await readFile(target, 'utf8')) as RunRecord
+          if (current.status === 'canceled') {
+            Object.assign(record, current)
+            return
+          }
+        } catch {}
+      }
+      record.updatedAt = new Date().toISOString()
+      await atomicWriteFile(target, JSON.stringify(record, null, 2))
+    })
+  pendingWrites.set(target, write)
+  try {
+    await write
+  } finally {
+    if (pendingWrites.get(target) === write) pendingWrites.delete(target)
+  }
+}
+
+export async function atomicWriteFile(
+  target: string,
+  data: string | NodeJS.ArrayBufferView,
+  signal?: AbortSignal,
+) {
+  const temporary = `${target}.${crypto.randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, data, { signal })
+    signal?.throwIfAborted()
+    await rename(temporary, target)
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
 }
 
 export async function deleteRunRecord(runId: string) {

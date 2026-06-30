@@ -51,18 +51,19 @@ def execute_mesh_inference(
         validation.interior_count,
     )
 
-    preprocessed = preprocess_mesh_inference(
-        mesh_request,
-        mesh_bytes=mesh_file.content,
-        filename=mesh_file.filename,
-        rng=np.random.default_rng(0),
-    )
     runtime = get_inference_runtime(
         str(settings.model_path),
         settings.device_preference,
         settings.allow_fallback_model,
         settings.inference_engine,
         str(settings.onnx_model_path),
+    )
+    preprocessed = preprocess_mesh_inference(
+        mesh_request,
+        mesh_bytes=mesh_file.content,
+        filename=mesh_file.filename,
+        rng=np.random.default_rng(0),
+        normalization=runtime.normalization,
     )
     prediction = run_inference(
         load=preprocessed.load,

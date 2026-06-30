@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from .mesh import MeshData, denormalize_points, load_mesh, normalize_mesh, normalize_points, points_inside_mesh, sample_interior_points, sample_surface_points
+from .models.ginot import PhysicsNormalization
 from .schemas import DiffuserInput, MeshInferenceOptions, MeshInferenceRequest
 
 
@@ -90,13 +91,24 @@ def preprocess_mesh_inference(
     mesh_bytes: bytes,
     filename: str,
     rng: np.random.Generator,
+    normalization: PhysicsNormalization | None = None,
 ) -> MeshInferenceInputs:
     mesh = load_mesh(mesh_bytes, filename)
     mesh_norm = normalize_mesh(mesh)
     sampling = resolve_sampling_options(request.options)
     diffusers = collapse_diffusers(request.diffusers)
 
-    pc_points = sample_surface_points(mesh_norm, sampling.boundary_count, rng)
+    diffuser_point_counts = (
+        _diffuser_sample_counts(request.diffusers, sampling.boundary_count)
+        if normalization is not None
+        else None
+    )
+    wall_point_count = (
+        sampling.boundary_count - sum(diffuser_point_counts)
+        if diffuser_point_counts is not None
+        else sampling.boundary_count
+    )
+    pc_points = sample_surface_points(mesh_norm, wall_point_count, rng)
     grid = None
     if request.options.returnGrid3D:
         positions_world, grid = sample_regular_grid(mesh, sampling.interior_count)
@@ -112,16 +124,137 @@ def preprocess_mesh_inference(
         axis=0,
     ).astype(np.float32, copy=False)
 
+    pc = torch.from_numpy(pc_points).unsqueeze(0)
+    xyt = torch.from_numpy(xyt_points).unsqueeze(0)
+    if normalization is not None:
+        pc_world = denormalize_points(pc_points, mesh.center, mesh.scale)
+        pc = torch.from_numpy(
+            _build_physics_point_cloud(
+                pc_world,
+                request.diffusers,
+                diffuser_point_counts,
+                normalization,
+                rng,
+            )
+        ).unsqueeze(0)
+        coord_min = np.asarray(normalization.coord_min, dtype=np.float32)
+        coord_scale = np.asarray(normalization.coord_scale, dtype=np.float32)
+        xyt = torch.from_numpy(
+            ((positions_world - coord_min) / coord_scale).astype(np.float32, copy=False)
+        ).unsqueeze(0)
+
     return MeshInferenceInputs(
         mesh=mesh,
         load=torch.from_numpy(load_vector).unsqueeze(0),
-        pc=torch.from_numpy(pc_points).unsqueeze(0),
-        xyt=torch.from_numpy(xyt_points).unsqueeze(0),
+        pc=pc,
+        xyt=xyt,
         positions_world=positions_world,
         sampling=sampling,
         diffusers=diffusers,
         grid=grid,
     )
+
+
+def _build_physics_point_cloud(
+    wall_points: np.ndarray,
+    diffusers: list[DiffuserInput],
+    diffuser_point_counts: list[int],
+    normalization: PhysicsNormalization,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    coord_min = np.asarray(normalization.coord_min, dtype=np.float32)
+    coord_scale = np.asarray(normalization.coord_scale, dtype=np.float32)
+    target_mean = np.asarray(normalization.target_mean, dtype=np.float32)
+    target_std = np.asarray(normalization.target_std, dtype=np.float32)
+    zero_normalized = -target_mean / target_std
+
+    coordinates = [wall_points.astype(np.float32, copy=False)]
+    masks = [np.tile(np.asarray([0, 1, 0, 0, 0], dtype=np.float32), (len(wall_points), 1))]
+    wall_targets = np.tile(zero_normalized, (len(wall_points), 1))
+    wall_targets[:, 3] = 0.0
+    targets = [wall_targets]
+
+    for diffuser, point_count in zip(diffusers, diffuser_point_counts, strict=True):
+        diffuser_points = _sample_diffuser_surface(diffuser, point_count)
+        coordinates.append(diffuser_points)
+        if diffuser.kind == "supply":
+            masks.append(
+                np.tile(np.asarray([0, 0, 1, 0, 0], dtype=np.float32), (point_count, 1))
+            )
+            inlet_physical = np.append(_supply_velocity_vector(diffuser), np.float32(0.0))
+            inlet_targets = (inlet_physical - target_mean) / target_std
+            inlet_targets[3] = 0.0
+            targets.append(
+                np.tile(inlet_targets.astype(np.float32, copy=False), (point_count, 1))
+            )
+        else:
+            masks.append(
+                np.tile(np.asarray([0, 0, 0, 1, 0], dtype=np.float32), (point_count, 1))
+            )
+            outlet_targets = zero_normalized.copy()
+            outlet_targets[:3] = 0.0
+            targets.append(np.tile(outlet_targets, (point_count, 1)))
+
+    xyz = (np.concatenate(coordinates, axis=0) - coord_min) / coord_scale
+    point_cloud = np.concatenate(
+        [xyz, np.concatenate(masks, axis=0), np.concatenate(targets, axis=0)],
+        axis=1,
+    ).astype(np.float32, copy=False)
+    return point_cloud[rng.permutation(len(point_cloud))]
+
+
+def _diffuser_sample_counts(
+    diffusers: list[DiffuserInput],
+    boundary_point_count: int,
+) -> list[int]:
+    counts = np.ones(len(diffusers), dtype=np.int64)
+    sized = [
+        index
+        for index, diffuser in enumerate(diffusers)
+        if diffuser.width is not None and diffuser.depth is not None
+    ]
+    if not sized:
+        return counts.tolist()
+
+    # ponytail: reserve 25% for terminals; tune only if checkpoint validation proves otherwise.
+    terminal_budget = max(len(diffusers), boundary_point_count // 4)
+    extra_budget = terminal_budget - len(diffusers)
+    areas = np.asarray(
+        [diffusers[index].width * diffusers[index].depth for index in sized],
+        dtype=np.float64,
+    )
+    allocations = areas / areas.sum() * extra_budget
+    extras = np.floor(allocations).astype(np.int64)
+    for index in np.argsort(-(allocations - extras))[: extra_budget - int(extras.sum())]:
+        extras[index] += 1
+    counts[sized] += extras
+    return counts.tolist()
+
+
+def _sample_diffuser_surface(diffuser: DiffuserInput, point_count: int) -> np.ndarray:
+    center = np.asarray(diffuser.center, dtype=np.float32)
+    if diffuser.width is None or diffuser.depth is None:
+        return center[None, :]
+
+    columns = max(1, round(np.sqrt(point_count * diffuser.width / diffuser.depth)))
+    rows = int(np.ceil(point_count / columns))
+    width_offsets = (np.arange(columns, dtype=np.float32) + 0.5) / columns - 0.5
+    depth_offsets = (np.arange(rows, dtype=np.float32) + 0.5) / rows - 0.5
+    uu, vv = np.meshgrid(width_offsets, depth_offsets)
+
+    cosine = np.float32(np.cos(diffuser.rotation))
+    sine = np.float32(np.sin(diffuser.rotation))
+    width_axis = np.asarray([cosine, 0.0, -sine], dtype=np.float32)
+    if diffuser.mount == "wall":
+        depth_axis = np.asarray([0.0, -1.0, 0.0], dtype=np.float32)
+    else:
+        depth_axis = np.asarray([sine, 0.0, cosine], dtype=np.float32)
+
+    return (
+        center
+        + uu.reshape(-1, 1)[:point_count] * diffuser.width * width_axis
+        + vv.reshape(-1, 1)[:point_count] * diffuser.depth * depth_axis
+    ).astype(np.float32, copy=False)
 
 
 def collapse_diffusers(diffusers: list[DiffuserInput]) -> ResolvedDiffusers:

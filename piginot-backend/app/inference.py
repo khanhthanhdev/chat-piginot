@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .models.ginot import AnalyticFallbackGINOT, GINOTModel
+from .models.ginot import AnalyticFallbackGINOT, PhysicsNormalization, load_ginot_checkpoint
 from .settings import resolve_device
 
 
@@ -23,6 +23,7 @@ class InferenceRuntime:
     device: str
     source: str
     checkpoint_path: str | None
+    normalization: PhysicsNormalization | None = None
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class InferencePrediction:
 def get_inference_runtime(
     model_path: str,
     device_preference: str,
-    allow_fallback_model: bool = True,
+    allow_fallback_model: bool = False,
     engine: str = "torch",
     onnx_model_path: str | None = None,
 ) -> InferenceRuntime:
@@ -55,7 +56,7 @@ def get_inference_runtime(
 
     if checkpoint_path.exists():
         try:
-            model = GINOTModel.load_from_checkpoint(checkpoint_path)
+            model, normalization = load_ginot_checkpoint(checkpoint_path)
             model.eval()
             model.to(resolved_device)
             return InferenceRuntime(
@@ -64,6 +65,7 @@ def get_inference_runtime(
                 device=resolved_device,
                 source=model.source,
                 checkpoint_path=str(checkpoint_path),
+                normalization=normalization,
             )
         except Exception:
             LOGGER.exception("Failed to load Ginot checkpoint from %s", checkpoint_path)
@@ -79,7 +81,7 @@ def get_inference_runtime(
         model=fallback_model,
         engine="torch",
         device=resolved_device,
-        source="analytic-fallback",
+        source="analytic-test-fixture",
         checkpoint_path=str(checkpoint_path),
     )
 
@@ -133,6 +135,12 @@ def run_inference(
             "Ginot model returned unexpected output shape: "
             f"expected ({load.shape[0]}, {xyt.shape[1]}, 4), got {tuple(prediction.shape)}"
         )
+
+    normalization = getattr(model, "normalization", None)
+    if engine != "onnx" and normalization is not None:
+        target_std = prediction.new_tensor(normalization.target_std)
+        target_mean = prediction.new_tensor(normalization.target_mean)
+        prediction = prediction * target_std + target_mean
 
     pred_np = prediction.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
     positions = xyt.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)

@@ -1,26 +1,42 @@
 import { createHash } from 'node:crypto'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createStep, createWorkflow } from '@mastra/core/workflows'
-import type { Candidate, Kpis, OptimizationRequest, RunRecord, Terminal, Vec3 } from './contracts'
-import { optimizationContextSchema } from './contracts'
-import { addEvent, loadRun, runRoot, saveRun, toContext } from './store'
+import type {
+  Candidate,
+  Kpis,
+  ModelIdentity,
+  OptimizationRequest,
+  RunRecord,
+  Terminal,
+  Vec3,
+} from './contracts'
+import { optimizationContextSchema, publicCandidate } from './contracts'
+import { addEvent, atomicWriteFile, loadRun, runRoot, saveRun, toContext } from './store'
 
-type Stage = (record: RunRecord) => Promise<void>
+type Stage = (record: RunRecord, signal: AbortSignal) => Promise<void>
 
 function stageWorkflow(id: string, runStage: Stage) {
   const step = createStep({
     id,
     inputSchema: optimizationContextSchema,
     outputSchema: optimizationContextSchema,
-    execute: async ({ inputData }) => {
+    execute: async ({ inputData, abort, abortSignal }) => {
       const record = await loadRun(inputData.runId)
       if (record.status === 'canceled' || record.status === 'failed') return toContext(record)
       await addEvent(record, id, 'running')
       try {
-        await runStage(record)
+        await runStage(record, abortSignal)
+        if (abortSignal.aborted) {
+          abort()
+          return toContext(record)
+        }
         await addEvent(record, id, record.status)
       } catch (error) {
+        if (abortSignal.aborted || isAbortError(error)) {
+          abort()
+          return toContext(record)
+        }
         const summary = error instanceof Error ? error.message : String(error)
         await addEvent(record, id, 'failed', summary)
         throw error
@@ -39,13 +55,14 @@ function stageWorkflow(id: string, runStage: Stage) {
 
 export const candidateGenerationWorkflow = stageWorkflow(
   'candidate-generation-workflow',
-  async (record) => {
+  async (record, signal) => {
     const { variables } = record.request
-    const candidates: Candidate[] = []
+    const candidates = new Map<string, Candidate>()
     for (const supplySpacingM of values(variables.supplySpacingM)) {
       for (const supplyOffsetM of values(variables.supplyOffsetM)) {
         for (const returnSpacingM of values(variables.returnSpacingM)) {
           for (const returnOffsetM of values(variables.returnOffsetM)) {
+            signal.throwIfAborted()
             const candidateVariables = {
               supplySpacingM,
               supplyOffsetM,
@@ -53,45 +70,49 @@ export const candidateGenerationWorkflow = stageWorkflow(
               returnOffsetM,
             }
             const terminals = terminalsFor(record.request, candidateVariables)
-            candidates.push({
+            const candidate = {
               id: candidateId(terminals),
               variables: candidateVariables,
               terminals,
-              status: 'pending',
-            })
+              status: 'pending' as const,
+            }
+            candidates.set(candidate.id, candidate)
           }
         }
       }
     }
-    record.candidates = [
-      ...new Map(candidates.map((candidate) => [candidate.id, candidate])).values(),
-    ]
+    record.candidates = [...candidates.values()]
+    signal.throwIfAborted()
     await saveRun(record)
   },
 )
 
-export const topologyRulesWorkflow = stageWorkflow('topology-rules-workflow', async (record) => {
-  const valid = record.candidates.filter((candidate) => topologyValid(record.request, candidate))
-  if (valid.length === 0) throw new Error('No candidate satisfies room clearance and overlap rules')
-  const limit = Math.min(record.request.candidateLimit, 1000)
-  record.candidates = evenlyDistributed(valid, limit)
-  await saveRun(record)
-})
+export const topologyRulesWorkflow = stageWorkflow(
+  'topology-rules-workflow',
+  async (record, signal) => {
+    signal.throwIfAborted()
+    const valid = record.candidates.filter((candidate) => topologyValid(record.request, candidate))
+    if (valid.length === 0)
+      throw new Error('No candidate satisfies room clearance and overlap rules')
+    const limit = Math.min(record.request.candidateLimit, 1000)
+    record.candidates = evenlyDistributed(valid, limit)
+    signal.throwIfAborted()
+    await saveRun(record)
+  },
+)
 
-export const predictionWorkflow = stageWorkflow('prediction-workflow', async (record) => {
+export const predictionWorkflow = stageWorkflow('prediction-workflow', async (record, signal) => {
   const pending = []
   const expectedBytes = record.request.grid.shape.reduce((product, value) => product * value, 1) * 4
   for (const candidate of record.candidates) {
+    signal.throwIfAborted()
     const actualFieldPath = path.join(runRoot(record.runId), 'fields', `${candidate.id}.f32`)
     try {
       const metadataPath = actualFieldPath.replace(/\.f32$/, '.json')
-      const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as {
-        grid?: { shape?: number[] }
-      }
-      if (
-        (await readFile(actualFieldPath)).byteLength === expectedBytes &&
-        JSON.stringify(metadata.grid?.shape) === JSON.stringify(record.request.grid.shape)
-      ) {
+      const bytes = await readFile(actualFieldPath)
+      const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as ArtifactMetadata
+      if (validArtifact(record, candidate, bytes, metadata, expectedBytes)) {
+        record.modelIdentity ??= metadata.model
         candidate.status = 'succeeded'
         candidate.artifact = {
           fieldPath: actualFieldPath,
@@ -104,10 +125,12 @@ export const predictionWorkflow = stageWorkflow('prediction-workflow', async (re
   }
 
   for (let index = 0; index < pending.length; index += 25) {
+    signal.throwIfAborted()
     if ((await loadRun(record.runId)).status === 'canceled') return
     const batch = pending.slice(index, index + 25)
     try {
-      const response = await inferBatch(record.request, batch)
+      const response = await inferBatch(record.request, batch, signal)
+      validateModel(record, response.model)
       if (
         JSON.stringify(response.grid.shape) !== JSON.stringify(record.request.grid.shape) ||
         JSON.stringify(response.grid.origin) !== JSON.stringify(record.request.grid.origin) ||
@@ -115,39 +138,43 @@ export const predictionWorkflow = stageWorkflow('prediction-workflow', async (re
       ) {
         throw new Error('PiGINOT returned grid metadata that does not match the request')
       }
+      const responseIds = response.candidates.map(({ id }) => id)
+      if (new Set(responseIds).size !== responseIds.length) {
+        throw new Error('PiGINOT returned duplicate candidate IDs')
+      }
       for (const candidate of batch) {
+        signal.throwIfAborted()
         const result = response.candidates.find((item) => item.id === candidate.id)
         if (result?.status !== 'succeeded' || !result.velocityMagnitudeBase64) {
           candidate.status = 'failed'
           candidate.error = result?.error ?? 'PiGINOT omitted the candidate result'
           continue
         }
-        const bytes = Buffer.from(result.velocityMagnitudeBase64, 'base64')
-        if (bytes.toString('base64') !== result.velocityMagnitudeBase64) {
+        let bytes: Buffer
+        try {
+          bytes = decodeField(result.velocityMagnitudeBase64, expectedBytes)
+        } catch (error) {
           candidate.status = 'failed'
-          candidate.error = 'PiGINOT returned malformed base64'
-          continue
-        }
-        if (bytes.byteLength !== expectedBytes) {
-          candidate.status = 'failed'
-          candidate.error = `Field size ${bytes.byteLength} does not match expected ${expectedBytes}`
+          candidate.error = error instanceof Error ? error.message : String(error)
           continue
         }
         const fieldPath = path.join(runRoot(record.runId), 'fields', `${candidate.id}.f32`)
         const metadataPath = fieldPath.replace(/\.f32$/, '.json')
-        await writeFile(fieldPath, bytes)
-        await writeFile(
+        await atomicWriteFile(fieldPath, bytes, signal)
+        await atomicWriteFile(
           metadataPath,
           JSON.stringify(
             { model: response.model, grid: response.grid, terminals: candidate.terminals },
             null,
             2,
           ),
+          signal,
         )
         candidate.status = 'succeeded'
         candidate.artifact = { fieldPath, metadataPath }
       }
     } catch (error) {
+      if (signal.aborted) throw error
       const summary = error instanceof Error ? error.message : String(error)
       for (const candidate of batch) {
         candidate.status = 'failed'
@@ -161,8 +188,9 @@ export const predictionWorkflow = stageWorkflow('prediction-workflow', async (re
   }
 })
 
-export const evaluationWorkflow = stageWorkflow('evaluation-workflow', async (record) => {
+export const evaluationWorkflow = stageWorkflow('evaluation-workflow', async (record, signal) => {
   for (const candidate of record.candidates) {
+    signal.throwIfAborted()
     if (candidate.status !== 'succeeded' || !candidate.artifact) continue
     const bytes = await readFile(candidate.artifact.fieldPath)
     const values = Array.from({ length: bytes.byteLength / 4 }, (_, index) =>
@@ -171,56 +199,41 @@ export const evaluationWorkflow = stageWorkflow('evaluation-workflow', async (re
     const plane = occupiedPlane(values, record.request.grid)
     candidate.kpis = calculateKpis(plane.flat(), record.request)
     const metadata = JSON.parse(await readFile(candidate.artifact.metadataPath, 'utf8')) as object
-    await writeFile(
+    await atomicWriteFile(
       candidate.artifact.metadataPath,
       JSON.stringify({ ...metadata, occupiedPlane: plane, kpis: candidate.kpis }, null, 2),
+      signal,
     )
   }
   await saveRun(record)
 })
 
-export const velocityRulesWorkflow = stageWorkflow('velocity-rules-workflow', async (record) => {
-  for (const candidate of record.candidates) {
-    if (!candidate.kpis) continue
-    const { meanVelocity, maxVelocity, deadZoneRatio, airSweepCoverage, uniformity } =
-      candidate.kpis
-    const violations = meanVelocity > 0.3 ? ['Mean occupied-plane velocity exceeds 0.30 m/s'] : []
-    const warnings = [
-      ...(maxVelocity > 0.3 ? ['Maximum occupied-plane velocity exceeds 0.30 m/s'] : []),
-      ...(uniformity < 0.5 ? ['Velocity uniformity is below 0.50'] : []),
-    ]
-    const activatedRules = [
-      ...(meanVelocity > 0.3 ? ['R-V1'] : []),
-      ...(maxVelocity > 0.3 ? ['R-V2'] : []),
-      ...(deadZoneRatio > 0.2 ? ['R-V3'] : []),
-      ...(airSweepCoverage > 0.8 ? ['R-V4'] : []),
-      ...(uniformity < 0.5 ? ['R-V5'] : []),
-    ]
-    candidate.rules = {
-      status: violations.length ? 'fail' : warnings.length ? 'warning' : 'pass',
-      activatedRules,
-      warnings,
-      violations,
-      recommendations: [
-        ...(deadZoneRatio > 0.2 ? ['Reduce stagnant occupied-plane area'] : []),
-        ...(maxVelocity > 0.3 ? ['Reduce local draft velocity'] : []),
-      ],
+export const velocityRulesWorkflow = stageWorkflow(
+  'velocity-rules-workflow',
+  async (record, signal) => {
+    for (const candidate of record.candidates) {
+      signal.throwIfAborted()
+      if (!candidate.kpis) continue
+      candidate.rules = velocityRules(candidate.kpis)
     }
-  }
-  await saveRun(record)
-})
+    signal.throwIfAborted()
+    await saveRun(record)
+  },
+)
 
-export const rankingWorkflow = stageWorkflow('ranking-workflow', async (record) => {
+export const rankingWorkflow = stageWorkflow('ranking-workflow', async (record, signal) => {
+  signal.throwIfAborted()
   const candidates = record.candidates.filter(
     (candidate): candidate is Candidate & { kpis: Kpis } =>
       candidate.status === 'succeeded' && Boolean(candidate.kpis),
   )
   rankCandidates(candidates, record.request.weights)
   record.ranking = candidates.map(({ id }) => id)
+  signal.throwIfAborted()
   await saveRun(record)
 })
 
-export const reportWorkflow = stageWorkflow('report-workflow', async (record) => {
+export const reportWorkflow = stageWorkflow('report-workflow', async (record, signal) => {
   const ranked = record.ranking
     .map((id) => record.candidates.find((candidate) => candidate.id === id))
     .filter((candidate): candidate is Candidate => Boolean(candidate))
@@ -229,18 +242,10 @@ export const reportWorkflow = stageWorkflow('report-workflow', async (record) =>
     room: record.request.room,
     candidateCount: record.candidates.length,
     successfulCandidateCount: ranked.length,
-    ranking: ranked.map(
-      ({ id, variables, terminals, kpis, score, paretoOptimal, rules, artifact }) => ({
-        id,
-        variables,
-        terminals,
-        kpis,
-        score,
-        paretoOptimal,
-        rules,
-        artifact,
-      }),
-    ),
+    ranking: ranked.map((candidate) => publicCandidate(record.runId, candidate)),
+    failedCandidates: record.candidates
+      .filter(({ status }) => status === 'failed')
+      .map(({ id, error }) => ({ id, error: error ?? 'Prediction failed' })),
   }
   const jsonPath = path.join(runRoot(record.runId), 'report.json')
   const markdownPath = jsonPath.replace(/\.json$/, '.md')
@@ -265,9 +270,15 @@ export const reportWorkflow = stageWorkflow('report-workflow', async (record) =>
         } |`,
     ),
     '',
+    '## Failed candidates',
+    '',
+    ...(report.failedCandidates.length
+      ? report.failedCandidates.map(({ id, error }) => `- ${id}: ${error}`)
+      : ['None.']),
+    '',
   ].join('\n')
-  await writeFile(jsonPath, JSON.stringify(report, null, 2))
-  await writeFile(markdownPath, markdown)
+  await atomicWriteFile(jsonPath, JSON.stringify(report, null, 2), signal)
+  await atomicWriteFile(markdownPath, markdown, signal)
   record.report = { markdownPath, jsonPath }
   record.status = 'completed'
   await saveRun(record)
@@ -316,6 +327,7 @@ export function terminalsFor(
       request.directions.supply,
       flowPerTerminal /
         (request.terminalDimensions.supply[0] * request.terminalDimensions.supply[1]),
+      request.terminalDimensions.supply,
     ),
     ...terminalGroup(
       'return',
@@ -325,6 +337,7 @@ export function terminalsFor(
       request.directions.return,
       flowPerTerminal /
         (request.terminalDimensions.return[0] * request.terminalDimensions.return[1]),
+      request.terminalDimensions.return,
     ),
   ]
 }
@@ -336,6 +349,7 @@ function terminalGroup(
   offset: number,
   direction: Vec3,
   faceVelocity: number,
+  dimensions: [number, number],
 ): Terminal[] {
   const lineDirection = unit(subtract(line.end, line.start))
   const offsetDirection = unit(line.offsetDirection)
@@ -347,6 +361,9 @@ function terminalGroup(
     centre: add(anchor, scale(lineDirection, spacing * position)),
     direction,
     faceVelocity,
+    width: dimensions[0],
+    depth: dimensions[1],
+    rotation: Math.atan2(lineDirection[1], lineDirection[0]),
   }))
 }
 
@@ -357,11 +374,15 @@ export function topologyValid(request: OptimizationRequest, candidate: Candidate
       terminal.role === 'supply'
         ? request.terminalDimensions.supply
         : request.terminalDimensions.return
+    const cos = Math.abs(Math.cos(terminal.rotation))
+    const sin = Math.abs(Math.sin(terminal.rotation))
+    const halfX = (size[0] * cos + size[1] * sin) / 2
+    const halfY = (size[0] * sin + size[1] * cos) / 2
     if (
-      terminal.centre[0] - size[0] / 2 < minimum[0] + request.minimumClearanceM ||
-      terminal.centre[0] + size[0] / 2 > maximum[0] - request.minimumClearanceM ||
-      terminal.centre[1] - size[1] / 2 < minimum[1] + request.minimumClearanceM ||
-      terminal.centre[1] + size[1] / 2 > maximum[1] - request.minimumClearanceM ||
+      terminal.centre[0] - halfX < minimum[0] + request.minimumClearanceM ||
+      terminal.centre[0] + halfX > maximum[0] - request.minimumClearanceM ||
+      terminal.centre[1] - halfY < minimum[1] + request.minimumClearanceM ||
+      terminal.centre[1] + halfY > maximum[1] - request.minimumClearanceM ||
       terminal.centre[2] < minimum[2] ||
       terminal.centre[2] > maximum[2]
     )
@@ -371,16 +392,58 @@ export function topologyValid(request: OptimizationRequest, candidate: Candidate
     for (let right = left + 1; right < candidate.terminals.length; right++) {
       const a = candidate.terminals[left]!
       const b = candidate.terminals[right]!
-      const aSize =
-        a.role === 'supply' ? request.terminalDimensions.supply : request.terminalDimensions.return
-      const bSize =
-        b.role === 'supply' ? request.terminalDimensions.supply : request.terminalDimensions.return
-      const gapX = Math.abs(a.centre[0] - b.centre[0]) - (aSize[0] + bSize[0]) / 2
-      const gapY = Math.abs(a.centre[1] - b.centre[1]) - (aSize[1] + bSize[1]) / 2
-      if (gapX < request.minimumClearanceM && gapY < request.minimumClearanceM) return false
+      if (terminalsOverlap(a, b, request.minimumClearanceM)) return false
     }
   }
   return true
+}
+
+function terminalsOverlap(a: Terminal, b: Terminal, clearance: number) {
+  const axes = [a.rotation, a.rotation + Math.PI / 2, b.rotation, b.rotation + Math.PI / 2]
+  const dx = b.centre[0] - a.centre[0]
+  const dy = b.centre[1] - a.centre[1]
+  return axes.every((angle) => {
+    const x = Math.cos(angle)
+    const y = Math.sin(angle)
+    const distance = Math.abs(dx * x + dy * y)
+    const radius = terminalRadius(a, x, y) + terminalRadius(b, x, y) + clearance
+    return distance < radius
+  })
+}
+
+function terminalRadius(terminal: Terminal, axisX: number, axisY: number) {
+  const cos = Math.cos(terminal.rotation)
+  const sin = Math.sin(terminal.rotation)
+  return (
+    (terminal.width / 2) * Math.abs(axisX * cos + axisY * sin) +
+    (terminal.depth / 2) * Math.abs(axisX * -sin + axisY * cos)
+  )
+}
+
+export function velocityRules(kpis: Kpis): NonNullable<Candidate['rules']> {
+  const { meanVelocity, maxVelocity, deadZoneRatio, airSweepCoverage, uniformity } = kpis
+  const violations = meanVelocity > 0.3 ? ['Mean occupied-plane velocity exceeds 0.30 m/s'] : []
+  const warnings = [
+    ...(maxVelocity > 0.3 ? ['Maximum occupied-plane velocity exceeds 0.30 m/s'] : []),
+    ...(deadZoneRatio > 0.2 ? ['Occupied-plane dead zone exceeds 20%'] : []),
+    ...(uniformity < 0.5 ? ['Velocity uniformity is below 0.50'] : []),
+  ]
+  return {
+    status: violations.length ? 'fail' : warnings.length ? 'warning' : 'pass',
+    activatedRules: [
+      ...(meanVelocity > 0.3 ? ['R-V1'] : []),
+      ...(maxVelocity > 0.3 ? ['R-V2'] : []),
+      ...(deadZoneRatio > 0.2 ? ['R-V3'] : []),
+      ...(airSweepCoverage > 0.8 ? ['R-V4'] : []),
+      ...(uniformity < 0.5 ? ['R-V5'] : []),
+    ],
+    warnings,
+    violations,
+    recommendations: [
+      ...(deadZoneRatio > 0.2 ? ['Reduce stagnant occupied-plane area'] : []),
+      ...(maxVelocity > 0.3 ? ['Reduce local draft velocity'] : []),
+    ],
+  }
 }
 
 export function evenlyDistributed<T>(items: T[], limit: number) {
@@ -392,7 +455,11 @@ export function evenlyDistributed<T>(items: T[], limit: number) {
   )
 }
 
-async function inferBatch(request: OptimizationRequest, candidates: Candidate[]) {
+export async function inferBatch(
+  request: OptimizationRequest,
+  candidates: Candidate[],
+  signal: AbortSignal,
+) {
   const url = `${process.env.PIGINOT_URL ?? 'http://localhost:8000'}/api/v1/hvac-inference-batch`
   const payload = {
     room: request.room,
@@ -404,7 +471,7 @@ async function inferBatch(request: OptimizationRequest, candidates: Candidate[])
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
     })
     if (response.ok) {
       return (await response.json()) as {
@@ -423,8 +490,83 @@ async function inferBatch(request: OptimizationRequest, candidates: Candidate[])
         `PiGINOT batch request failed with ${response.status}: ${await response.text()}`,
       )
     }
-    await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 1000))
+    await abortableDelay((attempt + 1) * 1000, signal)
   }
+}
+
+type ArtifactMetadata = {
+  model?: ModelIdentity
+  grid?: OptimizationRequest['grid']
+  terminals?: Terminal[]
+}
+
+function validArtifact(
+  record: RunRecord,
+  candidate: Candidate,
+  bytes: Buffer,
+  metadata: ArtifactMetadata,
+  expectedBytes: number,
+) {
+  return (
+    bytes.byteLength === expectedBytes &&
+    finiteFloat32(bytes) &&
+    Boolean(metadata.model?.id && metadata.model.version && metadata.model.source) &&
+    (!record.modelIdentity ||
+      JSON.stringify(metadata.model) === JSON.stringify(record.modelIdentity)) &&
+    JSON.stringify(metadata.grid) === JSON.stringify(record.request.grid) &&
+    JSON.stringify(metadata.terminals) === JSON.stringify(candidate.terminals)
+  )
+}
+
+function finiteFloat32(bytes: Buffer) {
+  for (let offset = 0; offset < bytes.byteLength; offset += 4) {
+    if (!Number.isFinite(bytes.readFloatLE(offset))) return false
+  }
+  return true
+}
+
+export function decodeField(encoded: string, expectedBytes: number) {
+  const bytes = Buffer.from(encoded, 'base64')
+  if (bytes.toString('base64') !== encoded) throw new Error('PiGINOT returned malformed base64')
+  if (bytes.byteLength !== expectedBytes) {
+    throw new Error(`Field size ${bytes.byteLength} does not match expected ${expectedBytes}`)
+  }
+  if (!finiteFloat32(bytes)) throw new Error('PiGINOT returned non-finite field values')
+  return bytes
+}
+
+function validateModel(record: RunRecord, model: ModelIdentity) {
+  if (!(model?.id && model.version && model.source)) {
+    throw new Error('PiGINOT omitted model identity')
+  }
+  if (model.source === 'analytic-test-fixture' && process.env.PIGINOT_ALLOW_SYNTHETIC !== 'true') {
+    throw new Error('Synthetic PiGINOT predictions are disabled')
+  }
+  if (record.modelIdentity && JSON.stringify(record.modelIdentity) !== JSON.stringify(model)) {
+    throw new Error('PiGINOT model identity changed during the run')
+  }
+  record.modelIdentity = model
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal) {
+  signal.throwIfAborted()
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, milliseconds)
+    signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer)
+        reject(signal.reason)
+      },
+      { once: true },
+    )
+  })
+}
+
+function isAbortError(error: unknown) {
+  return (
+    error instanceof DOMException && (error.name === 'AbortError' || error.name === 'TimeoutError')
+  )
 }
 
 export function occupiedPlane(field: number[], grid: OptimizationRequest['grid']): number[][] {

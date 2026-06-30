@@ -203,3 +203,28 @@ See `docs/ginot-backend-api-specification.md` for the full request/response cont
 
 Response positions are world coordinates — the frontend does not denormalize anything.
 Response velocities are in m/s and pressure is in Pa.
+
+### Physics-boundary checkpoints
+
+The backend also detects the Fourier physics-boundary model from `full.py`. Its point cloud is
+`[batch, N, 12]`: normalized XYZ, five boundary masks, and normalized UVWP values. Use only
+`POST /api/hvac-inference-mesh`; the backend builds these features and restores model outputs to
+physical units.
+
+The checkpoint must include the training normalization:
+
+```python
+torch.save({
+    "state_dict": model.state_dict(),
+    "model_config": {"branch_args": branch_args, "trunk_args": trunk_args},
+    "normalization": {
+        "coord_min": dataset.coord_min.tolist(),
+        "coord_scale": dataset.coord_scale.tolist(),
+        "target_mean": dataset.target_mean.tolist(),
+        "target_std": dataset.target_std.tolist(),
+    },
+}, "ginot_physics.pth")
+```
+
+For an existing raw state dictionary, put the same `model_config` and `normalization` objects in
+`ginot_physics.json` beside `ginot_physics.pth`.

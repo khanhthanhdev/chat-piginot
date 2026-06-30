@@ -1,7 +1,7 @@
 import { readdir } from 'node:fs/promises'
 import type { Mastra } from '@mastra/core/mastra'
 import type { OptimizationRequest } from './contracts'
-import { optimizationRequestSchema } from './contracts'
+import { optimizationRequestSchema, publicCandidate } from './contracts'
 import {
   addEvent,
   createRunRecord,
@@ -12,7 +12,16 @@ import {
   toContext,
 } from './store'
 
-const activeRuns = new Map<string, { cancel(): Promise<void> }>()
+const activeRuns = new Map<string, { cancel(): Promise<void>; completion: Promise<unknown> }>()
+
+export class HvacHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: 400 | 404 | 409 | 500,
+  ) {
+    super(message)
+  }
+}
 
 export async function startOptimization(mastra: Pick<Mastra, 'getWorkflow'>, input: unknown) {
   const request = optimizationRequestSchema.parse(input)
@@ -31,8 +40,7 @@ async function executeRun(
     .getWorkflow('hvacOptimizationWorkflow')
     .createRun({ runId: record.runId })
   const { runId } = record
-  activeRuns.set(runId, run)
-  void run
+  const completion = run
     .start({ inputData: toContext(record) })
     .catch(async (error) => {
       try {
@@ -48,6 +56,8 @@ async function executeRun(
       } catch {}
     })
     .finally(() => activeRuns.delete(runId))
+  activeRuns.set(runId, { cancel: () => run.cancel(), completion })
+  void completion
 }
 
 export async function recoverRuns(mastra: Pick<Mastra, 'getWorkflow'>) {
@@ -79,16 +89,27 @@ export async function getRunStatus(runId: string) {
 
 export async function getRanking(runId: string) {
   const record = await loadRun(runId)
-  return record.ranking.map((id, index) => ({
-    rank: index + 1,
-    ...record.candidates.find((candidate) => candidate.id === id),
-  }))
+  return {
+    ranking: record.ranking.map((id, index) => ({
+      rank: index + 1,
+      ...publicCandidate(runId, record.candidates.find((candidate) => candidate.id === id)!),
+    })),
+    failedCandidates: record.candidates
+      .filter(({ status }) => status === 'failed')
+      .map(({ id, error }) => ({ id, error: error ?? 'Prediction failed' })),
+    candidateCount: record.candidates.length,
+    successfulCandidateCount: record.ranking.length,
+  }
 }
 
 export async function getCandidate(runId: string, candidateId: string) {
+  return publicCandidate(runId, await getCandidateRecord(runId, candidateId))
+}
+
+export async function getCandidateRecord(runId: string, candidateId: string) {
   const record = await loadRun(runId)
   const candidate = record.candidates.find(({ id }) => id === candidateId)
-  if (!candidate) throw new Error(`Candidate '${candidateId}' not found`)
+  if (!candidate) throw new HvacHttpError(`Candidate '${candidateId}' not found`, 404)
   return candidate
 }
 
@@ -98,12 +119,16 @@ export async function cancelRun(runId: string) {
     return { runId, status: record.status }
   }
   await addEvent(record, 'hvac-optimization-workflow', 'canceled')
-  await activeRuns.get(runId)?.cancel()
+  const active = activeRuns.get(runId)
+  await active?.cancel()
+  await active?.completion
   return { runId, status: 'canceled' as const }
 }
 
 export async function deleteRun(runId: string) {
-  await activeRuns.get(runId)?.cancel()
+  const active = activeRuns.get(runId)
+  await active?.cancel()
+  await active?.completion
   activeRuns.delete(runId)
   await deleteRunRecord(runId)
   return { runId, deleted: true }

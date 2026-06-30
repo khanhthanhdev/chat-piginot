@@ -5,16 +5,31 @@ import {
   cancelRun,
   deleteRun,
   getCandidate,
+  getCandidateRecord,
   getRanking,
   getRunStatus,
+  HvacHttpError,
   loadRun,
   startOptimization,
 } from './service'
 
+const errorStatus = (error: unknown) => {
+  if (error instanceof HvacHttpError) return error.status
+  if (error instanceof SyntaxError || error instanceof ZodError) return 400
+  if (
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    (error as { code?: string }).code === 'ENOENT'
+  )
+    return 404
+  return 500
+}
+
 const jsonError = (error: unknown) =>
   Response.json(
     { error: error instanceof Error ? error.message : String(error) },
-    { status: error instanceof SyntaxError || error instanceof ZodError ? 400 : 404 },
+    { status: errorStatus(error) },
   )
 
 export const hvacRoutes = [
@@ -48,7 +63,9 @@ export const hvacRoutes = [
         return jsonError(error)
       }
       const encoder = new TextEncoder()
-      let sequence = 0
+      const requestedSequence = Number(c.req.header('last-event-id') ?? c.req.query('after') ?? 0)
+      let sequence =
+        Number.isInteger(requestedSequence) && requestedSequence >= 0 ? requestedSequence : 0
       return new Response(
         new ReadableStream({
           async start(controller) {
@@ -61,7 +78,17 @@ export const hvacRoutes = [
               }
               sequence = record.events.length
               if (['completed', 'failed', 'canceled'].includes(record.status)) break
-              await new Promise((resolve) => setTimeout(resolve, 250))
+              await new Promise<void>((resolve) => {
+                const onAbort = () => {
+                  clearTimeout(timer)
+                  resolve()
+                }
+                const timer = setTimeout(() => {
+                  c.req.raw.signal.removeEventListener('abort', onAbort)
+                  resolve()
+                }, 250)
+                c.req.raw.signal.addEventListener('abort', onAbort, { once: true })
+              })
             }
             controller.close()
           },
@@ -94,8 +121,8 @@ export const hvacRoutes = [
     method: 'GET',
     handler: async (c) => {
       try {
-        const candidate = await getCandidate(c.req.param('runId'), c.req.param('candidateId'))
-        if (!candidate.artifact) throw new Error('Candidate field is unavailable')
+        const candidate = await getCandidateRecord(c.req.param('runId'), c.req.param('candidateId'))
+        if (!candidate.artifact) throw new HvacHttpError('Candidate field is unavailable', 409)
         return new Response(await readFile(candidate.artifact.fieldPath), {
           headers: { 'content-type': 'application/octet-stream' },
         })
@@ -108,11 +135,14 @@ export const hvacRoutes = [
     method: 'GET',
     handler: async (c) => {
       try {
-        const candidate = await getCandidate(c.req.param('runId'), c.req.param('candidateId'))
-        if (!candidate.artifact) throw new Error('Candidate occupied plane is unavailable')
+        const candidate = await getCandidateRecord(c.req.param('runId'), c.req.param('candidateId'))
+        if (!candidate.artifact)
+          throw new HvacHttpError('Candidate occupied plane is unavailable', 409)
         const metadata = JSON.parse(await readFile(candidate.artifact.metadataPath, 'utf8')) as {
           occupiedPlane?: number[][]
         }
+        if (!metadata.occupiedPlane)
+          throw new HvacHttpError('Candidate occupied plane is unavailable', 409)
         return c.json({ occupiedPlane: metadata.occupiedPlane })
       } catch (error) {
         return jsonError(error)
@@ -124,7 +154,7 @@ export const hvacRoutes = [
     handler: async (c) => {
       try {
         const record = await loadRun(c.req.param('runId'))
-        if (!record.report) throw new Error('Run report is unavailable')
+        if (!record.report) throw new HvacHttpError('Run report is unavailable', 409)
         const json = c.req.query('format') === 'json'
         return new Response(
           await readFile(json ? record.report.jsonPath : record.report.markdownPath),

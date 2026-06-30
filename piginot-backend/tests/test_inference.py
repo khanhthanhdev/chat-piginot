@@ -1,4 +1,6 @@
 import asyncio
+from pathlib import Path
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -9,6 +11,7 @@ import torch
 from app.api import hvac_inference
 from app.inference import get_inference_runtime, run_inference
 from app.errors import request_validation_exception_handler
+from app.models.ginot import PhysicsGINOTModel, PhysicsNormalization, load_ginot_checkpoint
 from app.schemas import GinotInferenceRequest
 from app.settings import get_settings
 
@@ -84,3 +87,92 @@ class InferenceRouteTests(unittest.TestCase):
         self.assertEqual(tuple(prediction.velocities.shape), (3, 3))
         self.assertEqual(tuple(prediction.pressure.shape), (3,))
         self.assertTrue((prediction.speed > 0).all())
+
+    def test_analytic_fixture_fails_closed_by_default(self):
+        with self.assertRaises(FileNotFoundError):
+            get_inference_runtime("/missing/checkpoint.pth", "cpu")
+
+        runtime = get_inference_runtime(
+            "/missing/checkpoint.pth",
+            "cpu",
+            allow_fallback_model=True,
+        )
+        self.assertEqual(runtime.source, "analytic-test-fixture")
+
+    def test_physics_model_predictions_are_returned_in_physical_units(self):
+        class PhysicsFixture(torch.nn.Module):
+            normalization = PhysicsNormalization(
+                coord_min=(0.0, 0.0, 0.0),
+                coord_scale=(1.0, 1.0, 1.0),
+                target_mean=(1.0, 2.0, 3.0, 4.0),
+                target_std=(2.0, 3.0, 4.0, 5.0),
+            )
+
+            def forward(self, load, xyt, pc):
+                return torch.ones(xyt.shape[0], xyt.shape[1], 4)
+
+        prediction = run_inference(
+            load=torch.zeros(1, 9),
+            pc=torch.zeros(1, 4, 12),
+            xyt=torch.zeros(1, 2, 3),
+            model=PhysicsFixture(),
+            device="cpu",
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                torch.from_numpy(prediction.velocities),
+                torch.tensor([[3.0, 5.0, 7.0]] * 2),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(torch.from_numpy(prediction.pressure), torch.tensor([9.0, 9.0]))
+        )
+
+    def test_loads_physics_checkpoint_with_normalization_metadata(self):
+        branch_args = {
+            "input_channels": 12,
+            "out_c": 8,
+            "width": 8,
+            "latent_d": 4,
+            "n_point": 4,
+            "n_sample": 2,
+            "radius": 1.0,
+            "d_hidden": [8, 8],
+            "num_heads": 2,
+            "cross_attn_layers": 1,
+            "self_attn_layers": 1,
+        }
+        trunk_args = {
+            "in_channels": 3,
+            "out_channels": 4,
+            "embed_dim": 8,
+            "cross_attn_layers": 1,
+            "num_heads": 2,
+            "min_length_norm": 0.2,
+        }
+        model = PhysicsGINOTModel(branch_args=branch_args, trunk_args=trunk_args)
+        normalization = {
+            "coord_min": [0, 0, 0],
+            "coord_scale": [1, 1, 1],
+            "target_mean": [0, 0, 0, 0],
+            "target_std": [1, 1, 1, 1],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "physics.pth"
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "model_config": {
+                        "branch_args": branch_args,
+                        "trunk_args": trunk_args,
+                    },
+                    "normalization": normalization,
+                },
+                checkpoint,
+            )
+            loaded, loaded_normalization = load_ginot_checkpoint(checkpoint)
+
+        self.assertIsInstance(loaded, PhysicsGINOTModel)
+        self.assertEqual(loaded_normalization.target_std, (1.0, 1.0, 1.0, 1.0))

@@ -35,6 +35,7 @@ const ROTATE_STEP_RAD = Math.PI / 4
 const DEFAULT_CEILING_HEIGHT = 2.5
 /** Snap radius (meters) for mating the collar onto a nearby duct port. */
 const PORT_SNAP_RADIUS_M = 0.5
+const EMPTY_DEFAULTS: Record<string, unknown> = {}
 
 type Mount = DuctTerminalNode['mount']
 const MOUNT_CYCLE: Mount[] = ['floor', 'ceiling', 'wall']
@@ -149,13 +150,20 @@ function resolvePortSnap(
 const DuctTerminalTool = () => {
   const { camera, gl } = useThree()
   const activeLevelId = useViewer((s) => s.selection.levelId)
-  const [mount, setMount] = useState<Mount>('floor')
+  const defaults = useEditor((s) => s.toolDefaults['duct-terminal']) ?? EMPTY_DEFAULTS
+  const initialMount = (defaults.mount as Mount | undefined) ?? 'floor'
+  const [mount, setMount] = useState<Mount>(initialMount)
   const [placement, setPlacement] = useState<Placement | null>(null)
 
-  const mountRef = useRef<Mount>('floor')
+  const mountRef = useRef<Mount>(initialMount)
   const yawRef = useRef(0)
   const raycaster = useRef(new Raycaster())
   const pointer = useRef(new Vector2())
+
+  useEffect(() => {
+    mountRef.current = initialMount
+    setMount(initialMount)
+  }, [initialMount])
 
   // The ghost mirrors whatever mount will actually be committed: a snap can
   // override the manual M selection (port direction picks floor / ceiling /
@@ -165,10 +173,11 @@ const DuctTerminalTool = () => {
     () =>
       DuctTerminalNode.parse({
         ...ductTerminalDefinition.defaults(),
-        name: 'Register',
+        ...defaults,
+        name: (defaults.name as string | undefined) ?? 'Register',
         mount: effectiveMount,
       }),
-    [effectiveMount],
+    [defaults, effectiveMount],
   )
   const ghost = useMemo(() => {
     const group = buildDuctTerminalGeometry(previewNode)
@@ -280,7 +289,8 @@ const DuctTerminalTool = () => {
     const commit = (p: Placement) => {
       const terminal = DuctTerminalNode.parse({
         ...ductTerminalDefinition.defaults(),
-        name: 'Register',
+        ...defaults,
+        name: (defaults.name as string | undefined) ?? 'Register',
         mount: p.mount,
         position: p.position,
         rotation: p.yaw,
@@ -377,7 +387,7 @@ const DuctTerminalTool = () => {
       window.removeEventListener('keydown', onKeyDown, true)
       clearDrawAlignment()
     }
-  }, [activeLevelId, camera, gl])
+  }, [activeLevelId, camera, defaults, gl])
 
   if (!activeLevelId || !placement) return null
 

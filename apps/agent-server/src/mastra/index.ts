@@ -26,7 +26,7 @@ const mcp = new MCPClient({
   servers: {
     pascal: {
       command: 'bunx',
-      args: ['pascal-mcp', '--stdio'],
+      args: ['--package', '@pascal-app/mcp', 'pascal-mcp', '--stdio'],
       env: {
         PASCAL_DATA_DIR:
           process.env.PASCAL_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.pascal', 'data'),
@@ -44,7 +44,14 @@ Use the HVAC workflow tools for every engineering run.
 Never calculate terminal coordinates, KPIs, rules, scores, rankings, or report values yourself.
 `,
   model: process.env.PIGINOT_AGENT_MODEL ?? 'openai/gpt-4.1-mini',
-  tools: { ...(await mcp.listTools()), ...hvacTools },
+  tools: {
+    ...(await mcp.listTools().then((tools) => {
+      if (!Object.keys(tools).some((name) => name === 'get_scene' || name.endsWith('_get_scene')))
+        throw new Error('Pascal MCP did not register get_scene')
+      return tools
+    })),
+    ...hvacTools,
+  },
 })
 
 export const mastra = new Mastra({

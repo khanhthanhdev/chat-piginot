@@ -11,6 +11,7 @@ from app.api_mesh import hvac_inference_from_mesh
 from app.inference import get_inference_runtime
 from app.mesh import load_mesh, normalize_mesh, sample_interior_points, sample_surface_points
 from app.mesh_pipeline import preprocess_mesh_inference
+from app.models.ginot import PhysicsNormalization
 from app.schemas import MeshInferenceRequest
 from app.settings import get_settings
 
@@ -117,11 +118,18 @@ class MeshUtilityTests(unittest.TestCase):
                         "kind": "supply",
                         "center": [0.5, 0.5, 0.5],
                         "direction": [2.0, 0.0, 0.0],
+                        "width": 0.4,
+                        "depth": 0.2,
+                        "mount": "wall",
+                        "rotation": np.pi / 2,
                     },
                     {
                         "id": "return-1",
                         "kind": "return",
                         "center": [0.75, 0.75, 0.75],
+                        "width": 0.2,
+                        "depth": 0.2,
+                        "mount": "ceiling",
                     },
                 ],
                 "options": {
@@ -147,6 +155,63 @@ class MeshUtilityTests(unittest.TestCase):
         self.assertEqual(preprocessed.sampling.quality, "preview")
         self.assertEqual(preprocessed.sampling.boundary_count, 100)
         self.assertEqual(preprocessed.sampling.interior_count, 12)
+
+    def test_preprocess_mesh_inference_builds_physics_boundary_features(self):
+        request = MeshInferenceRequest.model_validate(
+            {
+                "diffusers": [
+                    {
+                        "id": "supply-1",
+                        "kind": "supply",
+                        "center": [0.5, 0.5, 0.5],
+                        "direction": [2.0, 0.0, 0.0],
+                        "width": 0.4,
+                        "depth": 0.2,
+                        "mount": "wall",
+                        "rotation": np.pi / 2,
+                    },
+                    {
+                        "id": "return-1",
+                        "kind": "return",
+                        "center": [0.75, 0.75, 0.75],
+                        "width": 0.2,
+                        "depth": 0.2,
+                        "mount": "ceiling",
+                    },
+                ],
+                "options": {"quality": "preview", "boundaryCount": 100, "interiorCount": 12},
+            }
+        )
+        normalization = PhysicsNormalization(
+            coord_min=(0.0, 0.0, 0.0),
+            coord_scale=(2.0, 2.0, 2.0),
+            target_mean=(1.0, 2.0, 3.0, 4.0),
+            target_std=(2.0, 2.0, 2.0, 2.0),
+        )
+
+        preprocessed = preprocess_mesh_inference(
+            request,
+            mesh_bytes=_build_cube_stl(),
+            filename="cube.stl",
+            rng=np.random.default_rng(0),
+            normalization=normalization,
+        )
+        pc = preprocessed.pc.squeeze(0).numpy()
+
+        self.assertEqual(pc.shape, (100, 12))
+        wall = pc[pc[:, 4] == 1]
+        inlet = pc[pc[:, 5] == 1]
+        outlet = pc[pc[:, 6] == 1]
+        inlet_world = inlet[:, :3] * 2
+        self.assertGreater(len(inlet), 1)
+        self.assertTrue(np.allclose(inlet_world[:, 0], 0.5))
+        self.assertGreater(np.ptp(inlet_world[:, 1]), 0.1)
+        self.assertGreater(np.ptp(inlet_world[:, 2]), 0.3)
+        self.assertTrue(np.allclose(wall[:, 8:], [-0.5, -1.0, -1.5, 0.0]))
+        self.assertTrue(np.allclose(inlet[:, 8:], [0.5, -1.0, -1.5, 0.0]))
+        self.assertTrue(np.allclose(outlet[:, 8:], [0.0, 0.0, 0.0, -2.0]))
+        self.assertTrue(np.all(preprocessed.xyt.numpy() >= 0.0))
+        self.assertTrue(np.all(preprocessed.xyt.numpy() <= 0.5))
 
     def test_grid_sampling_is_deterministic_and_row_major(self):
         request = MeshInferenceRequest.model_validate(

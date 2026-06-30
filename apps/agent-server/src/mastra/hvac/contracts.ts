@@ -84,6 +84,16 @@ export const optimizationRequestSchema = z
     if (request.variables.supplySpacingM.min <= 0 || request.variables.returnSpacingM.min <= 0) {
       context.addIssue({ code: 'custom', message: 'Terminal spacing must be positive' })
     }
+    const candidateCount = Object.values(request.variables).reduce(
+      (product, range) => product * (Math.floor((range.max - range.min) / range.step + 1e-9) + 1),
+      1,
+    )
+    if (candidateCount > 100_000) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Variable ranges must generate at most 100000 candidates',
+      })
+    }
   })
 
 export type OptimizationRequest = z.infer<typeof optimizationRequestSchema>
@@ -108,6 +118,9 @@ export type Terminal = {
   centre: Vec3
   direction: Vec3
   faceVelocity: number
+  width: number
+  depth: number
+  rotation: number
 }
 
 export type Kpis = {
@@ -117,6 +130,12 @@ export type Kpis = {
   deadZoneRatio: number
   airSweepCoverage: number
   uniformity: number
+}
+
+export type ModelIdentity = {
+  id: string
+  version: string
+  source: string
 }
 
 export type Candidate = {
@@ -163,9 +182,21 @@ export type RunRecord = {
   status: OptimizationContext['status']
   candidates: Candidate[]
   ranking: string[]
+  modelIdentity?: ModelIdentity
   events: ProgressEvent[]
   report?: { markdownPath: string; jsonPath: string }
   errorSummary?: string
   createdAt: string
   updatedAt: string
+}
+
+export function publicCandidate(runId: string, candidate: Candidate) {
+  const base = `/api/v1/hvac/runs/${encodeURIComponent(runId)}/candidates/${encodeURIComponent(candidate.id)}`
+  const { artifact: _, ...publicFields } = candidate
+  return {
+    ...publicFields,
+    artifactAvailable: Boolean(candidate.artifact),
+    fieldUrl: candidate.artifact ? `${base}/field` : undefined,
+    planeUrl: candidate.artifact ? `${base}/plane` : undefined,
+  }
 }

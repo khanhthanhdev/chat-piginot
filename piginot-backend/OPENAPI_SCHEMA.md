@@ -141,7 +141,11 @@ Perform CFD inference directly from a mesh file (STL/OBJ). The endpoint handles 
       "kind": "supply",
       "center": [0.0, 0.0, 3.0],
       "direction": [0.0, 0.0, -1.0],
-      "airflowRate": 2.5
+      "airflowRate": 2.5,
+      "width": 0.6,
+      "depth": 0.6,
+      "mount": "ceiling",
+      "rotation": 0.0
     },
     {
       "id": "return_1",
@@ -220,6 +224,10 @@ HVAC diffuser configuration.
 | `center` | array[float] | ✓ | Diffuser center location [x, y, z] |
 | `direction` | array[float] | ✗ | Flow direction [dx, dy, dz] (normalized internally) |
 | `airflowRate` | float | ✗ | Inlet speed in m/s (uses direction magnitude if omitted for supply) |
+| `width` | float | ✗ | Terminal face width in meters; requires `depth` |
+| `depth` | float | ✗ | Terminal face depth in meters; requires `width` |
+| `mount` | string | ✗ | `floor`, `ceiling`, or `wall`; defaults to `floor` |
+| `rotation` | float | ✗ | Terminal yaw in radians; defaults to `0` |
 
 ### MeshInferenceOptions
 

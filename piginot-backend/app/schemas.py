@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MetadataInput(BaseModel):
@@ -88,6 +89,36 @@ class DiffuserInput(BaseModel):
             "If omitted for a supply diffuser, the direction vector magnitude is used."
         ),
     )
+    width: float | None = Field(
+        default=None,
+        gt=0,
+        description="Terminal face width in meters.",
+    )
+    depth: float | None = Field(
+        default=None,
+        gt=0,
+        description="Terminal face depth in meters.",
+    )
+    mount: Literal["floor", "ceiling", "wall"] = Field(
+        default="floor",
+        description="Surface carrying the terminal face.",
+    )
+    rotation: float = Field(
+        default=0.0,
+        description="Terminal yaw in radians.",
+    )
+
+    @model_validator(mode="after")
+    def validate_surface_dimensions(self) -> "DiffuserInput":
+        if (self.width is None) != (self.depth is None):
+            raise ValueError("width and depth must be provided together")
+        if not math.isfinite(self.rotation):
+            raise ValueError("rotation must be finite")
+        if self.width is not None and self.depth is not None and not (
+            math.isfinite(self.width) and math.isfinite(self.depth)
+        ):
+            raise ValueError("width and depth must be finite")
+        return self
 
 
 class MeshInferenceOptions(BaseModel):
@@ -139,6 +170,7 @@ class MeshInferenceRequest(BaseModel):
     diffusers: list[DiffuserInput] = Field(
         ...,
         min_length=2,
+        max_length=64,
         description="List of supply and/or return diffusers. Minimum 2 diffusers required (e.g., 1 supply + 1 return).",
     )
     options: MeshInferenceOptions = Field(
@@ -287,6 +319,9 @@ class BatchTerminal(BaseModel):
     centre: tuple[float, float, float]
     direction: tuple[float, float, float]
     faceVelocity: float = Field(..., gt=0)
+    width: float = Field(..., gt=0)
+    depth: float = Field(..., gt=0)
+    rotation: float = 0.0
 
 
 class BatchCandidate(BaseModel):

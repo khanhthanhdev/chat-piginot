@@ -34,12 +34,20 @@ Diffuser payload:
     "kind": "supply",
     "center": [5.2, 2.4, 1.8],
     "direction": [0.0, -1.0, 0.0],
-    "airflowRate": 1.8
+    "airflowRate": 1.8,
+    "width": 0.6,
+    "depth": 0.6,
+    "mount": "ceiling",
+    "rotation": 0.0
   },
   {
     "id": "return-1",
     "kind": "return",
-    "center": [5.2, 2.4, 8.1]
+    "center": [5.2, 2.4, 8.1],
+    "width": 0.8,
+    "depth": 0.4,
+    "mount": "wall",
+    "rotation": 1.5708
   }
 ]
 ```
@@ -52,6 +60,8 @@ Diffuser rules:
 | At least one `return` diffuser is required | Backend derives the outlet center from return diffusers. |
 | At least one supply diffuser must have non-zero `direction` | Required to produce the model inlet velocity vector. |
 | `center` and `direction` must contain 3 finite values | Request is rejected otherwise. |
+| `width` and `depth` must be supplied together | Physics-boundary models sample the complete terminal face. |
+| `mount` is `floor`, `ceiling`, or `wall` | Together with yaw `rotation`, it orients the sampled face. |
 | Diffuser IDs must be unique | Duplicate IDs are rejected. |
 
 Velocity derivation:

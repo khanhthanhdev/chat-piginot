@@ -64,6 +64,7 @@ type MepItem = {
   label: string
   iconSrc: string
   kind: MepToolKind
+  defaults?: Record<string, unknown>
 }
 
 // Same icons + ordering as the community Build sidebar, minus presets.
@@ -90,10 +91,18 @@ const BUILD_TYPES: BuildType[] = [
 const MEP_ITEMS: MepItem[] = [
   { id: 'duct-segment', label: 'Duct', iconSrc: '/icons/duct.webp', kind: 'duct-segment' },
   {
-    id: 'duct-terminal',
-    label: 'Register',
+    id: 'inlet-diffuser',
+    label: 'Inlet Diffuser',
     iconSrc: '/icons/registers.webp',
     kind: 'duct-terminal',
+    defaults: { terminalType: 'return-grille', mount: 'ceiling', name: 'Inlet Diffuser' },
+  },
+  {
+    id: 'outlet-diffuser',
+    label: 'Outlet Diffuser',
+    iconSrc: '/icons/registers.webp',
+    kind: 'duct-terminal',
+    defaults: { terminalType: 'diffuser', mount: 'ceiling', name: 'Outlet Diffuser' },
   },
   { id: 'hvac-equipment', label: 'HVAC Unit', iconSrc: '/icons/HVAC.webp', kind: 'hvac-equipment' },
   { id: 'lineset', label: 'Lineset', iconSrc: '/icons/lineset.webp', kind: 'lineset' },
@@ -106,12 +115,15 @@ const MEP_ITEMS: MepItem[] = [
  * Activate a raw structure draw/cursor tool. Mirrors the editor's own
  * structure-tool activation (`setPhase`/`setStructureLayer`/`setMode`/`setTool`).
  */
-function activateBuildTool(kind: BuildToolKind | MepToolKind): void {
+function activateBuildTool(
+  kind: BuildToolKind | MepToolKind,
+  defaults: Record<string, unknown> | null = null,
+): void {
   const ed = useEditor.getState()
   ed.setPhase('structure')
   ed.setStructureLayer('elements')
   ed.setCatalogCategory(null)
-  ed.setToolDefaults(kind, null)
+  ed.setToolDefaults(kind, defaults)
   ed.setMode('build')
   ed.setTool(kind)
 }
@@ -179,7 +191,11 @@ export function BuildTab() {
         ? pipeContext
         : item.kind === 'liquid-line'
           ? liquidLineContext
-          : mode === 'build' && activeTool === item.kind
+          : mode === 'build' &&
+            activeTool === item.kind &&
+            (!item.defaults ||
+              useEditor.getState().toolDefaults[item.kind]?.terminalType ===
+                item.defaults.terminalType)
 
   // Read at render time (not module scope): the registry is populated by the
   // app bootstrap, so enumerating earlier would race it and see no kinds.
@@ -342,7 +358,7 @@ export function BuildTab() {
                         )}
                         onClick={() => {
                           triggerSFX('sfx:menu-click')
-                          activateBuildTool(item.kind)
+                          activateBuildTool(item.kind, item.defaults ?? null)
                         }}
                         onMouseEnter={() => triggerSFX('sfx:menu-hover')}
                         type="button"

@@ -114,6 +114,12 @@ The agent server provides chat plus structured routes for:
 - cancellation;
 - deletion.
 
+Ranking responses contain `ranking` for every successful candidate in
+deterministic order, `failedCandidates`, `candidateCount`, and
+`successfulCandidateCount`. Candidate, ranking, tool, and report payloads expose
+only `fieldUrl`, `planeUrl`, and `artifactAvailable`; server filesystem paths
+are never public.
+
 The editor calls only the agent server. PiGINOT exposes
 `POST /api/v1/hvac-inference-batch` through REST and the existing FastMCP mount.
 PiGINOT returns model identity, grid metadata, per-candidate status, and
@@ -127,6 +133,28 @@ Mastra workflow snapshots use local LibSQL at
 is retained at
 `${PASCAL_DATA_DIR}/agent-server/hvac-runs/{runId}/fields/{candidateId}.f32`
 with a JSON sidecar. Deletion is explicit and removes the entire run.
+Fields, sidecars, run metadata, and reports are committed by atomic rename.
+Cancellation aborts active inference, retry delays, and artifact writes before
+deletion proceeds.
+
+## Editor behavior
+
+The standalone editor reads the central server URL from
+`NEXT_PUBLIC_PASCAL_AGENT_SERVER_URL`, defaulting to
+`http://localhost:4111`. Results are transient and project-scoped. Each room
+retains its run ID, complete ranking, failed candidates, selected candidate,
+and lazily fetched previews. The only supported previews are occupied-plane
+velocity magnitude and full-grid velocity-magnitude points. Optimization never
+mutates the scene or places terminals.
+
+## Model gate
+
+The batch endpoint uses a compatible physics-boundary checkpoint when one is
+configured. The checked-in fallback predictor is identified as
+`analytic-test-fixture`; both PiGINOT and the agent server reject it unless
+`PIGINOT_ALLOW_SYNTHETIC=true`. That opt-in is for development and tests only.
+Physical validation and real-model benchmarks remain blocked on a compatible
+user-provided checkpoint with normalization metadata.
 
 ## Acceptance
 

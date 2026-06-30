@@ -58,11 +58,15 @@ twice, after one and two seconds. Candidate failures are retained. Validation
 failure or zero successful predictions fails the run.
 
 Before inference, an existing field is reused only when its byte length equals
-`nx × ny × nz × 4`. Missing or invalid artifacts restart from the first batch
-that contains them.
+`nx × ny × nz × 4`, every Float32 value is finite, model identity and complete
+grid metadata match, all six terminals match, and the sidecar is complete.
+Missing or invalid artifacts restart from the first batch that contains them.
+Fields, sidecars, reports, and run metadata use temporary files plus atomic
+rename.
 
 Events contain run ID, monotonic sequence, workflow ID, candidate counts,
-status, optional error summary, and timestamp.
+status, optional error summary, and timestamp. SSE reconnects resume after
+`Last-Event-ID` or the `after` query value.
 
 ## Storage and API
 
@@ -74,6 +78,9 @@ and reports use
 The agent server exposes start, status, SSE events, ranking, candidate, raw
 field, occupied plane, report, cancel, and delete routes under
 `/api/v1/hvac/runs`. It also exposes the same run controls as HVAC-agent tools.
+Both adapters call the same service functions. Rankings return successful
+candidates, failed candidate summaries, and total/successful counts. Public
+payloads contain URLs and availability flags, never artifact paths.
 
 ## Numerical evaluation
 
@@ -87,3 +94,8 @@ server.
 Production ranking requires a real independent 3+3 checkpoint adapter.
 The checked-in nine-value averaged inlet/outlet checkpoint is incompatible and
 must never be presented as a 3+3 model.
+
+The checked-in six-terminal analytic implementation is identified as
+`analytic-test-fixture` and is rejected unless
+`PIGINOT_ALLOW_SYNTHETIC=true`. It exists only for development and contract
+tests; it is not the production adapter.

@@ -123,3 +123,20 @@ class ValidatorTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Duplicate diffuser id"):
             validate_mesh_request(request, filename="room.stl")
+
+    def test_diffuser_surface_dimensions_must_be_complete(self):
+        with self.assertRaisesRegex(ValueError, "width and depth"):
+            MeshInferenceRequest.model_validate(
+                {
+                    "diffusers": [
+                        {
+                            "id": "supply-1",
+                            "kind": "supply",
+                            "center": [0, 0, 0],
+                            "direction": [0, -1, 0],
+                            "width": 0.3,
+                        },
+                        {"id": "return-1", "kind": "return", "center": [1, 1, 1]},
+                    ]
+                }
+            )

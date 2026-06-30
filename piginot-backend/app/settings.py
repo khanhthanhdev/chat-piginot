@@ -58,5 +58,6 @@ def get_settings() -> Settings:
         cors_allow_origins=_split_csv(os.getenv("CORS_ALLOW_ORIGINS"), default_origins),
         rate_limit_times=int(os.getenv("RATE_LIMIT_TIMES", "10")),
         rate_limit_window_seconds=int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
-        allow_fallback_model=os.getenv("GINOT_ALLOW_FALLBACK_MODEL", "true").strip().lower() not in {"0", "false", "no"},
+        allow_fallback_model=os.getenv("PIGINOT_ALLOW_SYNTHETIC", "").strip().lower()
+        in {"1", "true", "yes"},
     )

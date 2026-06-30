@@ -145,6 +145,7 @@ class MeshInferenceOptions(BaseModel):
         default=False,
         description="If true, return results as a 3D grid. Otherwise returns point cloud results.",
     )
+    generateVisualization: bool = Field(default=False)
 
 
 class MeshInferenceContext(BaseModel):

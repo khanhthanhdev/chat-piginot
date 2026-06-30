@@ -57,10 +57,7 @@ const ScanModel = ({ url, opacity }: { url: string; opacity: number }) => {
         // Disable raycasting
         mesh.raycast = () => {}
 
-        // Exclude from bounding box calculations
-        mesh.geometry.boundingBox = null
-        mesh.geometry.boundingSphere = null
-        mesh.frustumCulled = false
+        if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere()
 
         if (Array.isArray(mesh.material)) {
           mesh.material.forEach((material) => {

@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, status
 from .schemas import GinotInferenceRequest, GinotInferenceResponse
 from .services.common import InferenceTimeoutError
 from .services.inference_service import execute_legacy_inference
+from .services.execution import run_inference_in_worker
 
 
 LOGGER = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ router = APIRouter(prefix="/api", tags=["ginot"])
 )
 async def hvac_inference(request: GinotInferenceRequest) -> GinotInferenceResponse:
     try:
-        return execute_legacy_inference(request)
+        return await run_inference_in_worker(lambda: execute_legacy_inference(request))
     except InferenceTimeoutError as exc:
         LOGGER.warning("inference_flow=legacy error=%s", exc)
         raise HTTPException(

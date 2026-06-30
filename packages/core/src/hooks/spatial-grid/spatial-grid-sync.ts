@@ -106,9 +106,13 @@ export function initSpatialGridSync(): () => void {
 
   // Subscribe to all changes
   const unsubscribe = store.subscribe((state, prevState) => {
+    if (state.nodes === prevState.nodes) return
+    const ids = new Set([...Object.keys(state.nodes), ...Object.keys(prevState.nodes)])
     // Detect added nodes
-    for (const [id, node] of Object.entries(state.nodes)) {
-      if (!prevState.nodes[id as AnyNode['id']]) {
+    for (const id of ids) {
+      const node = state.nodes[id as AnyNode['id']]
+      const prev = prevState.nodes[id as AnyNode['id']]
+      if (node && !prev) {
         const levelId = resolveLevelId(node, state.nodes)
         spatialGridManager.handleNodeCreated(node, levelId)
 
@@ -116,28 +120,15 @@ export function initSpatialGridSync(): () => void {
         if (node.type === 'slab') {
           markNodesOverlappingSlab(node as SlabNode, state.nodes, markDirty)
         }
-      }
-    }
-
-    // Detect removed nodes
-    for (const [id, node] of Object.entries(prevState.nodes)) {
-      if (!state.nodes[id as AnyNode['id']]) {
-        const levelId = resolveLevelId(node, prevState.nodes)
-        spatialGridManager.handleNodeDeleted(id, node.type, levelId)
+      } else if (prev && !node) {
+        const levelId = resolveLevelId(prev, prevState.nodes)
+        spatialGridManager.handleNodeDeleted(id, prev.type, levelId)
 
         // When a slab is removed, mark items/walls that were on it dirty (using current state)
-        if (node.type === 'slab') {
-          markNodesOverlappingSlab(node as SlabNode, state.nodes, markDirty)
+        if (prev.type === 'slab') {
+          markNodesOverlappingSlab(prev as SlabNode, state.nodes, markDirty)
         }
-      }
-    }
-
-    // Detect updated nodes (items with position/rotation/parentId/side changes, slabs with polygon/elevation changes)
-    for (const [id, node] of Object.entries(state.nodes)) {
-      const prev = prevState.nodes[id as AnyNode['id']]
-      if (!prev) continue
-
-      if (node.type === 'item' && prev.type === 'item') {
+      } else if (node && prev && node !== prev && node.type === 'item' && prev.type === 'item') {
         if (
           !(
             arraysEqual(node.position, prev.position) &&
@@ -154,7 +145,7 @@ export function initSpatialGridSync(): () => void {
             markDirty(node.id)
           }
         }
-      } else if (node.type === 'slab' && prev.type === 'slab') {
+      } else if (node && prev && node !== prev && node.type === 'slab' && prev.type === 'slab') {
         if (
           node.polygon !== prev.polygon ||
           node.elevation !== prev.elevation ||

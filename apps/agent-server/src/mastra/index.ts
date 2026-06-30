@@ -7,7 +7,7 @@ import { LibSQLStore } from '@mastra/libsql'
 import { MCPClient } from '@mastra/mcp'
 import { hvacRoutes } from './hvac/routes'
 import { recoverRuns } from './hvac/service'
-import { dataRoot } from './hvac/store'
+import { dataRoot, pruneRuns } from './hvac/store'
 import { hvacTools } from './hvac/tools'
 import {
   candidateGenerationWorkflow,
@@ -77,4 +77,4 @@ export const mastra = new Mastra({
   mcpServers: await mcp.toMCPServerProxies(),
 })
 
-void recoverRuns(mastra)
+void pruneRuns().then(() => recoverRuns(mastra))

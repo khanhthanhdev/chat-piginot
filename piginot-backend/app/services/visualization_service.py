@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -8,6 +9,16 @@ import numpy as np
 import plotly.graph_objects as go
 
 LOGGER = logging.getLogger(__name__)
+
+
+def prune_visualizations(output_dir: str = "data/visualizations") -> None:
+    root = Path(output_dir).resolve()
+    cutoff = time.time() - float(os.getenv("VISUALIZATION_TTL_HOURS", "24")) * 3600
+    if not root.exists():
+        return
+    for path in root.glob("*.html"):
+        if path.stat().st_mtime < cutoff:
+            path.unlink()
 
 
 def generate_pressure_velocity_visualization(
@@ -43,6 +54,7 @@ def generate_pressure_velocity_visualization(
 
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    prune_visualizations(output_dir)
 
     timestamp = int(time.time() * 1000)
     html_filename = f"{inference_id}_{timestamp}.html"

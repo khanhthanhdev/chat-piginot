@@ -83,20 +83,20 @@ def execute_mesh_inference(
         len(preprocessed.positions_world),
     )
 
-    # Generate visualization
     visualization_path = None
     inference_id = f"ginot_{uuid.uuid4().hex[:8]}"
 
-    try:
-        visualization_path = generate_pressure_velocity_visualization(
-            positions=preprocessed.positions_world,
-            velocities=prediction.velocities,
-            pressure=prediction.pressure,
-            speed=prediction.speed,
-            inference_id=inference_id,
-        )
-    except Exception as exc:
-        LOGGER.warning("request_id=%s failed to generate visualization: %s", request_id, exc)
+    if mesh_request.options.generateVisualization:
+        try:
+            visualization_path = generate_pressure_velocity_visualization(
+                positions=preprocessed.positions_world,
+                velocities=prediction.velocities,
+                pressure=prediction.pressure,
+                speed=prediction.speed,
+                inference_id=inference_id,
+            )
+        except Exception as exc:
+            LOGGER.warning("request_id=%s failed to generate visualization: %s", request_id, exc)
 
     return build_inference_response(
         positions=preprocessed.positions_world,

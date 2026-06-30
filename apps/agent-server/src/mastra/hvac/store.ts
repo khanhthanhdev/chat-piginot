@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type {
   OptimizationContext,
@@ -19,6 +19,7 @@ export function runRoot(runId: string) {
 }
 
 export async function createRunRecord(runId: string, request: OptimizationRequest) {
+  await pruneRuns()
   const now = new Date().toISOString()
   const record: RunRecord = {
     runId,
@@ -83,6 +84,23 @@ export async function atomicWriteFile(
 
 export async function deleteRunRecord(runId: string) {
   await rm(runRoot(runId), { recursive: true, force: true })
+}
+
+export async function pruneRuns() {
+  const cutoff = Date.now() - Number(process.env.PASCAL_HVAC_RUN_TTL_HOURS ?? '24') * 60 * 60 * 1000
+  for (const entry of await readdir(runsRoot, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory()) continue
+    try {
+      const record = await loadRun(entry.name)
+      if (
+        ['completed', 'failed', 'canceled'].includes(record.status) &&
+        Date.parse(record.updatedAt) < cutoff
+      )
+        await deleteRunRecord(entry.name)
+    } catch {
+      // Corrupt records require manual inspection.
+    }
+  }
 }
 
 export async function addEvent(

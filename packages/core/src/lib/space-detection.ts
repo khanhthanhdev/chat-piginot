@@ -1119,9 +1119,10 @@ export function initSpaceDetectionSync(sceneStore: any, editorStore: any): () =>
   const previousSnapshots = new Map<string, string>()
   let isProcessing = false
 
-  const unsubscribe = sceneStore.subscribe((state: any) => {
+  const unsubscribe = sceneStore.subscribe((state: any, previousState: any) => {
     if (isProcessing) return
     if (getSceneHistoryPauseDepth() > 0) return
+    if (state.nodes === previousState.nodes) return
 
     const nodes = state.nodes
     const currentSnapshots = levelStructureSnapshots(nodes)

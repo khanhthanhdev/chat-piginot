@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from .schemas import HvacInferenceBatchRequest, HvacInferenceBatchResponse
 from .services.batch_inference_service import execute_batch_inference
+from .services.execution import run_inference_in_worker
 
 
 router = APIRouter(prefix="/api/v1", tags=["ginot-batch"])
@@ -18,6 +19,6 @@ async def hvac_inference_batch(
     request: HvacInferenceBatchRequest,
 ) -> HvacInferenceBatchResponse:
     try:
-        return execute_batch_inference(request)
+        return await run_inference_in_worker(lambda: execute_batch_inference(request))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

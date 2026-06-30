@@ -37,6 +37,8 @@ class Settings:
     rate_limit_times: int
     rate_limit_window_seconds: int
     allow_fallback_model: bool
+    batch_inference_chunk_size: int
+    visualization_ttl_hours: float
 
     @property
     def device(self) -> str:
@@ -60,4 +62,6 @@ def get_settings() -> Settings:
         rate_limit_window_seconds=int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
         allow_fallback_model=os.getenv("PIGINOT_ALLOW_SYNTHETIC", "").strip().lower()
         in {"1", "true", "yes"},
+        batch_inference_chunk_size=max(1, int(os.getenv("BATCH_INFERENCE_CHUNK_SIZE", "4"))),
+        visualization_ttl_hours=float(os.getenv("VISUALIZATION_TTL_HOURS", "24")),
     )

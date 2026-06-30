@@ -79,9 +79,7 @@ interface SceneLoaderProps {
   meta: SceneMeta
 }
 
-type SceneGraphWithCollections = SceneGraph & {
-  collections?: Record<string, unknown>
-}
+type SceneGraphWithCollections = SceneGraph & { collections?: Record<string, unknown> }
 
 interface LiveSceneEvent {
   eventId: number
@@ -92,18 +90,9 @@ interface LiveSceneEvent {
   graph: SceneGraphWithCollections
 }
 
-function sceneGraphSignature(graph: SceneGraphWithCollections): string {
-  return JSON.stringify({
-    nodes: graph.nodes,
-    rootNodeIds: graph.rootNodeIds,
-    collections: graph.collections,
-  })
-}
-
 export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
   const router = useRouter()
   const versionRef = useRef(meta.version)
-  const lastRemoteGraphJsonRef = useRef<string | null>(null)
   const suppressRemoteSaveUntilRef = useRef(0)
   const [conflict, setConflict] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -112,13 +101,7 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
 
   const handleSave = useCallback(
     async (graph: SceneGraph, options?: { keepalive?: boolean }) => {
-      const graphJson = sceneGraphSignature(graph)
       const isRecentRemoteApply = Date.now() < suppressRemoteSaveUntilRef.current
-      if (lastRemoteGraphJsonRef.current === graphJson) {
-        lastRemoteGraphJsonRef.current = null
-        suppressRemoteSaveUntilRef.current = 0
-        return
-      }
       if (isRecentRemoteApply) return
 
       try {
@@ -170,7 +153,6 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
       if (payload.version <= versionRef.current) return
 
       versionRef.current = payload.version
-      lastRemoteGraphJsonRef.current = sceneGraphSignature(payload.graph)
       suppressRemoteSaveUntilRef.current = Date.now() + 2500
       applySceneGraphToEditor(payload.graph)
       setConflict(false)

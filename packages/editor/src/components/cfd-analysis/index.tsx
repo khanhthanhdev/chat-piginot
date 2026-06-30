@@ -98,6 +98,14 @@ type CfdState = {
 
 let activeController: AbortController | null = null
 
+function deleteRuns(results: Record<string, RoomResult>) {
+  for (const { apiBaseUrl, runId } of Object.values(results))
+    void fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs/${runId}`, {
+      method: 'DELETE',
+      keepalive: true,
+    })
+}
+
 export const useCfdAnalysis = create<CfdState>((set) => ({
   apiBaseUrl: '',
   projectId: null,
@@ -115,6 +123,7 @@ export const useCfdAnalysis = create<CfdState>((set) => ({
   clear: () => {
     activeController?.abort()
     activeController = null
+    deleteRuns(useCfdAnalysis.getState().results)
     set((state) => ({
       results: {},
       failures: {},
@@ -342,8 +351,8 @@ async function runRoom(
   signal.addEventListener(
     'abort',
     () => {
-      void fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs/${runId}/cancel`, {
-        method: 'POST',
+      void fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/v1/hvac/runs/${runId}`, {
+        method: 'DELETE',
       })
     },
     { once: true },
@@ -478,13 +487,16 @@ export function CfdAnalysisPanel({
             progress: { ...current.progress, [space.id]: progress },
           })),
         )
-        if (result && generation === useCfdAnalysis.getState().generation)
+        if (result && generation === useCfdAnalysis.getState().generation) {
+          const previous = useCfdAnalysis.getState().results[space.id]
+          if (previous) deleteRuns({ [space.id]: previous })
           useCfdAnalysis.setState((s) => ({
             results: { ...s.results, [space.id]: result },
             failures: Object.fromEntries(
               Object.entries(s.failures).filter(([id]) => id !== space.id),
             ),
           }))
+        }
       } catch (error) {
         if (!controller.signal.aborted && generation === useCfdAnalysis.getState().generation)
           useCfdAnalysis.setState((s) => ({
@@ -525,7 +537,9 @@ export function CfdAnalysisPanel({
           [roomId]: {
             ...room,
             selectedCandidateId: candidateId,
-            views: { ...room.views, [candidateId]: views },
+            views: Object.fromEntries(
+              [...Object.entries(room.views), [candidateId, views]].slice(-2),
+            ),
           },
         },
       }))
@@ -680,6 +694,7 @@ export function CfdAnalysisPanel({
 export function ConfiguredCfdAnalysisPanel() {
   const apiBaseUrl = useCfdAnalysis((state) => state.apiBaseUrl)
   const projectId = useCfdAnalysis((state) => state.projectId)
+  useEffect(() => () => useCfdAnalysis.getState().clear(), [projectId])
   return <CfdAnalysisPanel apiBaseUrl={apiBaseUrl} projectId={projectId} />
 }
 

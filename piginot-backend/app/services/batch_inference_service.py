@@ -153,6 +153,10 @@ def _validate_request(request: HvacInferenceBatchRequest) -> None:
         raise ValueError("Room maximum must be greater than minimum")
     if np.any(shape <= 0) or np.any(spacing <= 0):
         raise ValueError("Grid shape and spacing must be positive")
+    if int(np.prod(shape, dtype=np.int64)) > get_settings().max_interior_points:
+        raise ValueError(
+            f"Grid contains more than {get_settings().max_interior_points} interior points"
+        )
     for candidate in request.candidates:
         ids = [terminal.id for terminal in candidate.terminals]
         if len(ids) != len(set(ids)):

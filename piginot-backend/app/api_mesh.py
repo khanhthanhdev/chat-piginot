@@ -10,6 +10,7 @@ from .http.mesh_form import parse_mesh_form_request
 from .schemas import GinotInferenceResponse
 from .services.common import InferenceTimeoutError
 from .services.mesh_inference_service import execute_mesh_inference
+from .services.execution import run_inference_in_worker
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,10 +37,12 @@ async def hvac_inference_from_mesh(request: Request) -> GinotInferenceResponse:
 
     try:
         mesh_request, mesh_file = await parse_mesh_form_request(request)
-        return execute_mesh_inference(
-            mesh_request,
-            mesh_file,
-            request_id=request_id,
+        return await run_inference_in_worker(
+            lambda: execute_mesh_inference(
+                mesh_request,
+                mesh_file,
+                request_id=request_id,
+            )
         )
     except InferenceTimeoutError as exc:
         LOGGER.warning("request_id=%s error=%s", request_id, exc)

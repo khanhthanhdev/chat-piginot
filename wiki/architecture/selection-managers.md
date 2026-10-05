@@ -36,6 +36,12 @@ return <mesh ref={ref} {...events} />
 
 Events are suppressed during camera drag (`useViewer.getState().cameraDragging`).
 
+Selection/hover picking is only meaningful while the interaction scope is `idle`
+(`selectionEnabled(scope)`). During an active placement/move/etc., the pointer
+belongs to that interaction's body and the hot-set narrows which scene objects
+are raycast-eligible — see [interaction-scope](interaction-scope.md) for the
+hot-set derivation and the overlay scope matrix.
+
 ---
 
 ## Viewer Selection Manager
@@ -55,7 +61,7 @@ type SelectionPath = {
 
 `setSelection` has a hierarchy guard: setting `levelId` without `buildingId` resets children. Use `resetSelection()` to clear everything.
 
-Multi-select: `Ctrl/Meta + click` toggles an ID in `selectedIds`. Regular click replaces it.
+Multi-select: `Ctrl/Meta + click` toggles an ID in `selectedIds`; `Shift + click` toggles the same way. Regular click replaces it.
 
 ---
 
@@ -66,12 +72,30 @@ Extends selection with phase awareness from `useEditor`. The viewer's `Selection
 ```
 phase: 'site'      → selectable: buildings
 phase: 'structure' → selectable: walls, zones, slabs, ceilings, roofs, doors, windows
-  structureLayer: 'zones'    → only zones
-  structureLayer: 'elements' → all structure types
+  either structureLayer     → room-first walls, slabs and ceilings
+  structureLayer: 'zones'    → also zone labels and zone editing
 phase: 'furnish'   → selectable: furniture items only
 ```
 
 Clicking a node of a different phase auto-switches the phase. Double-click drills into a context level.
+
+Structure selection first resolves a wall face or floor/ceiling hit to a detected room.
+The editor keeps its transient `{ levelId, roomId }` in `useEditor.room`; `roomKey`
+in `lib/room-selection.ts` derives identity from the sorted unique boundary ID/face pairs in `spans`, excluding
+coordinates and interval extents so moving a boundary preserves selection. This adapter
+is the migration point for future persistent zone IDs.
+`useSelectedRoom()` exposes the clear footprint, boundary spans and matching surfaces.
+Each mounted level shares one incremental topology index and scene subscription.
+
+Live session groups take precedence over room interception in both views.
+Room commands orchestrate viewer selection; editor room actions are plain setters.
+Clicking the room clears `selectedIds`. Its own elements then select individually;
+a hit in another room changes the room context. Escape clears the element first,
+then the room. Empty clicks clear both. Alt bypasses room and session-group picking;
+Shift/Ctrl/Meta and marquee select elements in either structure layer. Free elements
+retain direct selection. Room highlights and the read-only inspector follow
+`resolveOverlayPolicy` and hide during active interaction scopes. Zone-label selection
+still uses `useViewer.selection.zoneId`.
 
 In Select mode, 3D and 2D canvas selection share the same modifier vocabulary:
 
@@ -88,13 +112,22 @@ The floating helper in `packages/editor/src/components/ui/helpers/helper-manager
 mirrors these rules from current selection state and held modifiers. Keep that helper and
 the shortcut dialog in sync when changing selection gestures.
 
+### Session groups (editor-only)
+
+`Ctrl/Cmd+G` / `Ctrl/Cmd+Shift+G` create and dissolve **session selection groups** in
+`use-session-groups` (not the scene graph). Plain click expands to live members via
+`expandIdsForNode`, threaded into all three click paths:
+`resolveSelectedIdsForNodeClick` (3D), the registry layer's `applyEntrySelection` (2D
+entries), and `resolveFloorplanBackgroundSelection` (2D background hit-test). Alt+click
+opts out. See [selection-groups](selection-groups.md).
+
 ---
 
 ## Rules
 
 - **Never add selection logic to renderers.** Renderers spread `useNodeEvents` events and stop there. All selection decisions live in the selection manager.
 - **Never add editor phase logic to the viewer's SelectionManager.** Phase, mode, and tool awareness belong exclusively in the editor's selection manager.
-- **`useViewer` is the single source of truth for selection state.** Both managers read and write through `setSelection` / `resetSelection`. Nothing else should mutate `selection` directly.
+- **`useViewer` is the single source of truth for scene-node selection state.** Both managers read and write through `setSelection` / `resetSelection`. Nothing else should mutate `selection` directly.
 - **Outliner arrays are mutated in-place** (not replaced) for performance. Don't assign new arrays to `outliner.selectedObjects` or `outliner.hoveredObjects`.
 - **Hover is a separate scalar** (`hoveredId: string | null`), not part of `selectedIds`. Update it via `setHoveredId`.
 

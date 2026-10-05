@@ -6,7 +6,7 @@ Applies to: `packages/core/src/registry/`, `packages/nodes/src/<kind>/`, `packag
 
 A *node kind* — shelf, wall, door, item, spawn, zone — is described by a `NodeDefinition` registered with `nodeRegistry`. The definition is plain data + lazy module references. Three optional fields decide how the kind appears in the scene at runtime; pick whichever combination matches the kind's needs.
 
-This page covers those three fields. For the broader registry contract (schemas, capabilities, parametrics, MCP), see [the registry plan](../../../plans/editor-node-registry.md) in the private repo.
+This page covers those three fields. For the broader registry contract (schemas, capabilities, parametrics, MCP), see the public [registry type definitions](../../packages/core/src/registry/types.ts).
 
 ## The three-checkbox model
 
@@ -53,6 +53,19 @@ Two framework components live in `packages/viewer/src/components/viewer/`:
   3. After building, if `textures` is off and the kind declares `def.surfaceRole`, `GeometrySystem` overrides the built meshes' materials with the themed role colour (`applyDefaultSurfaceRole`).
   4. Kinds with no `def.geometry` are skipped — their custom `def.renderer` handles geometry on its own.
 
+### Hosting declarations
+
+`rendersChildren` describes whether a custom parametric renderer mounts arbitrary child
+nodes. It defaults to true for custom renderers; a renderer that filters children or
+only draws its own meshes declares `rendersChildren: false`. Geometry-only definitions
+inherit child mounting from the generic renderer. Hosting also requires the host schema
+to retain the actual child ID in `children`; renderability alone is insufficient.
+
+`capabilities.surfaces.hosting: false` disables surface hosting for a kind.
+`capabilities.surfacePlacement: 'floor-only'` prevents that kind from becoming a
+hosted child; it does not prevent the kind from hosting other objects. Cabinets,
+columns, stairs, elevators and fences use this child-placement restriction.
+
 ### `surfaceRole`
 
 A kind may declare `surfaceRole?: SurfaceRole` on its definition. It is a colour token only (`core` stores no material), used to resolve the per-role clay/theme colour for untextured surfaces. See [materials-and-themes](materials-and-themes.md).
@@ -61,7 +74,7 @@ Per-kind `def.system` components mount alongside via `<RegisteredSystems>`. They
 
 ### `dirtyTracking`
 
-`dirtyNodes` is the per-frame rebuild queue consumed by `<GeometrySystem>` (`def.geometry`), `<FloorElevationSystem>` (`capabilities.floorPlaced`), and the legacy per-kind viewer systems. Kinds none of those consume — structural/organizational kinds like site, building, level, zone, guide — declare `dirtyTracking: false` so `markDirty` skips them. Without it their marks are never cleared: they accumulate for the whole session, defeat every consumer's empty-set early exit each frame, and pollute the perf overlay's DIRTY readout. If such a kind later gains `def.geometry` (or any other dirty consumer), delete the flag.
+`dirtyNodes` is the per-frame rebuild queue consumed by `<GeometrySystem>` (`def.geometry`), `<FloorElevationSystem>` (`capabilities.floorPlaced`), and the legacy per-kind viewer systems. Kinds none of those consume — structural/organizational kinds like site, building, level, zone, guide — declare `dirtyTracking: false`. The store's set is a `GuardedDirtySet`: `add()` itself refuses marks for flagged kinds, so both `markDirty` and direct `dirtyNodes.add(...)` calls are covered (blindly marking `node.parentId` is safe — a wall's parent is a level, and the guard drops it). A mark without a consumer would otherwise sit for the whole session, defeat every consumer's empty-set early exit each frame, and pollute the perf overlay's DIRTY readout. If such a kind later gains `def.geometry` (or any other dirty consumer), delete the flag.
 
 ## `GeometryContext`
 
@@ -83,6 +96,127 @@ type GeometryContext = {
 `GeometryContext` exists so builders stay pure (no `useScene` import, no store mutation) and trivially unit-testable. The generic `<GeometrySystem>` builds `ctx` from the current scene snapshot once per dirty node; the cost is a few `Map.get` calls.
 
 For level-scoped batch data (wall mitering across an entire level), `ctx` can be extended with `ctx.levelData?.miters` in a future revision — decided alongside the wall migration (Phase 3 of the registry plan).
+
+## Floor-plan scope
+
+`def.floorplan` is a pure `FloorplanGeometry` builder over the same
+`GeometryContext` shape. `def.floorplanScope` controls discovery:
+
+| Scope | Persisted parent | Builder coordinates | `ctx.parent` |
+|---|---|---|---|
+| `'level'` (default) | active level subtree | building-local metres | semantic parent |
+| `'building'` | active building | building-local metres | active level |
+| `'site'` | active building's Site | site-local metres | real Site |
+
+The floor-plan layer applies the inverse active-building transform to
+site-scoped output and paints that output below level architecture. A plugin
+therefore keeps one semantic Site child while the same representation appears
+from every level of every building on that Site. Scope discovery is
+registry-driven; editor code must not name plugin kinds.
+
+`FloorplanStyle.fillRule` is the winding rule for compound contours. Use
+`'evenodd'` when nested rings represent holes; both the interactive SVG
+renderer and PDFKit export preserve it. `FloorplanImage.url` may also be an
+inline `data:` URL, which PDF export passes directly to PDFKit rather than
+through the asset resolver.
+
+## Bake policy
+
+`def.bake` says how a kind is treated by the GLB bake and the baked `/viewer`.
+The bake and the viewer read it through `bakePolicyOf(kind)` /
+`kindsWithBakePolicy(policy)`; neither names kinds.
+
+| `def.bake` | In the GLB | Pascal's baked viewer | For |
+|---|---|---|---|
+| `'static'` (default) | yes | shows the baked mesh | walls, doors, items |
+| `'strip'` | no | rebuilds the node live from `scene_graph` with its registry renderer | heavy reference assets (scans, guides) |
+| `'replace'` | yes, static | hides the baked meshes and re-renders the kind live | dynamic content (wind-animated plants, interactivity) |
+
+Do not re-apply a runtime effect to baked meshes. The bake optimises geometry
+(quantised positions with a per-node scale, instancing dropped, vertices
+welded), so a shader written for the live coordinate space distorts on the
+baked one. `'replace'` keeps a static snapshot for any glTF viewer and gives
+Pascal's viewer the kind's own render path. Its `bakeReplaceRenderer` is
+collective: it receives every node of the kind under one baked level and is
+portaled into that level's `Object3D`, so it rides level stacking and can draw
+instanced meshes in level-local space — per-instance phase for animated
+content, and a few non-raycast meshes instead of one per node under the baked
+scene's pointer handlers.
+
+## Export-only geometry
+
+`def.bakeGeometry(node, ctx)` replaces the registered node's cloned subtree
+only inside `prepareSceneForExport()`. It exists for procedural runtime trees
+whose live GPU representation is not a faithful portable artifact—for example,
+an instanced maximum population masked by a TSL material.
+
+The hook receives persisted scene data through `GeometryContext` and returns a
+new detached, local-space `Object3D`. That return value is the complete static
+snapshot for the node. It must use geometry and materials supported by
+`GLTFExporter`; the exporter preserves the registered node's transform and
+identity. The live editor tree is neither passed to the hook nor mutated.
+
+Use `bake: 'replace'` with `bakeGeometry` when the generic GLB should retain the
+portable static snapshot while Pascal's baked viewer hides it and mounts
+`bakeReplaceRenderer` for the richer live result.
+
+`def.bakeGeometryAsync(node, ctx)` is the asynchronous counterpart for material
+baking and texture reads. Portable export awaits it once instead of invoking the
+synchronous hook; synchronous geometry-only callers retain `bakeGeometry`.
+Both return detached, local-space trees owned by the export artifact. Context
+includes captured materials and level data as well as semantic node lookup.
+
+Model exports accept `excludedNodeTypes?: readonly string[]`. Matching registered
+subtrees are omitted before cloning or invoking either builder. Filtering affects
+output, not the complete semantic context available to retained builders.
+
+Settings → Export → **Include in file** discovers procedural kinds from
+`bakeGeometry`, `bakeGeometryAsync`, or `bake: 'replace'`, including palette-hidden
+kinds. Node filters apply to model downloads, not saved-viewer artifacts, print
+profiles, scene JSON, or floor-plan PDFs. GLB and USDZ additionally accept
+`includedPresentationIds` for explicitly selected static presentation builders;
+live presentation subtrees remain outside `scene-renderer` and are never cloned.
+
+Portable GLB/USDZ outputs freeze instancing and deformation and normalize
+material textures, vertex colors, sidedness, and reflected geometry. Saved-viewer
+artifacts retain their authored animation clips. Preparation captures the source
+synchronously, restores viewer state before asynchronous work, and returns an
+owned artifact that callers must dispose after serialization or failure.
+
+## Selection presentation
+
+`capabilities.selectionHighlight` controls only the Editor's material-based
+selection and hover presentation. It defaults to `true`, including for legacy
+and unregistered kinds. Set it to `false` when a node must stay semantically
+selected while its rendered subtree keeps plugin-authored materials—for
+example, a paint layer whose NodeMaterial carries the result being edited.
+
+The selection manager and outliner query this capability through the registry,
+including after late plugin registration. The capability does not change
+selectability, inspector ownership, tool activation, keyboard behavior or
+deletion policy. Host code must not special-case the opting-out kind.
+
+## Opting out of a generic path
+
+The registry lets a kind opt in to generic behaviour; it never forces it. Where
+a generic path would over-generalise, the kind **omits** the capability or
+**supplies its own** module, and its `definition.ts` says why:
+
+- `capabilities.movable` — omit it when the move is bespoke (an endpoint drag
+  with a linked-corner cascade, a polygon vertex edit) and supply
+  `def.affordanceTools.move`. `MoveTool` routes to the generic
+  `MoveRegistryNodeTool` only when `movable` is set, never merely because the
+  kind is registered.
+- `def.renderer` — set it for JSX-only features (GLB via `useGLTF`, `<Html>`,
+  TSL materials, React-mounted hosted children) and skip `def.geometry`.
+- `def.system` — set it for per-frame imperative work beyond a geometry
+  rebuild (door and window animation, zone uniforms).
+- `parametrics.customPanel` — replace the generic inspector for a kind with
+  non-numeric editors (see [the slider-drag pitfall](#custom-panels-keep-handlers-stable-during-slider-drags)).
+
+A need that fits none of these becomes a new optional definition field
+(additive, so existing kinds are untouched), never a `case '<kind>'` in the
+framework (DECISIONS.md E-002).
 
 ## Choosing the right combination
 
@@ -160,7 +294,7 @@ useFrame(() => {
 Use this when the kind has parametric geometry **and** extra responsibilities. **Door, window.**
 
 - `geometry` builds the visible meshes (frame, panels, hardware) as a pure function of node state + parent wall.
-- `system` advances animation (`operationState`), then calls `markDirty(node.id)` so the geometry system rebuilds on the next frame.
+- `system` advances animation (`operationState`) in `useInteractive`. The animation *record itself* is the per-frame rebuild signal — the consumer system rebuilds any node with an active entry (doors) or poses named parts directly (windows). Do **not** `markDirty` per animation tick: a dirty mark is one-shot work that must drain to zero, and per-tick marks keep the scene from ever settling (breaks the `?perf` settle detector and any render-on-demand quiet gate). Mark once when the animation completes so the settled pose gets its rebuild.
 
 This split keeps animation state outside the node schema (it's ephemeral — lives in `useInteractive`) while still re-using the generic rebuild path.
 
@@ -184,7 +318,7 @@ If the system also handles cascades, animations, or material updates, keep `def.
 - **Builders must be pure.** No `useScene` import inside a `def.geometry` function. Read scene state via `ctx`. Mutating the store from a builder breaks idempotence.
 - **Builders emit local-space children.** The registered `<group>` is positioned/rotated by `<ParametricNodeRenderer>` via JSX (`position={liveTransform?.position ?? node.position}`). Builders return geometry as if the parent were at the origin — never bake the node's world position into vertex coords.
 - **One mesh registered per node ID.** The generic renderer registers a single `<group>` per node. If a custom renderer mounts multiple meshes, register the parent group (or whichever object the system needs to address).
-- **Custom systems run in addition to the generic system, not instead of it.** A kind with `def.geometry` + `def.system` will see the generic system rebuild children on dirty AND the per-kind system run its `useFrame`. Plan priorities accordingly: door-animation runs at priority 2, geometry rebuild at priority 3.
+- **Custom systems run in addition to the generic system, not instead of it.** A kind with `def.geometry` + `def.system` will see the generic system rebuild children on dirty AND the per-kind system run its `useFrame`. Plan priorities accordingly: `GeometrySystem` and ceiling dirty consumption run at frame priority 2, after the node batch's priority-1 dirty snapshot. `def.system.priority` orders components, not frame callbacks.
 - **Dispose on rebuild.** The generic system disposes the previous children's geometry + material before swapping. Custom systems that imperatively add children must dispose what they replace, or accept the GPU-memory cost.
 - **`def.renderer` overrides the generic renderer.** Once you set it, you own the mount — `<ParametricNodeRenderer>` is not invoked. The generic geometry system still runs for the kind if `def.geometry` is set, so a custom renderer can register an empty group and let the system fill it.
 
@@ -206,7 +340,11 @@ during the gesture. A `Shift` hint should describe the bypass in user terms, suc
 `Free angle`, `Free place`, or `Bypass guided constraints`.
 
 `HelperManager` renders `def.toolHints` through `RegisteredToolHelper`, and active Shift
-state can update the row to show that guided constraints are currently bypassed. Select
+state can update the row to show that guided constraints are currently bypassed.
+`affordanceHints?: Record<string, ToolHint[]>` is the same contract for a kind's own
+reshapes, keyed like `affordanceTools`: while a node of the kind is in that `reshaping`
+scope the HUD shows those hints instead of the generic reshape rows (the wall split's
+cut-count chip lives there). Select
 mode is not owned by a node definition, so its helper is derived separately from
 selection state, selected-node move/rotate capabilities, and held modifiers.
 
@@ -235,6 +373,42 @@ The fix is to clone in the preview, mutate the clone, and reassign `mesh.materia
 If your kind declares `relations.hosts: [...]`, add `children: z.array(...).default([])` to the schema. `useScene.createNode(child, parentId)` writes `child.parentId = parentId` **and** appends `child.id` to `parent.children`. Without the field, the parent-side write is a no-op — `<ParametricNodeRenderer>`'s `n.children.map(...)` then has nothing to mount and the host renderer never sees the new child. Symptom: hosted node lives in `useScene.nodes` but no React mount fires, so the host's tree-node sidebar entry is empty and the 3D scene shows nothing where the host should pick it up.
 
 Migrations matter: if your kind shipped before hosting was added, patch existing nodes in `migrateNodes` so `Array.isArray(node.children)` holds for every loaded scene before the renderer reads it.
+
+### Custom panels: keep handlers stable during slider drags
+
+A `parametrics.customPanel` that selects the whole node
+(`useScene((s) => s.nodes[id])`) and lists it as a `useCallback` dependency gets
+new handlers on every store tick of a slider drag. `SliderControl` then rebuilds
+its pointer handlers while pointer capture is active, and the cascade ends in
+React's "Maximum update depth exceeded". Make handlers depend on the selection
+only and read the latest node from a ref:
+
+```tsx
+const nodeRef = useRef(node)
+nodeRef.current = node
+
+const handleUpdate = useCallback(
+  (updates: Partial<DoorNode>) => {
+    if (!selectedId) return
+    useScene.getState().updateNode(selectedId, updates)
+  },
+  [selectedId],
+)
+
+// Keep the aspect ratio: derived from the latest node, not one captured at render.
+const handleWidthChange = useCallback(
+  (width: number) => {
+    const current = nodeRef.current
+    if (!current || width <= 0) return
+    handleUpdate({ width, height: current.height * (width / current.width) })
+  },
+  [handleUpdate],
+)
+```
+
+Handlers now change only when the selection does, never mid-drag.
+`<ParametricInspector>` already works this way (per-field subscriptions,
+`useScene.getState()` in handlers), so kinds without a custom panel need nothing.
 
 ## Capability reference
 
@@ -269,6 +443,37 @@ capabilities: {
 
 ---
 
+### `capabilities.cuts`
+
+Frozen contract (F5b cut intents), not read by any host yet. A kind that removes material from a host publishes what it removes, and each host kernel intersects the intents with its own faces. It supersedes `cuttable`, which nothing ever read: that field stays as a deprecated, ignored alias until plugin API v2.
+
+```ts
+cuts?: (node: AnyNode, ctx: { nodes: Record<AnyNodeId, AnyNode> }) => CutIntent[]
+
+type CutIntent = {                   // core/src/schema/cut.ts
+  host: { nodeId: string; surfaceId: string; partKey?: PartKey } // a face of the host
+  shape: { kind: 'polygon'; ring: [u, v][] } | { kind: 'circle'; center: [u, v]; radius: number }
+  depth: 'through' | number          // metres along −normal from that face
+  taper?: number                     // radians; positive narrows with depth
+}
+```
+
+`shape` is in the face's surface chart ([u, v] metres, v = normal × u): a wall's `front` is wall-local (x, y); its `back` runs from `end` (u = length − x); a roof facet's `facet:<id>:covering` has u along the eave and v up the slope. Horizontal hosts are the one exception: a slab's `top` and a ceiling's `underside` take plan [x, z] in the host's local plan, like their `polygon` and stored `holes`, never the chart's mirrored [x, −z] for a top face. A numeric `depth` is a pocket that keeps the host's backing (walls keep at least 5 mm). Executable examples: `core/src/contracts/cut-intent.test.ts`.
+
+How today's cut sources map onto it (their consumers switch in DT-03b and RL-02):
+
+| Source today | Where it is consumed | Intent |
+|---|---|---|
+| Door and window on a wall | `collectCutoutBrushes` → `createOpeningCutoutBrush` (`viewer/systems/wall/wall-system.tsx`), outline from `buildOpeningCutoutShape` | wall, `front` or `back`; the rectangle, arch or rounded outline; `through` (the 2 × thickness brush) |
+| Item with a `cutout` mesh on a wall | same loop: the mesh's wall-local bounding rectangle | wall, the item's side; that rectangle; `through` today, a numeric depth for recessed cabinets and niches |
+| `roofAccessory.buildCut` (skylight, dormer) | `roof-system.tsx` subtracts the segment-local geometry from the shin, deck and wall brushes | roof segment, `facet:<id>:covering`; the framed opening in slope metres; `through`, applied per segment |
+| Door or window on a roof-segment wall face (`buildRoofWallOpeningCut`, `cutScope: 'wall'`) | same, wall brush only | roof segment, `face:<wall face>`; the opening outline; `through` |
+| `ceilingCut.buildCeilingHole` (recessed fixtures) | `CeilingSystem` merges the rings as holes | ceiling, `underside`; the same ring; `through` |
+| Stair and elevator openings | `stair-opening-sync` and `elevator-opening-sync` persist rings into `slab.holes` / `ceiling.holes` with `holeMetadata` | slab `top` or ceiling `underside`; `through`. The persisted holes stay as they are; intents are how a child cutter publishes |
+| Authored `slab.holes` / `ceiling.holes` | the host's own polygon | not an intent: host data |
+
+---
+
 ### `capabilities.paint`
 
 Per-kind paint dispatch. Lets the editor's `selection-manager` route paint hover / click / preview through a generic dispatcher instead of adding an `if (node.type === '<kind>')` arm for every paintable kind.
@@ -299,6 +504,30 @@ capabilities: {
   paint: chimneyPaint,  // imported from ./paint.ts
 },
 ```
+
+---
+
+### `capabilities.assembly`
+
+F2 assembly layers are consumed by the wall readers and renderers; roofs declare the same optional contract. A kind that declares it stores an optional `assembly` field (`Assembly` in `core/src/schema/assembly.ts`): body `layers` from the reference face inward, each with a stable `id` (its `#layer:<id>` address), a `role`, a `thickness`, an optional `material` kind (`stucco`, `osb`, `wood`, …), `slot` and provenance `src`, one source reference `<ns>:<id>[::<sub>]` (`SourceRefString`: printable ASCII, ns ≤ 48 bytes, id ≤ 160 bytes, the `ProvenanceRef` caps). At most one body layer is the `core`, and only a structural role (`structure`, `deck`, `shell`) may be; a layer `slot` is a key into the host's own `slots` (roofs carry a `slots` record for it); `inset`, `bottom` and `lift` belong to `backing` layers only. Preset capture removes every `src` with `provenance` through `withoutSourceIdentity`.
+
+**The stack sets the body.** A host's thickness is the sum of its layers; a writer that edits the layers writes the sum to the host's thickness in the same patch (the WS5 rule). `face: 'exterior'` lists the layers from the outside, resolved from `frontSide` / `backSide` with the front face as fallback.
+
+```ts
+type AssemblyHostConfig = {
+  reference: 'front' | 'top' | 'underside' | 'covering'
+  measure: 'normal' | 'vertical'
+  body: (node: AnyNode) => number | null // the thickness the host stores; null = none (roofs)
+  backing?: boolean                        // absent = assembly.backing refused
+}
+```
+
+| Host | `reference` | `body` | Rule |
+|---|---|---|---|
+| `roof` (declared in `nodes/src/roof/definition.ts`) | `covering` top plane | `null` | One contiguous stack along the facet normal; `air` for gaps. |
+| `wall` (declared in `nodes/src/wall/definition.ts`) | `front` (+n) or the exterior face (`face: 'exterior'`) | `thickness` | The layer sum; `wallAssemblyPatch` writes both. The Architect's WS5 helpers (`resolveWallAssembly`, `wallAssemblyFinishRef`, `wallAssemblyFraming`, the presets) read F2. Scenes saved with the WS5 `WallAssembly` shape are converted on load by `migrateLegacyWallAssemblies` (`wallAssemblyFromLegacy`: exterior → `finish`, sheathing → `sheathing`, framing → the `core` structure layer, interior → `lining`), and the inspector edits through `wallAssemblyToLegacy`, a WS5 view plugin readers can use too. |
+
+Each kind declares its own host in its definition; core ships none. `resolveAssemblyStack(assembly, host)` returns each layer's depth and thickness exactly as declared, and, on a host that accepts backing, the backing layers with their depth from the body's far face (a ceiling with no body and insulation backing resolves), never throwing; a stored thickness that disagrees with the sum is reported as `assembly.thickness-mismatch`. `getWallLayerBands(wall, assembly, miters)` slices the mitred plan footprint into one band per layer (`back`/`front` offsets from the centreline along +n, and the footprint ∩ strip rings); it draws no bands on a mismatch.
 
 ---
 
@@ -345,9 +574,36 @@ Door and window still use legacy direct calls in `use-keyboard.ts`; migrating th
 
 ---
 
+### `capabilities.mechanism`
+
+Moving parts people run (a fan's spin, a cabinet's doors, an articulated asset's joints). The action menu's Play/Stop button, E (after the kind's own `keyboardActions.e`), the walkthrough and the baked viewer read it instead of a kind name, so a plugin kind gets all of them by declaring it.
+
+```ts
+type MechanismCapability = {
+  has: (node: AnyNode) => boolean                            // anything to run?
+  isOn: (node: AnyNode, state: InteractiveState) => boolean  // any of it running?
+  set: (node: AnyNode, on: boolean) => void                  // start or stop all of it
+  verb?: 'open' | 'run'                                      // walkthrough wording, default 'run'
+}
+```
+
+Operating state is transient: `set` writes `useInteractive`, never the node, so running a mechanism never enters undo, autosave or collaboration. A kind with one switch keeps it in `useInteractive.mechanisms`:
+
+```ts
+mechanism: {
+  has: (node) => node.joints.some((joint) => joint.type !== 'fixed'),
+  isOn: (node, state) => Boolean(state.mechanisms[node.id]),
+  set: (node, on) => useInteractive.getState().setMechanism(node.id, on),
+},
+```
+
+`item` and `procedural-item` declare it over their own interactive state (`nodes/src/shared/item-interactions.ts`). Its GLB clips come from `exportAnimation`: every node that bakes clips lists them in `extras.clips`, and the baked viewer runs `: loop` clips no other controller owns on click and E, stopped at start. Lights are not part of it yet.
+
+---
+
 ## See also
 
-- [renderers.md](renderers.md) — the legacy renderer pattern (still authoritative for kinds with custom `def.renderer`).
+- [renderers.md](renderers.md) — `NodeRenderer` dispatch and the contract for a custom `def.renderer`.
 - [systems.md](systems.md) — per-kind systems, frame-priority ordering, and core/viewer split.
 - [scene-registry.md](scene-registry.md) — how `sceneRegistry` indexes nodes by ID and type.
-- [Node registry plan](../../../plans/editor-node-registry.md) *(in private-editor)* — the multi-phase migration that produced this model.
+- [Registry type definitions](../../packages/core/src/registry/types.ts) — schemas, capabilities, parametrics and MCP contracts for node kinds.

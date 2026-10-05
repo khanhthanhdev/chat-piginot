@@ -1,11 +1,25 @@
+import { mintHostPanel, mintPlugin } from '@mint/pascal-plugin'
 import {
   type AnyNodeDefinition,
   discoverPlugins,
+  extendPluginDiscovery,
   loadPlugin,
   nodeRegistry,
   registerNode,
 } from '@pascal-app/core'
+import { registerEditorHostPanel } from '@pascal-app/editor'
 import { builtinPlugin } from '@pascal-app/nodes'
+import { bonesHostPanel, bonesPlugin } from '@pascal-app/plugin-bones'
+import {
+  environmentHostPanel,
+  environmentPlugin,
+  environmentPresentation,
+} from '@pascal-app/plugin-environment'
+import { poolHostPanel, poolPlugin } from '@pascal-app/plugin-pool'
+import { streetscapeHostPanel, streetscapePlugin } from '@pascal-app/plugin-streetscape'
+import { treesHostPanel, treesPlugin } from '@pascal-app/plugin-trees'
+import { registerViewerPresentation } from '@pascal-app/viewer'
+import { webXRHostPanel, webXRPlugin } from '@webxr/plugin'
 
 // Idempotency guards: HMR can reload this module, but `registerNode`
 // throws on duplicate kinds. Flags live in the module closure so they
@@ -76,6 +90,31 @@ export async function loadExternalPlugins(): Promise<void> {
     console.info(`[pascal:registry] + ${externals.length} discovered plugin(s)`)
   }
 }
+
+// Register the first-party example node plugin alongside any host-provided
+// discovery source instead of replacing it. Its Nature rail panel is host UI,
+// so it is registered separately from the core plugin manifest.
+extendPluginDiscovery(async () => [treesPlugin])
+registerEditorHostPanel(treesHostPanel)
+extendPluginDiscovery(async () => [environmentPlugin])
+registerEditorHostPanel(environmentHostPanel)
+registerViewerPresentation(environmentPresentation)
+extendPluginDiscovery(async () => [bonesPlugin])
+// Opt-in: Bones ships uninstalled — users enable it per scene from the
+// Plugins panel (engineering X-ray is a specialist view, not a default).
+registerEditorHostPanel({ ...bonesHostPanel, defaultInstalled: false })
+extendPluginDiscovery(async () => [mintPlugin])
+registerEditorHostPanel(mintHostPanel)
+extendPluginDiscovery(async () => [poolPlugin])
+registerEditorHostPanel(poolHostPanel)
+extendPluginDiscovery(async () => [streetscapePlugin])
+// The upstream manifest still names 'Pascal' as creator; credit the author.
+registerEditorHostPanel({
+  ...streetscapeHostPanel,
+  creator: { name: 'Sudhir Yadav', url: 'https://github.com/sudhir9297' },
+})
+extendPluginDiscovery(async () => [webXRPlugin])
+registerEditorHostPanel(webXRHostPanel)
 
 loadBuiltinsSync()
 void loadExternalPlugins()

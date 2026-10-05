@@ -18,6 +18,7 @@ import {
   publishStructuralElevationGuide,
   resolveStructuralElevationSnap,
 } from '@pascal-app/editor'
+import { surfaceBatchable } from '../shared/node-batch/batchable'
 import { polygonMeasurementFeatures } from '../shared/polygon-measurement'
 import { sameOutlineSurfaceCounterparts } from '../shared/surface-counterparts'
 import {
@@ -248,6 +249,10 @@ function slabBaseElevationHandle(): HandleDescriptor<SlabNodeType> {
 }
 
 function slabHandles(node: SlabNodeType): HandleDescriptor<SlabNodeType>[] {
+  // A footprint's floor (base plate) has one control, its height above the
+  // ground, drawn by the editor's footprint height handle; room plates are
+  // reached through their room. Only user-drawn slabs keep these handles.
+  if (node.plateRole) return []
   return node.recessed
     ? [slabRecessedDepthHandle()]
     : [slabThicknessHandle(), slabBaseElevationHandle()]
@@ -300,6 +305,7 @@ export const slabDefinition: NodeDefinition<typeof SlabNode> = {
   }),
 
   capabilities: {
+    batchable: surfaceBatchable,
     selectable: { hitVolume: 'bbox' },
     surfaces: {
       top: { height: (n) => (n as SlabNode).elevation },

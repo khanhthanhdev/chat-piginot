@@ -14,6 +14,7 @@ export { ErrorBoundary } from './components/error-boundary'
 export { NodeRenderer } from './components/renderers/node-renderer'
 export {
   default as Viewer,
+  pendingSceneBuildCount,
   type ViewerHandle,
   type ViewerImmersiveSession,
 } from './components/viewer'
@@ -100,6 +101,7 @@ export {
   prepareBrushForCSG,
   SUBTRACTION,
 } from './lib/csg-utils'
+export type { DisplayState } from './lib/display-state'
 export { disposeObject3DResources } from './lib/dispose-object3d'
 export type { EdgeMode } from './lib/edge-style'
 export { PERF_OVERLAY_ENABLED } from './lib/gpu-perf'
@@ -118,6 +120,7 @@ export {
   isIsolationActive,
   refreshIsolation,
 } from './lib/isolation'
+export { setKeyLightDirectionOverride } from './lib/key-light-override'
 export { configureKtx2Support, ensureKtx2Support } from './lib/ktx2-loader'
 export { LayerPassIndex } from './lib/layer-pass'
 export {
@@ -129,6 +132,7 @@ export {
   setSurfaceRaycastLayers,
   ZONE_LAYER,
 } from './lib/layers'
+export { holdLiveFrame } from './lib/live-frame-hold'
 export {
   applyMaterialPresetToMaterials,
   BLUEPRINT_PALETTE,
@@ -157,13 +161,20 @@ export {
   resolveMaterialRef,
   resolveSlotDefaultMaterial,
   resolveSurfaceColor,
+  setSlotDefaultOverrides,
   WHITE_PALETTE,
 } from './lib/materials'
 export { mergedOutline } from './lib/merged-outline-node'
 export * from './lib/perf-actions'
 export { type PerfBatchStats, publishPerfBatchStats } from './lib/perf-panel-store'
 export * from './lib/perf-tracks'
-export { markPureRaycast } from './lib/pointer-events'
+export { hasMaterialsForGroups, markPureRaycast } from './lib/pointer-events'
+export {
+  cloneWithProceduralEmission,
+  decorateProceduralEmission,
+  proceduralSlotMeshes,
+  setProceduralEmission,
+} from './lib/procedural-emission'
 export {
   detectRendererCapability,
   initializeGpuRenderer,
@@ -185,7 +196,9 @@ export {
   showInScene,
   temporarilyShowShadowOnly,
 } from './lib/scene-visibility'
+export { SCRIPTED_MODEL_FLAG } from './lib/scripted-opening'
 export {
+  createPlainSnapshotPipeline,
   createSnapshotPipeline,
   SNAPSHOT_MAX_EDGE,
   SNAPSHOT_MIME,
@@ -195,6 +208,7 @@ export {
   type SnapshotCropRegion,
   type SnapshotPipeline,
   type SnapshotSize,
+  type StudioBackdrop,
   THUMBNAIL_HEIGHT,
   THUMBNAIL_WIDTH,
 } from './lib/snapshot-pipeline'
@@ -211,14 +225,20 @@ export {
   textureMapForSlot,
 } from './lib/texture-reference'
 export { packNormalToRGB, unpackRGBToNormal } from './lib/tsl-compat'
-export { useItemLightPool } from './store/use-item-light-pool'
+export { createZoneShape, createZoneWallGeometry } from './lib/zone-geometry'
+export type { LightSource } from './store/use-item-light-pool'
+export { catalogLightSource, useItemLightPool } from './store/use-item-light-pool'
 export {
   applyCountryUnitDefault,
   default as useViewer,
   type MetricNotation,
   type WallMode,
 } from './store/use-viewer'
-export { CeilingSystem } from './systems/ceiling/ceiling-system'
+export {
+  CEILING_REGION_MESH,
+  type CeilingRegionMaterial,
+  CeilingSystem,
+} from './systems/ceiling/ceiling-system'
 export {
   createColumnBoxGeometry,
   createColumnCylinderGeometry,
@@ -254,7 +274,7 @@ export {
   getLevelPresentationY,
   snapLevelsToTruePositions,
 } from './systems/level/level-utils'
-export { getRoofMaterialArray } from './systems/roof/roof-materials'
+export { getRoofMaterialArray, levelWallCladdingRef } from './systems/roof/roof-materials'
 // Generic roof-segment primitives. Kinds that compose CSG against
 // the roof shell (chimney's self-trim, dormer's virtual-segment cut)
 // read these through the public surface. No kind-specific helpers
@@ -297,6 +317,12 @@ export {
   type WallCutoutViewerState,
   type WallCutoutViewerStore,
 } from './systems/wall/wall-cutout-cache'
+export {
+  getWallFaceBaseAt,
+  getWallFinishData,
+  getWallFinishRefs,
+  type WallFinishGeometryData,
+} from './systems/wall/wall-finish-data'
 export {
   getMaterialsForWall,
   getVisibleWallMaterials,

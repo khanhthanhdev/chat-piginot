@@ -9,8 +9,18 @@
 // `loaded` guard inside `../lib/bootstrap` keeps the side effect
 // idempotent under HMR.
 import '../lib/bootstrap'
-import type { ReactNode } from 'react'
+import { type ReactNode, useEffect } from 'react'
 
-export function ClientBootstrap({ children }: { children: ReactNode }) {
+export function ClientBootstrap({
+  children,
+  enableDevDiagnostics,
+}: {
+  children: ReactNode
+  enableDevDiagnostics: boolean
+}) {
+  useEffect(() => {
+    if (!enableDevDiagnostics) return
+    import('react-scan').then(({ scan }) => scan({ enabled: true }))
+  }, [enableDevDiagnostics])
   return children
 }

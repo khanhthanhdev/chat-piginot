@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "mastra dev",
+    "dev": "PORT=4111 mastra dev",
     "build": "mastra build",
     "smoke:build": "bun run build && bun run scripts/smoke-build.ts",
     "start": "mastra start",

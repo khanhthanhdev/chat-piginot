@@ -3,34 +3,37 @@
   "private": true,
   "scripts": {
     "build": "turbo run build",
-    "dev": "set -a && . ./.env 2>/dev/null; set +a; turbo run dev --filter=!ifc-converter-app --filter=!@pascal-app/ifc-converter --env-mode=loose",
+    "dev": "dotenv -e ./.env -e ./.env.defaults -- turbo run dev --filter=!ifc-converter-app --filter=!@pascal-app/ifc-converter --env-mode=loose",
     "dev:agent": "turbo run dev --filter=agent-server --env-mode=loose",
     "dev:backend": "turbo run dev --filter=piginot-backend --env-mode=loose",
     "lint": "biome lint",
+    "lints": "bun run lint",
     "lint:fix": "biome lint --write",
     "format": "biome format --write",
     "format:check": "biome format",
     "check": "biome check",
+    "checks": "bun run check && bun run check-types",
     "check:fix": "biome check --write",
     "check-types": "turbo run check-types",
     "test": "turbo run test",
-    "test:agent": "turbo run test --filter=agent-server --env-mode=loose",
-    "test:backend": "turbo run test --filter=piginot-backend --env-mode=loose",
+    "ci": "bun run check && bun run skills:validate && bun run check-types && bun run test && bun run build",
+    "postinstall": "[ -n \"$CI\" ] || [ ! -e .git ] || git config core.hooksPath .githooks",
+    "skills:validate": "bun scripts/validate-skills.ts && bun test scripts/cursor-plugin-policy.test.ts scripts/clawhub-ignore-policy.test.ts scripts/claude-mcp-config-policy.test.ts scripts/openai-tool-annotation-policy.test.ts scripts/path-containment.test.ts scripts/public-skill-discovery-policy.test.ts",
     "kill": "lsof -ti:3002 | xargs kill -9 2>/dev/null || echo 'No processes found on port 3002'",
     "clean:cache": "rm -rf apps/*/.next apps/*/.swc apps/*/.turbo packages/*/.turbo tooling/*/.turbo .turbo node_modules/.cache",
     "restart": "bun kill && bun clean:cache && bun dev",
-    "release": "gh workflow run release.yml -f package=all -f bump=patch",
-    "release:viewer": "gh workflow run release.yml -f package=viewer -f bump=patch",
-    "release:core": "gh workflow run release.yml -f package=core -f bump=patch",
-    "release:editor": "gh workflow run release.yml -f package=editor -f bump=patch",
-    "release:mcp": "gh workflow run release.yml -f package=mcp -f bump=patch",
-    "release:minor": "gh workflow run release.yml -f package=all -f bump=minor",
-    "release:major": "gh workflow run release.yml -f package=all -f bump=major"
+    "release": "gh workflow run release.yml -f bump=patch",
+    "release:beta": "gh workflow run release.yml -f bump=beta",
+    "release:minor": "gh workflow run release.yml -f bump=minor",
+    "release:major": "gh workflow run release.yml -f bump=major",
+    "test:agent": "turbo run test --filter=agent-server --env-mode=loose",
+    "test:backend": "turbo run test --filter=piginot-backend --env-mode=loose"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.16",
     "@typescript/native-preview": "7.0.0-dev.20260624.1",
     "dotenv-cli": "^11.0.0",
+    "fast-xml-parser": "^5.4.2",
     "turbo": "^2.9.17",
     "typescript": "6.0.3",
     "typescript-7": "npm:typescript@7.0.1-rc",
@@ -44,6 +47,8 @@
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
     "@types/three": "0.184.1",
+    "next": "16.3.0",
+    "react-grab": "0.1.50",
     "three": "0.186.0"
   },
   "optionalDependencies": {
@@ -61,5 +66,9 @@
     "piginot-backend",
     "packages/*",
     "tooling/*"
-  ]
+  ],
+  "patchedDependencies": {
+    "iwer@2.3.0": "patches/iwer@2.3.0.patch",
+    "three@0.186.0": "patches/three@0.186.0.patch"
+  }
 }

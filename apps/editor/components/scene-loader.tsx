@@ -9,13 +9,15 @@ import {
   type SceneGraph,
   type SidebarTab,
 } from '@pascal-app/editor'
-import { Hammer, Layers, MessageCircle } from 'lucide-react'
+import { Hammer, Layers, Settings } from 'lucide-react'
 import Image from 'next/image'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { countGraphNodes, isEmptyGraphOverwrite } from '@/lib/empty-graph-guard'
+import { type PersistedSceneGraph, sceneGraphSignature } from '@/lib/scene-signature'
+import { cn } from '@/lib/utils'
 import { BuildTab } from './build-tab'
-import { ChatTab } from './chat-tab'
 import { CommunityViewerToolbarLeft, CommunityViewerToolbarRight } from './viewer-toolbar'
 
 export interface SceneMeta {
@@ -65,12 +67,20 @@ const SIDEBAR_TABS: (SidebarTab & { component: React.ComponentType })[] = [
     ),
   },
   {
-    id: 'chat',
-    label: 'Chat',
-    component: ChatTab,
-    mobileDefaultSnap: 0.66,
-    mobileIcon: <MessageCircle className="h-5 w-5" />,
-    icon: <MessageCircle className="h-6 w-6" />,
+    id: 'settings',
+    label: 'Settings',
+    component: () => null,
+    mobileDefaultSnap: 0.5,
+    mobileIcon: <Settings className="h-5 w-5" />,
+    icon: (
+      <Image
+        alt=""
+        className="h-8 w-8 object-contain"
+        height={32}
+        src="/icons/settings.webp"
+        width={32}
+      />
+    ),
   },
 ]
 
@@ -79,30 +89,65 @@ interface SceneLoaderProps {
   meta: SceneMeta
 }
 
-type SceneGraphWithCollections = SceneGraph & { collections?: Record<string, unknown> }
-
 interface LiveSceneEvent {
   eventId: number
   sceneId: string
   version: number
   kind: string
   createdAt: string
-  graph: SceneGraphWithCollections
+  graph: PersistedSceneGraph
+}
+
+/**
+ * `?disable=postFx` is read at post-processing module load, so it only takes
+ * effect on a full page load. Reading it here as well lets the flag survive a
+ * client-side navigation, since `disablePostFx` is a live prop.
+ */
+function isLightPreviewQuery(searchParams: URLSearchParams): boolean {
+  const disable = searchParams.get('disable') ?? ''
+  return disable.split(',').some((p) => p.trim() === 'postFx')
 }
 
 export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const versionRef = useRef(meta.version)
+  // Node count of the graph the server is known to hold. Guards against the
+  // autosave wipe class: a save fired from a not-yet-hydrated (empty) editor
+  // store must never overwrite a populated server copy.
+  const serverNodeCountRef = useRef(meta.nodeCount)
+  const lastRemoteGraphJsonRef = useRef<string | null>(null)
   const suppressRemoteSaveUntilRef = useRef(0)
   const [conflict, setConflict] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+
+  const lightPreview = isLightPreviewQuery(searchParams)
 
   const handleLoad = useCallback(async () => initialScene, [initialScene])
 
   const handleSave = useCallback(
     async (graph: SceneGraph, options?: { keepalive?: boolean }) => {
+      const graphJson = sceneGraphSignature(graph)
       const isRecentRemoteApply = Date.now() < suppressRemoteSaveUntilRef.current
+      if (lastRemoteGraphJsonRef.current === graphJson) {
+        lastRemoteGraphJsonRef.current = null
+        suppressRemoteSaveUntilRef.current = 0
+        return
+      }
       if (isRecentRemoteApply) return
+
+      // Wipe guard: never PUT an empty graph over a populated server copy.
+      // An empty serialization here means the editor store was not hydrated
+      // (load in flight or failed), not that the user deleted everything.
+      const outgoingNodeCount = countGraphNodes(graph)
+      if (isEmptyGraphOverwrite(outgoingNodeCount, serverNodeCountRef.current)) {
+        console.error(
+          `[scene-loader] Blocked autosave: refusing to overwrite scene ${meta.id} ` +
+            `(${serverNodeCountRef.current} nodes on the server) with an empty graph.`,
+        )
+        setSaveError('Autosave blocked: the editor tried to save an empty scene')
+        return
+      }
 
       try {
         const response = await fetch(`/api/scenes/${meta.id}`, {
@@ -120,6 +165,16 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
         })
 
         if (response.status === 409) {
+          const body = (await response.json().catch(() => null)) as { error?: string } | null
+          if (body?.error === 'empty_graph_rejected') {
+            // Server-side wipe guard (defense in depth behind the client-side
+            // check above) — not a concurrent-session conflict.
+            console.error(
+              `[scene-loader] Server rejected an empty-graph save for scene ${meta.id}.`,
+            )
+            setSaveError('Autosave blocked: the editor tried to save an empty scene')
+            return
+          }
           setConflict(true)
           return
         }
@@ -131,6 +186,7 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
 
         const next = (await response.json()) as SceneMeta
         versionRef.current = next.version
+        serverNodeCountRef.current = next.nodeCount
         setSaveError(null)
       } catch (error) {
         setSaveError(error instanceof Error ? error.message : 'Save failed')
@@ -153,6 +209,8 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
       if (payload.version <= versionRef.current) return
 
       versionRef.current = payload.version
+      serverNodeCountRef.current = countGraphNodes(payload.graph)
+      lastRemoteGraphJsonRef.current = sceneGraphSignature(payload.graph)
       suppressRemoteSaveUntilRef.current = Date.now() + 2500
       applySceneGraphToEditor(payload.graph)
       setConflict(false)
@@ -213,7 +271,21 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
           <p className="font-medium text-destructive text-xs">{saveError}</p>
         </div>
       )}
-      <div className="pointer-events-none absolute top-4 right-4 z-40 flex items-center gap-2">
+      <div className="pointer-events-none absolute top-4 right-4 z-40 flex flex-col items-end gap-1 md:top-14 md:flex-row md:items-center md:gap-2">
+        <button
+          aria-pressed={lightPreview}
+          className={cn(
+            'pointer-events-auto rounded-md border border-border px-3 py-1.5 font-medium text-xs shadow-sm backdrop-blur',
+            lightPreview ? 'bg-accent' : 'bg-background/90 hover:bg-accent/40',
+          )}
+          onClick={() =>
+            router.push(lightPreview ? `/scene/${meta.id}` : `/scene/${meta.id}?disable=postFx`)
+          }
+          title="Skip the post-processing pipeline — lighter on the GPU, no ambient occlusion or selection outlines"
+          type="button"
+        >
+          Light preview
+        </button>
         <Link
           className="pointer-events-auto rounded-md border border-border bg-background/90 px-3 py-1.5 font-medium text-xs shadow-sm backdrop-blur hover:bg-accent/40"
           href="/scenes"
@@ -222,6 +294,7 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
         </Link>
       </div>
       <Editor
+        disablePostFx={lightPreview}
         layoutVersion="v2"
         onLoad={handleLoad}
         onSave={handleSave}

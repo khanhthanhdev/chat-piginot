@@ -1,5 +1,5 @@
 import {
-  getCurtainWallConfig,
+  getWallBodyCenterOffset,
   getWallCurveFrameAt,
   getWallCurveLength,
   type WallNode,
@@ -22,7 +22,8 @@ export function scaleHandleHeight(
 }
 
 /**
- * Converts wall-local (X along wall, Y = height above wall base) to world XYZ.
+ * Converts wall-local (X along wall, Y = height above wall base, Z = offset
+ * from the wall centre plane along its normal) to world XYZ.
  */
 export function wallLocalToWorld(
   wallNode: WallNode,
@@ -30,29 +31,22 @@ export function wallLocalToWorld(
   localY: number,
   levelYOffset = 0,
   slabElevation = 0,
+  localZ = 0,
 ): [number, number, number] {
   const wallLength = getWallCurveLength(wallNode)
   const frame = getWallCurveFrameAt(wallNode, wallLength > 1e-6 ? localX / wallLength : 0)
-  return [frame.point.x, slabElevation + localY + levelYOffset, frame.point.y]
+  // `localZ` is measured from the body's centre plane, which a justified wall
+  // sets off its reference line.
+  const across = getWallBodyCenterOffset(wallNode) + localZ
+  return [
+    frame.point.x + frame.normal.x * across,
+    slabElevation + localY + levelYOffset,
+    frame.point.y + frame.normal.y * across,
+  ]
 }
 
-/**
- * Clamps door center X so it stays fully within wall bounds.
- * Y is always height/2 — doors sit at floor level.
- */
-export function clampToWall(
-  wallNode: WallNode,
-  localX: number,
-  width: number,
-  height: number,
-): { clampedX: number; clampedY: number } {
-  const wallLength = getWallCurveLength(wallNode)
-  const margin = wallNode.wallType === 'curtain' ? getCurtainWallConfig(wallNode).perimeterWidth : 0
-
-  const clampedX = Math.max(margin + width / 2, Math.min(wallLength - margin - width / 2, localX))
-  const clampedY = height / 2 // Doors always sit at floor level
-  return { clampedX, clampedY }
-}
+/** Door centre on its wall: the shared rule in core (`clampDoorToWall`). */
+export { clampDoorToWall as clampToWall } from '@pascal-app/core/building'
 
 // Wall-child overlap is shared by door + window placement (one source of
 // truth in `shared/wall-attach-target.ts`). Re-exported here so existing

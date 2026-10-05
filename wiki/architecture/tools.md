@@ -1,16 +1,18 @@
 # Tools
 
-*Editor tools structure in `apps/editor`.*
+*Editor tools and registry-owned placement interactions.*
 
-Applies to: `apps/editor/components/tools/**`.
+Applies to: `apps/editor/components/tools/**` and `packages/nodes/src/*/{tool,floorplan-tool}.tsx`.
 
-Tools are React components that capture user input (pointer, keyboard) and translate it into `useScene` mutations. They live exclusively in `apps/editor/components/tools/`.
+Tools are React components that capture user input (pointer, keyboard) and translate it into `useScene` mutations. Cross-kind and application-level tools live in `apps/editor/components/tools/`. A registry-owned node kind may colocate its 3D `def.tool` and floorplan tool extension in `packages/nodes/src/<kind>/`; this keeps the complete kind registration removable and discoverable as one unit. These components may consume the public editor interaction APIs, but must not add app-specific state or import from `apps/editor`.
 
 ## Lifecycle
 
 `ToolManager` reads `useEditor` (phase + mode + tool) and mounts the active tool component. When the tool changes, the old component unmounts, cleaning up any transient state.
 
 See `apps/editor/components/tools/tool-manager.tsx`.
+
+> **What the user is doing right now** is owned by the interaction state machine, not by tool-local flags. A tool that starts a placement / move / handle / reshape / box-select / paint interaction enters it through `useInteractionScope.begin(...)` and leaves through `end()` — see [interaction-scope](interaction-scope.md). Do not add a new `useEditor` flag for a new interaction.
 
 ## Tool Categories by Phase
 
@@ -66,27 +68,52 @@ export function MyTool() {
   - The offset must be cleared on tool unmount, cancel, *and* commit — both `mesh.position.set(0, 0, 0)` and `useLiveTransforms.clear(id)`.
   - The tool must not generate or mutate geometry in this path — only transform writes. Geometry generation still belongs in a core system.
 - **No business logic in tools** — delegate geometry/constraint rules to core systems.
-- **Guided manipulation is the default.** Placement, move, rotate, resize, endpoint drag,
-  and handle drag should behave as guided building mode: they help the user build quickly
-  with fewer mistakes through grid/object snapping, canonical angle increments,
-  alignment guides, and distance feedback. Holding Shift is the standard live bypass for
-  those constraints: while Shift is held, tools should commit the raw pointer/angle
-  proposal instead of applying sticky snap or angle corrections. Passive measurement
-  guides may remain visible only when they do not alter the proposal. If an interaction
-  cannot use Shift because of an established shortcut or topology rule, document the
-  opt-out in its manipulation policy and explain the replacement behavior.
-- **Constraints and guides can be decoupled.** When a stronger constraint owns the
-  proposal, such as a wall segment's 15° angle lock, the tool may still publish passive
-  dashed alignment/proximity guides as long as it does not apply the guide snap delta.
-  Use this for chained wall segments: users keep the fast constrained draft, but still see
-  proximity feedback for later points. Shift remains the hard bypass for both correction
-  and guide feedback.
-- **Help must mirror manipulation policy.** The shortcut dialog and floating helper panel
-  are part of the interaction contract. Static shortcut docs should describe guided
-  building as the default and Shift as the live bypass. Floating help should be contextual
-  when enough state exists: Select mode can derive direct move, direct rotate,
-  multi-select, and Shift-bypass tips from the selected nodes and active modifiers; active
-  tools can highlight the Shift bypass row while the modifier is held.
+- **Snapping is mode-driven, not a held-Shift bypass.** Placement, move, rotate, resize,
+  endpoint drag, and handle drag are guided building — grid/object snapping, canonical angle
+  increments, alignment guides, distance feedback — but the active behaviour is an explicit,
+  always-visible, **per-context** mode (the contextual HUD chip), not a hidden held key:
+  - **Shift (tap)** cycles the snapping mode for the active context (`wall` grid/lines/angles/off ·
+    `item` lines/grid/off · `polygon` grid/lines/off — one persisted mode per context).
+  - **Alt (hold)** is force / free: commit the raw cursor past snap *and* past an invalid /
+    colliding drop. It is the only momentary "bypass" key (plus the vertical-riser carve-out for MEP runs).
+  - **Ctrl (tap)** cycles the grid step.
+  - Read snapping through the single path — `isGridSnapActive()` / `isMagneticSnapActive()` /
+    `isAngleSnapActive()` (`store/use-editor`), which resolve the active mode from the interaction
+    scope via `getActiveSnapContext()`. **Never** read `event.shiftKey` / `event.nativeEvent.shiftKey` /
+    `modifiers.shiftKey` to bypass snapping, and never apply a grid step that isn't gated on
+    `isGridSnapActive()` (`const step = isGridSnapActive() ? gridSnapStep : 0`). A snappable kind declares
+    `NodeDefinition.snapProfile` (`'item' | 'structural'`) so its context, mode-set, and chip fall out
+    with no per-kind switch. The contextual HUD renders the snapping chip for **any** tool that resolves
+    to a snap context — `helper-manager` gates the generic `RegisteredToolHelper` on `snapContext` (or
+    `continuationContext`), not on the presence of hand-written `def.toolHints`, so a snappable draft tool
+    with no bespoke hints (e.g. `zone`) still advertises the Shift = cycle control it already honors. See
+    [interaction-scope](interaction-scope.md) § "Snapping mode & modifiers" and `lib/snapping-mode.ts`.
+  - **Sanctioned exception — wall connect snap.** Wall drafting keeps a tight, mode-independent
+    "connect" snap so a room can still close in the non-magnetic modes (`grid` / `angles` / `off`):
+    within `WALL_CONNECT_SNAP_RADIUS` (0.05 m, `components/tools/wall/wall-snap-geometry.ts`) of an
+    existing wall's endpoint / midpoint / crossing / body, the drafted point sticks onto it (and the
+    beacon shows). This is *connectivity*, not alignment — the snap runs from the already
+    mode-positioned point, so grid quantise / angle lock / free placement are respected right up to
+    the wall and only the last few cm stick. It is **not** a Shift bypass and must not be gated on
+    modifiers. See `snapWallDraftPointDetailed` in `components/tools/wall/wall-drafting.ts`.
+  - **Sanctioned exception — lean-to structural connection snap.** Moving or resizing a
+    `lean-to-extension` keeps a tight, mode-independent edge/height catch to a neighboring
+    extension. This is connectivity: the joined roofs become one structural run with shared
+    gutter ends and a single joint post. It runs after the active grid/free proposal and is
+    bypassed only by held Alt. The same rule applies in 2D and 3D.
+- **Constraints and guides can be decoupled.** When a stronger constraint owns the proposal —
+  a wall segment's 45° lock while in `angles` mode — the tool may still publish passive dashed
+  alignment/proximity guides as long as it does not apply the guide snap delta. Use this for chained
+  wall segments: users keep the fast constrained draft but still see proximity feedback for later points.
+- **Vertical structural datums use their own ephemeral guide channel.** Slab, ceiling, wall-base,
+  and fence-base elevation handles resolve same-level structural Y targets through scalar snap
+  callbacks, then publish a short horizontal datum + elevation readout only while exactly aligned.
+  The payload is owner-scoped and cleared through the handle descriptor's `onDragEnd`; it is editor
+  feedback, never a scene node. Do not encode Y datums into the floor-plane XZ alignment store or
+  the wall-opening guide store — their coordinate and lifecycle contracts differ.
+- **Help mirrors the model.** The shortcut dialog and the contextual HUD are part of the interaction
+  contract: they describe the always-visible mode chip + `Alt` = force, **not** a hidden Shift bypass.
+  The HUD is driven by the active interaction scope, so it shows only the current context's controls.
 - **Preview geometry is local** — transient meshes shown while a tool is active live in the tool component, not in the scene store.
 - **Clean up on unmount** — remove any pending/incomplete nodes *and* any live transforms/mesh offsets when the tool unmounts.
 - **Tools must not import from `@pascal-app/viewer`** — use the scene store and core hooks only. `sceneRegistry` is exported from `@pascal-app/core` and is the allowed door into the Three.js graph for the narrow purposes above.
@@ -107,9 +134,22 @@ Concretely, door/window placement/move keeps these in lockstep across `{door,win
 
 - **Snap target**: nearest wall to the true cursor (shared `findClosestWallInPlan` / wall raycast), free-follow off-wall, commit only on a host.
 - **Move SFX**: a soft `sfx:grid-snap` click per grid step while sliding (free-follow plan XZ or on-wall along-X, quantized + deduped so it isn't a machine-gun) and a soft `sfx:item-pick` cue on the floor→wall snap. Both tools carry an identical `tickGridStep` / `tickWallSnap` pair — keep them in sync.
-- **R-flip** facing mid-placement, **Shift** to free snap/alignment (guides stay visible) and force-place over collisions, faithful ghost/symbol, deterministic single-undo commit.
+- **R-flip** facing mid-placement, **Alt (hold)** to force-place past snapping and collisions (guides stay visible) and **Shift (tap)** to cycle the snapping mode — the rule above, never a held-Shift bypass — faithful ghost/symbol, deterministic single-undo commit.
 
 Tells that you've broken parity: a sound/guide/snap that fires in 3D but is silent in 2D (or vice-versa), or a fix landed in one move file but not its sibling. The two move files are deliberately near-mirrors; diff them when in doubt.
+
+**Navigation is part of parity.** Movement learned in one view works in the other (WASD, Space + drag, middle drag, wheel, orbit), and split view keeps both in sync through `navigationSyncPose`. In 2D-only view the 3D canvas is paused (`renderPaused`), so nothing driven from its frame loop reaches the plan: the plan owns WASD and the orbit buttons there itself (`components/editor/floorplan-panel.tsx`, sharing `lib/keyboard-pan.ts` with `custom-camera-controls.tsx` — physical keys, same guards and speed) and publishes the pose to 3D when the move ends, while the camera stands down. A navigation input that only exists on the camera side is a 2D regression waiting to happen.
+
+**Group selection acts on the selection.** Group move / rotate / duplicate transform the selected participants only; connected walls outside the selection stretch at their shared ends (`LinkedNeighbor`). Their footprint comes from plan data, never from meshes: `groupPlanBounds` (`components/editor/group-transform-shared.ts`) reads wall outlines, polygon rings and fence runs in the level frame, and measures meshes only for placed objects (fresh bounds, `userData.placeholder` skipped, anchor as fallback). A world-space mesh box mapped into the level frame lands beside the meshes under a rotated building, and in 2D-only view meshes may be unbuilt. The 2D dashed box, the 3D rotate gizmo and keyboard R/T all pivot on that box's centre.
+
+**A room's slab and ceiling deselect together in the plan.** The floor plan draws the ceiling as an unfilled outline under the walls (`fill="none"` is click-through, see below), so a marquee can select it but a click can't reach it. Removing either surface from the selection removes its same-outline counterpart: slab and ceiling declare `extensions['pascal:editor/floorplan'].selectionCounterparts` (`packages/nodes/src/shared/surface-counterparts.ts`) and `applyEntrySelection` asks the registry, so the plan never names a kind. Adding stays single, and 3D keeps single toggles because each surface is clickable there.
+
+Plan-view surface movement retains only the original host while the footprint centre
+is supported. Exiting commits a level-frame floor pose with support re-elected and
+attachment links removed atomically. Plan view never acquires a new host or cycles
+surfaces; fresh placement stays on the floor. Generated designs enable body drag
+through `extensions['pascal:editor/floorplan'].directDrag`, which does not enable
+plain body drag in 3D.
 
 ## Move coexistence: 2D `FloorplanRegistryMoveOverlay` + legacy 3D mover
 
@@ -117,9 +157,9 @@ While a kind is mid-migration its move can run through two paths at once: the re
 
 ### Pitfall: the 2D cleanup clobbering the 3D commit
 
-`FloorplanRegistryMoveOverlay` pauses scene history at mount and snapshots the moving node. If the user actually commits in 3D, the 3D path writes new state and clears `movingNode`. The 2D overlay then unmounts — and its cleanup `useEffect` would call `updateNodes(snapshot)`, overwriting the just-committed 3D state with the original.
+`FloorplanRegistryMoveOverlay` registers the moving node as a carried history draft at mount and snapshots it; it pauses history only around its own writes (see "History during a gesture" below). If the user actually commits in 3D, the 3D path writes new state and clears `movingNode`. The 2D overlay then unmounts — and its cleanup `useEffect` would revert, overwriting the just-committed 3D state with the original.
 
-Fix in `floorplan-registry-move-overlay.tsx`: gate the cleanup revert on a `hasMovedSinceStart` flag that is only set inside `onMove` **after** the `target.closest('[data-floorplan-scene]')` guard. If no 2D apply ever ran, the divergence in scene state must be an external committer's — skip the revert, just resume history. Symptom when missing: items snap back to their pre-drag position / rotation on 3D commit.
+Fix in `floorplan-registry-move-overlay.tsx`: gate the cleanup revert on a `hasMovedSinceStart` flag that is only set inside `onMove` **after** the `target.closest('[data-floorplan-scene]')` guard. If no 2D apply ever ran, the divergence in scene state must be an external committer's — skip the revert, just end the drafts. Symptom when missing: items snap back to their pre-drag position / rotation on 3D commit.
 
 ### Pitfall: `useDraftNode.destroy()` clobbering the 2D commit
 
@@ -146,6 +186,24 @@ The store name suggests a uniform contract; the writes in practice are not. Docu
 
 Anything that subscribes to `useLiveTransforms` to inform 2D rendering needs to handle these frames explicitly. The `FloorplanRegistryLayer` override currently branches by kind: `item` / `shelf` / `column` are treated as world-plan (it copies `live.position` onto the effective node and forces `parentId: null` so the resolver skips the parent-chain transform), while `slab` / `ceiling` / `zone` are treated as a polygon **delta** (it translates the polygon vertices by `live.position`). Each kind added to the live-drag path grows this consumer-side switch; the preferred long-term fix is to standardise the frame at the writer so the consumer stops branching by `node.type`.
 
+## Data-driven live drag: `useLiveNodeOverrides`, never per-tick `useScene`
+
+`useLiveTransforms` (above) carries a rigid position/rotation offset — right when the renderer can preview the move by transforming the node's group. It's **wrong** when the geometry is *recomputed from data fields* (a wall re-miters from its `start`/`end`, an opening re-cuts its host wall, an endpoint drag reshapes the segment and cascades to linked walls): the shape itself changes, so there's no rigid offset to apply. Those preview via **`useLiveNodeOverrides`** (`@pascal-app/core`) — the tool publishes the changed fields per tick (`set(id, patch)` / `setMany(...)`) and the geometry systems merge them (`getEffectiveWall` in 3D, the floor-plan sibling-override merge in 2D, `getEffectiveNode` in panels). The scene store stays untouched during the drag; on commit the tool clears overrides and writes it **once** through a pause session's `commitStep`, so the gesture is a single undo step. Esc/unmount just clears overrides — cancel is free.
+
+**Writing `useScene.updateNodes`/`updateNode` per `grid:move` tick is a blocker:** it replaces the `nodes` map ref, so every `useScene(s => s.nodes)` subscriber app-wide (panels, HUD, tooltips, floor plan, catalog) re-renders each frame → FPS collapse. (`markDirty` per tick is fine for a bounded gesture — it never calls `set()` and the marks drain every frame; an animation loop that marks dirty for as long as it runs is not, see `node-definitions.md` § "`geometry` + `system`".) Reference: `packages/nodes/src/wall/{move-tool,move-endpoint-tool}.tsx`.
+
+**Room detection is a commit-time job, not a per-tick one.** A wall gesture that reshapes rooms previews the automatic slabs/ceilings it bounds with `createWallBoundSurfaceFollower` (boundary membership read once at arm time: each vertex follows the walls carrying its two edges, or its place on a curved wall's arc). On drop it writes the walls, including any support-slab change, in one `applyNodeChanges`; the live space-detection sync reconciles sides, zones, slabs and ceilings inside that write, once and incrementally, and its writes join the step. Reference: the 3D `MoveWallTool`.
+
+**History during a gesture (R2).** A move or placement never pauses history for the whole gesture. The nodes it carries are history drafts (`beginSceneHistoryDraft`): a created draft stays out of every snapshot, and each field of an adopted node that the gesture itself wrote (`runSceneHistoryDraftWrite`, which also pauses around that one write) is recorded as it was before, for as long as it still holds the gesture's value. Anything others write meanwhile (a collaborator, an agent, a wall edit), including over a field the gesture wrote, records as its own step at once and space detection reconciles it; an undo of such a step mid-gesture puts back only the gesture's own fields. Cancel reverts only those fields (`sceneHistoryDraftRevertUpdates`), never a parent that no longer exists. The drop ends the drafts and writes once through `beginSceneHistoryPauseSession(useScene, { gesture: movingNodeId })` → `commitStep` in a `finally`-guarded session, so whichever view drops (3D tool or 2D overlay, which share the gesture key and the draft) records exactly one step. References: the placement coordinator, `FloorplanRegistryMoveOverlay`, the 3D `MoveWallTool`.
+
+## Floorplan registry: per-node subscriptions, stable props
+
+`FloorplanRegistryLayer` draws one `FloorplanRegistryEntry` per node. The perf invariant — a live drag must re-render only the changed node(s), not all ~150 entries — rests on three things, and breaking any of them is a re-render-flood regression that still type-checks and passes tests (see `floorplan-registry-layer.tsx`):
+
+- Each entry subscribes to **its own slice** — `useLiveTransforms(s => s.transforms.get(id))` / `useLiveNodeOverrides(s => s.overrides.get(id))`, never the whole Map. This works because the live stores write a fresh value only for the changed node (the Map is cloned but unchanged value refs are reused), so an unchanged node's selector stays identity-stable and Zustand skips it. The parent subscribes only to the stable id list.
+- `FloorplanRegistryEntry` and `InteractiveGeometry` are `memo`'d, so the parent must pass **referentially stable props** (hoisted styles, `useCallback` handlers, memoized descriptors) — a fresh inline object/handler per entry defeats the memo.
+- Sibling-dependent geometry (wall miters, opening cuts) invalidates via a **per-node sibling epoch** bumped from a store `subscribe` (`computeAffectedSiblingIds`), not a whole-layer re-render.
+
 ## Wall-attached node rotations must be wall-local
 
 `door` / `window` / wall-attached `item` are children of the wall mesh in 3D. The wall's `mesh.rotation.y = -atan2(dy, dx)`. The child node's `rotation.y` therefore lives in the wall's local frame and composes with the wall's rotation at render time.
@@ -159,6 +217,59 @@ See `nodes/src/shared/wall-attach-target.ts`'s `WallHit.itemRotation`. Side dete
 A 3D move tool that follows the cursor by writing `mesh.position.set(x, 0, z)` runs into a feedback loop: as the mesh tracks the cursor it sits between the camera and the grid plane, so R3F's raycaster hits the moved mesh first → only `${kind}:move` fires → `grid:move` stops firing → the cursor snapshot (used as the commit position) freezes at its initial value. The user clicks at a new spot and the node commits at the starting one.
 
 Fix in `MoveRegistryNodeTool`: at drag-start, traverse the moved mesh and overwrite `child.raycast = () => {}` on every descendant; restore the originals in the effect's cleanup. The ray now passes through the moved mesh, hits the grid plane, and `grid:move` keeps firing.
+
+`MoveRegistryNodeTool` uses the shared surface resolver for kinds whose `floorPlaced`
+capability applies. Neither `hostable` nor `hostable.parents` gates the session. It
+subscribes to registered physical host kinds and lets their surface providers accept
+or reject the child; the protocol's non-physical denylist excludes containers and guides.
+Mounted procedural recipes stay in their separate session. The shared surface resolver owns shelf row election and fit. Shelf
+entry checks the upward normal; subsequent moves can switch rows over side faces.
+Every shelf placement checks the board region, including movement and rotation; see
+[Surface fit policy](#surface-fit-policy). Offset procedural bounds
+keep the footprint centered under a new cursor hit and put its bottom on the board.
+
+While hosted, grid dispatch waits until both DOM listeners have run and matches the
+native pointer event to the host hit. Unhosted registry floor moves apply immediately;
+a subsequent host hit in the same dispatch replaces the floor preview. Both the catalog coordinator and registry mover use
+`shared/shelf-stickiness.ts`: shelf leave events retain hosting, and a grid ray must
+miss the shelf's local volume (with the existing 8 cm margin) before detaching.
+Item-surface leaves still detach immediately. Existing hosted moves preserve their
+grab offset until switching hosts or detaching; R/T rotates around the stored local
+position. Attachment clears the child's slab support; detachment uses the existing
+floor support election. Procedural queries compose shelf and nested cabinet transforms and apply slab
+lift only at the level-parented ancestor.
+
+Parent transitions and hosted poses preview in `useScene` with history paused so
+React can reparent the renderer. Hosted previews use that stored local pose (no
+world-plan live transform); the footprint box is converted to the level frame.
+Commit restores the drag-start parent and pose before one tracked write. Cleanup
+restores both fresh and existing nodes without history, resets pointer/grab state,
+and leaves fresh drafts alive; explicit cancel deletes fresh drafts. The 2D item
+move path, also used by procedural items, composes the host transform and retains the
+current shelf row or counter surface while the rotated footprint remains contained.
+Outside it, the legacy level-detach/source-Y behavior remains pending slice F, together
+with acquiring and cycling surfaces in plan view.
+
+Shelf `relations.hosts` includes catalog and procedural children. Registry moves,
+3D handle previews/cleanup, and shelf 2D move/resize/rotate previews cascade dirty
+marks on each tick so children are re-marked after a renderer drains the set.
+Shelf `geometryKey` excludes children, keeping the boards stable during attachment.
+Cabinet geometry and neighbor keys include only structural cabinet/module child IDs.
+`geometryChildTypes` also filters the viewer's live child override key: shelves declare
+none, cabinets/modules declare only their structural child kinds.
+
+Both movers route cabinet events through `resolveSurfacePlacement`. Counters retain
+free XZ movement with grid snapping; they do not elect module or span centers. The
+provider chooses the real span or bar height from the hit, while the optional `origin`
+keeps a grabbed or off-origin child's pose separate from the contact that elected it.
+Full rotated footprints are checked after snapping against the span and its holes.
+Counter stickiness intersects the published surface regions, never the run's bounding
+volume, so real gaps and sink openings remain exits. The hit run owns the child,
+including a nested corner leg. Run inspector edits and registered resize handles stage
+their structural changes, carry child Y by the old/new stable surface height, and reject
+an edit that removes or invalidates an occupied surface. These are editing-path rules;
+arbitrary raw scene writes do not invoke this reconciliation.
+
 
 The same applies to placement previews — see `nodes/src/shelf/preview.tsx` for the `(obj as { raycast: () => void }).raycast = () => {}` pattern. A preview that captures rays starves the placement tool's own `grid:move` snapshot.
 
@@ -204,6 +315,79 @@ useLiveTransforms.getState().set(node.id, {
 
 If the tool *also* rotates the node during the drag, it should drive `rotation` from the current tool state — not from 0, not from the stale node value.
 
+## Wall lifecycle: draw, split, merge
+
+Walls are drawn as a rectangle, a chain that closes into a room, or one wall at a time — the Build panel's Rooms tiles (Rectangle / Polygon / Walls). The choice is picked before drawing, never toggled mid-draw: it is stored as the wall's continuation mode (`rectangle` / `room` / `single`, persisted with the editor preferences, `CONTINUATION_PROFILES.wall.chosenInPanel`), read through `useWallDrawVariant` (`packages/editor/src/lib/wall-draw-variant.ts`), and the HUD header names it (`lib/hud-title.ts`); C and the continuation chip skip it. `B` arms the wall tool on Rectangle and opens the Build panel (`P` opens Paint; `lib/sidebar-panel.ts` picks the first panel the host has). A Polygon room is draft state until it completes (`lib/wall-polygon-draft.ts`): its corners live in `useFloorplanDraftPreview.wallPolygonDraftPoints`, drawn as ghost sides by the 3D tool and the plan's draft layer and used as snap targets, and no wall is written. Closing on the first corner, sealing or teeing into existing walls, or a double-click plans every side against a scratch copy of the scene (`planWallInsertion`, as the chain used to) and writes them in one `applyNodeChanges` batch — one undo step, one scene commit, room detection derives the floor and ceiling from it. Esc, a tool / shape / level change or ⌘Z just drops the draft: the scene, history, autosave and collaboration never saw it. The 3D tool owns the draft; the plan owns it only in 2D-only view. Walls and Rectangle keep their per-command history. The cursor bubble (3D `CursorSphere`, 2D cursor indicator) shows the variant's tile icon. In 2D the rectangle tool only claims clicks and publishes its first corner to `useFloorplanDraftPreview`; the panel's linear draft layer draws the four mitered walls with the line draft's plates and guides, so cursor, snapping and alignment are the line wall's own (`packages/nodes/src/wall/floorplan-tool.tsx`).
+
+Split is a HUD-driven loop cut that lives entirely in `packages/nodes/src/wall/`: `split-session.ts` opens the wall's own `reshaping` scope (`reshape: 'split'`, `driver: 'tool'`, which resolves to the `polygon` snap context — see `interaction-scope.md`) and owns every transition of the `split-store.ts` draft; scrolling sets 1–32 cuts, a single cut follows the pointer with the snapping modes, several divide the wall evenly, and a click commits them as one undo step through `planWallDivisions` (core). The editor mounts it through kind-agnostic seams only: `def.affordanceTools.split` (3D markers, `split-tool.tsx`), `extensions['pascal:editor/floorplan'].reshapeLayers.split` (the plan layer, `split-floorplan-layer.tsx`, mounted by `FloorplanRegisteredToolLayer` while the scope runs), `def.affordanceHints.split` (the HUD's cut-count chip and hints, rendered by `HelperManager` like `toolHints`), and `actionMenu.actions` (`actions.tsx`, the Split and Merge buttons `NodeActionMenu` renders for whichever kinds are selected). Any reshape name without a dedicated arm in `ToolManager` resolves the same way, so the next kind-owned reshape needs no editor change. Merge is the inverse (core `planWallMerge`): selected walls that continue each other join into the wall with the most attachments, openings keep their world position, rooms keep one boundary reference; refusals name the difference in the button's tooltip. The join rule (`systems/wall/wall-merge.ts`) is shared with the delete heal.
+
+Modes and parameters of these tools live on keys, the wheel and the HUD (`ToolHint.chip`), not in sidebar option rows or floating panels — except what a tool draws, which is chosen in the Build panel before drawing (the wall's Rooms variants).
+
 ## SVG `fill="none"` is click-through
 
 When emitting a `FloorplanGeometry` polygon that should remain interactive but visually invisible (e.g. an item with a thumbnail image carrying the visual weight), use `fill="transparent"`, not `fill="none"`. The default `pointer-events: visiblePainted` only hit-tests the interior when there's a paint server — `none` is not paint, `transparent` is. Without this the floor-plan layer's wrapping `<g>` never sees the `onPointerDown` and clicks don't select the node.
+
+## Procedural ceiling placement
+
+Procedural recipes declare `mounting: { attachTo: 'ceiling', reference }` with a named, non-repeated +Y top surface. The shared procedural mounted move session handles wall and ceiling previews, snapping, collision checks, Alt force-place for collisions, fresh subtree commits and single-step undo. Ceiling enter/move/click events use ceiling-local XZ; grid fallback shows an unhosted red ghost and cannot commit. The parent is the ceiling, stored Y is zero at the reference, and only yaw rotates (R/T); the rendered pose subtracts the rotated reference so the design hangs flush below the ceiling underside. Core validation enforces polygon containment, holes and level height even with Alt. The 2D move target finds ceiling polygons and uses the same session; glyphs resolve the ceiling frame, while parameter arrows portal through the ceiling frame and floor elevation never applies.
+
+
+## Surface fit policy
+
+`resolveSurfacePlacement` owns fit for both movers. Strictness follows what the
+provider knows about the surface:
+
+- **Declared:** a stable, non-null surface ID requires a `region`. The child's
+  rotated hull must fit inside that region after snapping, excluding holes. The
+  hull projects all eight corners when full XYZ rotation or offset bounds are
+  supplied. Rectangle containment allows 1e-6 m per edge, so a centred, unrotated
+  object exactly matching a board fits despite floating-point noise.
+- **Hit-derived:** `id: null` has no region. An upward hit identifies support but
+  cannot describe an armrest or cushion's outline. The best-effort test compares
+  the rotated child's XZ spans to the host's available bounds, with a 1e-6 m
+  tolerance. It does not constrain the hit position to a fictitious flat top.
+  Hosts without measurable bounds remain permissive.
+
+`HostSurface` is a union: a non-null ID requires `region`, while a null ID has none.
+`SurfaceProvider.surfaces()` returns only `DeclaredHostSurface[]`. Untyped plugins
+that resolve a declared surface without a region throw an explicit contract error;
+they never silently enter the hit-derived fit path. The low-level
+`checkFootprint: false` option is for unchecked pose proposals, not valid drops:
+it still enforces declaration integrity and acceptance. Both shelf movers check
+fit on entry and movement and revalidate rotations before commit.
+
+Provider audit:
+
+| Provider | Published extent |
+|---|---|
+| Shelf rows | Centred board rectangles. Depth is `D - 0.002 m`. Wall shelves use width `W`; bookshelves with sides and cubbies use `W - 2 × thickness`; open racks and bookshelves without sides use `W - 0.002 m`. A bookshelf's optional bottom board without sides uses `W`, matching its mesh. The mesh and adapter share the board-dimension helper. |
+| Cabinet countertops and bars | Each real countertop span and bar slab's rectangle, with its actual centre and half-extents. Counter holes cover sink bowls, faucets and hob footprints. Tall/wall/disabled spans publish nothing. |
+| Procedural named surfaces | Evaluated recipe width/depth divided by two, in each surface's own frame. |
+| Catalog item hit provider | No declared extent: authored `asset.surface.height` supplies only Y, not a usable XZ boundary. Retains ray-selected freeform placement and the rotated best-effort host-bounds check. |
+| Generic hit-derived provider | No declared extent: the upward mesh hit supplies support, optionally bounded by `dragBounds` or `floorPlaced.footprint`. Legacy top-height/side metadata alone is not a region declaration. |
+
+Row election, first-row ties, shelf-volume stickiness and the existing grid snap
+functions remain unchanged. In 2D, current-host retention uses this same resolver
+and board region; its previous extra whole-shelf rectangle check is gone. Fresh
+host acquisition, surface cycling and the existing exit-to-level behavior remain
+in surface-hosting slice F. A 2D exit currently chooses the level rather than
+refusing a host drop, so it does not publish a surface-refusal label.
+
+A refusal in 3D sets the existing footprint preview red and places a short status
+label beside it. `onReject` reaches both movers; the matching floor event cannot
+erase the reason or commit the refused drop to the floor. A new floor move or a
+valid surface clears it, as do cleanup/cancel. Alt can bypass collision checks,
+but not a surface refusal. Rotation retries the attempted host when needed.
+
+| Rejection | Preview wording |
+|---|---|
+| Footprint outside declared region or exceeding hit-derived host bounds | Doesn't fit this surface |
+| Hit inside a hole, or contained footprint overlapping a hole | Over a sink or hob cutout |
+| Host ineligible or child rejected by its acceptance predicate | This host doesn't accept this kind of object |
+| No supporting surface or invalid hit | No supporting surface here |
+
+The frozen fit table pins both acceptance and refusal for each adapter, with exact
+per-verdict counts. Shelf acceptance sweeps every fixture board through interior,
+near-edge, centred equality and rotated placements, including grid-on cases. Captured
+expected poses stay static during tests; changing fit policy requires reviewing the
+verdict changes and retaining coverage of both outcomes.

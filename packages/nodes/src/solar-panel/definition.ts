@@ -255,10 +255,12 @@ export const solarPanelDefinition: NodeDefinition<typeof SolarPanelNode> = {
   handles: solarPanelHandles,
   floorplan: buildSolarPanelFloorplan,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),
   },
+  preview: () => import('./preview'),
 
   tool: () => import('./tool'),
   affordanceTools: {
@@ -272,7 +274,7 @@ export const solarPanelDefinition: NodeDefinition<typeof SolarPanelNode> = {
   presentation: {
     label: 'Solar Panel',
     description: 'Grid of photovoltaic panels mounted on a roof segment.',
-    icon: { kind: 'url', src: '/icons/roof.webp' },
+    icon: { kind: 'url', src: '/icons/solar-panel.webp' },
     paletteSection: 'structure',
     paletteOrder: 123,
   },

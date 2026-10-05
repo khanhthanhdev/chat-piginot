@@ -1,13 +1,49 @@
 export type ContextualShortcutHint = {
-  keys: string[]
+  // A combo of keys pressed together (rendered joined by "+"). An entry may
+  // itself be an array of alternatives (rendered joined by "/"), e.g.
+  // [['Cmd/Ctrl', 'Shift'], 'Left click'] → "⌘ / ⇧ + click".
+  keys: Array<string | string[]>
   label: string
+  // Optional secondary line under the label for a terser qualifier
+  // (e.g. "disable 15° snap"). The HUD wraps both lines rather than truncating.
+  subtitle?: string
   active?: boolean
+}
+
+// `activeHandleDrag.label` value a rotate gizmo sets while dragging, so the
+// contextual HUD can surface the rotation snapping mode for the duration.
+// Distinct from resize handles,
+// which route their own measurement label here.
+export const ROTATE_HANDLE_DRAG_LABEL = 'rotate-handle'
+
+// `activeHandleDrag.label` a plain resize / radial-resize arrow sets while
+// dragging (when it carries no dimension `measureLabel`). It exists only so the
+// interaction scope is non-idle during a resize, which keeps the idle
+// select-mode hints off-screen — a resize is its own action, not a selection.
+export const RESIZE_HANDLE_DRAG_LABEL = 'resize-handle'
+
+// `activeHandleDrag.label`s for the multi-selection group drags: the body
+// drag sessions (2D floorplan + 3D ground plane) and the rotate gizmo. Kept
+// here (not in the session/gizmo modules) so `snapping-mode.ts` can resolve
+// the group move to the 'item' snap context without importing component code.
+export const GROUP_MOVE_DRAG_LABEL = 'group-move-handle'
+export const GROUP_ROTATE_DRAG_LABEL = 'group-rotate-handle'
+
+export function resolveRotateHandleHelpHints(altPressed: boolean): ContextualShortcutHint[] {
+  return [
+    {
+      keys: [ALT_KEY],
+      label: altPressed ? 'Rotating freely (no angle step)' : 'Hold to rotate freely',
+      active: altPressed,
+    },
+  ]
 }
 
 export type SelectModeHelpContext = {
   selectedCount: number
   hasMovableSelection: boolean
   hasRotatableSelection: boolean
+  hasOpeningRadiusSelection?: boolean
   commandPressed: boolean
   shiftPressed: boolean
   // When a single MEP node is selected its in-world handle rig (click a dot to
@@ -23,11 +59,13 @@ const SHIFT_KEY = 'Shift'
 const CLICK = 'Click'
 const ALT_KEY = 'Alt'
 const ROTATE_KEYS = 'R / T'
+const ESC_KEY = 'Esc'
 
 export function resolveSelectModeHelpHints({
   selectedCount,
   hasMovableSelection,
   hasRotatableSelection,
+  hasOpeningRadiusSelection = false,
   commandPressed,
   shiftPressed,
   mepSelection = null,
@@ -38,10 +76,36 @@ export function resolveSelectModeHelpHints({
     if (!commandPressed && !shiftPressed) return hints
 
     hints.push({
-      keys: [commandPressed ? COMMAND_KEY : SHIFT_KEY, LEFT_CLICK],
+      keys: [[COMMAND_KEY, SHIFT_KEY], LEFT_CLICK],
       label: 'Add or remove objects from the selection',
       active: true,
     })
+    return hints
+  }
+
+  // Multi-selection — advertise the group gestures: drag any member to slide
+  // the whole selection (2D floor plan body drag + the 3D move gizmo), R / T
+  // to step-rotate the group around its bounding-box center.
+  if (selectedCount > 1) {
+    hints.push({
+      keys: [LEFT_CLICK],
+      label: 'Click or drag the selection to move it as one',
+    })
+    hints.push({ keys: [ROTATE_KEYS], label: 'Rotate the selection ±45°' })
+    hints.push({
+      keys: [COMMAND_KEY, 'G'],
+      label: 'Group selection (session only)',
+    })
+    hints.push({
+      keys: [COMMAND_KEY, SHIFT_KEY, 'G'],
+      label: 'Ungroup session selection',
+    })
+    hints.push({
+      keys: [[COMMAND_KEY, SHIFT_KEY], LEFT_CLICK],
+      label: 'Add or remove objects from the selection',
+      active: commandPressed || shiftPressed,
+    })
+    hints.push({ keys: [ESC_KEY], label: 'Clear the selection (or click outside)' })
     return hints
   }
 
@@ -59,65 +123,37 @@ export function resolveSelectModeHelpHints({
     hints.push({ keys: [ALT_KEY], label: 'Switch the rotation axis (Y → X → Z)' })
   }
 
-  if (commandPressed) {
-    if (hasMovableSelection) {
-      hints.push({
-        keys: [COMMAND_KEY, LEFT_CLICK],
-        label: shiftPressed
-          ? 'Drag selected movable object freely'
-          : 'Drag selected movable object with guides',
-        active: true,
-      })
-    }
-
-    if (hasRotatableSelection) {
-      hints.push({
-        keys: [COMMAND_KEY, RIGHT_CLICK],
-        label: shiftPressed
-          ? 'Drag left or right to rotate freely'
-          : 'Drag left or right to rotate',
-        active: true,
-      })
-    }
-
+  // The rows are the same whatever modifier is held — guides/snapping are
+  // governed by the snapping mode (Shift toggles it), not by the modifier of
+  // this gesture, so there are no modifier-specific variants to advertise.
+  // Holding Cmd/Ctrl or Shift just lights the selection row.
+  if (hasMovableSelection) {
     hints.push({
-      keys: [COMMAND_KEY, LEFT_CLICK],
-      label: 'Click without dragging to add or remove objects',
-      active: commandPressed && !shiftPressed,
+      keys: [LEFT_CLICK],
+      label: 'Drag selected movable object',
     })
-  } else {
-    if (hasMovableSelection) {
-      hints.push({
-        keys: [COMMAND_KEY, LEFT_CLICK],
-        label: 'Drag selected movable object',
-      })
-    }
-
-    if (hasRotatableSelection) {
-      hints.push({
-        keys: [COMMAND_KEY, RIGHT_CLICK],
-        label: 'Drag left or right to rotate selected object',
-      })
-    }
   }
 
-  hints.push({
-    keys: [SHIFT_KEY],
-    label: shiftPressed ? 'Guided constraints bypassed' : 'Hold to bypass snaps and angle steps',
-    active: shiftPressed,
-  })
-
-  if (!commandPressed) {
+  if (hasRotatableSelection) {
     hints.push({
-      keys: [COMMAND_KEY, LEFT_CLICK],
-      label: 'Add or remove objects from the selection',
+      keys: [COMMAND_KEY, RIGHT_CLICK],
+      label: 'Drag left or right to rotate selected object',
     })
+  }
+
+  if (hasOpeningRadiusSelection) {
     hints.push({
-      keys: [SHIFT_KEY, LEFT_CLICK],
-      label: 'Add or remove objects on the canvas',
+      keys: [SHIFT_KEY],
+      label: 'Adjust one side’s corner radius',
       active: shiftPressed,
     })
   }
+
+  hints.push({
+    keys: [[COMMAND_KEY, SHIFT_KEY], LEFT_CLICK],
+    label: 'Add or remove objects from the selection',
+    active: commandPressed || shiftPressed,
+  })
 
   return hints
 }

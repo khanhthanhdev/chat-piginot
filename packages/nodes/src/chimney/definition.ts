@@ -395,10 +395,12 @@ export const chimneyDefinition: NodeDefinition<typeof ChimneyNode> = {
   handles: chimneyHandles,
   floorplan: buildChimneyFloorplan,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),
   },
+  preview: () => import('./preview'),
 
   tool: () => import('./tool'),
   toolHints: [
@@ -409,7 +411,7 @@ export const chimneyDefinition: NodeDefinition<typeof ChimneyNode> = {
   presentation: {
     label: 'Chimney',
     description: 'Vertical masonry stack on a roof segment.',
-    icon: { kind: 'url', src: '/icons/roof.webp' },
+    icon: { kind: 'url', src: '/icons/chimney.webp' },
     paletteSection: 'structure',
     paletteOrder: 122,
   },

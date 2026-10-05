@@ -1,9 +1,12 @@
 import {
   DEFAULT_ANGLE_STEP,
+  type FenceConstructionOptions as FenceCommitOptions,
   FenceNode,
+  getTwoPointFenceCurveTangents,
   getWallCurveFrameAt,
   getWallCurveLength,
   isCurvedWall,
+  resolveFenceConstructionSupport,
   snapPointAlongAngleRay,
   useScene,
   type WallNode,
@@ -189,6 +192,7 @@ export function snapFenceDraftPoint(args: {
 export function createFenceOnCurrentLevel(
   start: FencePlanPoint,
   end: FencePlanPoint,
+  options?: FenceCommitOptions,
 ): FenceNode | null {
   const currentLevelId = useViewer.getState().selection.levelId
   const { createNode, nodes } = useScene.getState()
@@ -202,12 +206,58 @@ export function createFenceOnCurrentLevel(
   // spacing, …) merge in first; `name`/`start`/`end` always win. The
   // schema parse validates and drops anything unexpected.
   const defaults = useEditor.getState().toolDefaults.fence ?? {}
-  const fence = FenceNode.parse({
+  const authoredFence = FenceNode.parse({
     ...defaults,
     name: `Fence ${fenceCount + 1}`,
     start,
     end,
   })
+  // Fences run no per-frame support election — the persisted host IS the
+  // lift (absent = level floor), so elect it at commit, pointer-capped.
+  const fence = resolveFenceConstructionSupport(authoredFence, currentLevelId, nodes, options)
+
+  createNode(fence, currentLevelId)
+  sfxEmitter.emit('sfx:structure-build')
+
+  return fence
+}
+
+/**
+ * Commit a smooth spline fence from a list of drawn control points. The
+ * centerline becomes a Catmull-Rom curve through `path`; `start`/`end` are
+ * pinned to the first/last point so endpoint handles, bbox, and miter
+ * references stay valid. Requires >= 2 points spanning a usable distance.
+ */
+export function createSplineFenceOnCurrentLevel(
+  path: FencePlanPoint[],
+  tangents = getTwoPointFenceCurveTangents(path),
+  options?: FenceCommitOptions,
+): FenceNode | null {
+  const currentLevelId = useViewer.getState().selection.levelId
+  const { createNode, nodes } = useScene.getState()
+
+  if (!currentLevelId || path.length < 2) {
+    return null
+  }
+  const start = path[0]!
+  const end = path[path.length - 1]!
+  // A degenerate single-point-ish path (all clicks on one spot) is rejected
+  // the same way a too-short straight segment is.
+  if (!isSegmentLongEnough(start, end) && path.length < 3) {
+    return null
+  }
+
+  const fenceCount = Object.values(nodes).filter((node) => node.type === 'fence').length
+  const defaults = useEditor.getState().toolDefaults.fence ?? {}
+  const authoredFence = FenceNode.parse({
+    ...defaults,
+    name: `Fence ${fenceCount + 1}`,
+    start,
+    end,
+    path,
+    tangents,
+  })
+  const fence = resolveFenceConstructionSupport(authoredFence, currentLevelId, nodes, options)
 
   createNode(fence, currentLevelId)
   sfxEmitter.emit('sfx:structure-build')

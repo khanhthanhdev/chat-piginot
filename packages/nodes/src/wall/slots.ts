@@ -1,4 +1,9 @@
-import { type SlotDeclaration, WALL_SLOT_DEFAULT } from '@pascal-app/core'
+import {
+  getCurtainWallConfig,
+  type SlotDeclaration,
+  WALL_SURFACE_SLOT_DEFAULTS,
+  type WallNode,
+} from '@pascal-app/core'
 
 /**
  * A wall exposes two paintable faces — interior + exterior. Painting writes
@@ -7,9 +12,87 @@ import { type SlotDeclaration, WALL_SLOT_DEFAULT } from '@pascal-app/core'
  * keeps walls on the same `{ slotId, label, default }` contract. The defaults
  * come from core so the viewer's material resolver renders the identical value.
  */
-export function wallSlots(): SlotDeclaration[] {
+export function wallSlots(node?: WallNode): SlotDeclaration[] {
+  if (node?.wallType === 'curtain') {
+    const config = getCurtainWallConfig(node)
+    return [
+      { slotId: 'curtain-frame', label: 'Frame', default: config.frameColor },
+      { slotId: 'curtain-glass', label: 'Glass', default: config.glassColor },
+      { slotId: 'curtain-solid', label: 'Solid panels', default: config.solidColor },
+    ]
+  }
   return [
-    { slotId: 'interior', label: 'Interior', default: WALL_SLOT_DEFAULT.interior },
-    { slotId: 'exterior', label: 'Exterior', default: WALL_SLOT_DEFAULT.exterior },
+    { slotId: 'interior', label: 'Interior', default: WALL_SURFACE_SLOT_DEFAULTS.interior },
+    { slotId: 'exterior', label: 'Exterior', default: WALL_SURFACE_SLOT_DEFAULTS.exterior },
+    {
+      slotId: 'lowerInterior',
+      label: 'Lower band (interior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.lowerInterior,
+    },
+    {
+      slotId: 'middleInterior',
+      label: 'Middle band (interior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.middleInterior,
+    },
+    {
+      slotId: 'upperInterior',
+      label: 'Upper band (interior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.upperInterior,
+    },
+    {
+      slotId: 'topInterior',
+      label: 'Top band (interior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.topInterior,
+    },
+    {
+      slotId: 'lowerExterior',
+      label: 'Lower band (exterior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.lowerExterior,
+    },
+    {
+      slotId: 'middleExterior',
+      label: 'Middle band (exterior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.middleExterior,
+    },
+    {
+      slotId: 'upperExterior',
+      label: 'Upper band (exterior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.upperExterior,
+    },
+    {
+      slotId: 'topExterior',
+      label: 'Top band (exterior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.topExterior,
+    },
+    {
+      slotId: 'skirtingInterior',
+      label: 'Skirting (interior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.skirtingInterior,
+    },
+    {
+      slotId: 'skirtingExterior',
+      label: 'Skirting (exterior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.skirtingExterior,
+    },
+    {
+      slotId: 'crownInterior',
+      label: 'Crown (interior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.crownInterior,
+    },
+    {
+      slotId: 'crownExterior',
+      label: 'Crown (exterior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.crownExterior,
+    },
+    {
+      slotId: 'chairRailInterior',
+      label: 'Chair rail (interior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.chairRailInterior,
+    },
+    {
+      slotId: 'chairRailExterior',
+      label: 'Chair rail (exterior)',
+      default: WALL_SURFACE_SLOT_DEFAULTS.chairRailExterior,
+    },
   ]
 }

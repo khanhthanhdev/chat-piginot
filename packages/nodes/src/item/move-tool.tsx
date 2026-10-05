@@ -1,6 +1,12 @@
 'use client'
 
-import { type AnyNodeId, type ItemNode, useScene } from '@pascal-app/core'
+import {
+  type AnyNode,
+  type AnyNodeId,
+  canHostSurfaceChild,
+  type ItemNode,
+  useScene,
+} from '@pascal-app/core'
 import {
   type PlacementState,
   triggerSFX,
@@ -8,6 +14,7 @@ import {
   useEditor,
   usePlacementCoordinator,
 } from '@pascal-app/editor'
+import { useMemo } from 'react'
 import { Vector3 } from 'three'
 
 /**
@@ -35,8 +42,24 @@ import { Vector3 } from 'three'
  * move) also ports to `def.tool`, the primitives can be inlined here
  * and dropped from editor.
  */
-function getInitialState(node: ItemNode): PlacementState {
+export function getInitialState(
+  node: ItemNode,
+  parent: AnyNode | undefined = node.parentId
+    ? useScene.getState().nodes[node.parentId as AnyNodeId]
+    : undefined,
+): PlacementState {
   const attachTo = node.asset.attachTo
+  if (node.blockFaceId && parent?.type === 'block') {
+    return {
+      surface: 'block-face',
+      wallId: null,
+      roofSegmentId: null,
+      blockId: parent.id,
+      ceilingId: null,
+      surfaceItemId: null,
+      shelfId: null,
+    }
+  }
   if (attachTo === 'wall' || attachTo === 'wall-side') {
     if (node.roofSegmentId) {
       return {
@@ -72,8 +95,12 @@ function getInitialState(node: ItemNode): PlacementState {
   // handler — which preserves the grab offset — instead of a fresh `enter()`
   // that snaps the item's origin under the cursor. Without this the item
   // teleports the instant it's grabbed.
-  const parent = node.parentId ? useScene.getState().nodes[node.parentId as AnyNodeId] : undefined
-  if (parent?.type === 'item') {
+  if (
+    parent?.type === 'item' ||
+    parent?.type === 'cabinet' ||
+    parent?.type === 'procedural-item' ||
+    (parent && parent.type !== 'shelf' && canHostSurfaceChild(parent, node.type, node.id))
+  ) {
     return {
       surface: 'item-surface',
       wallId: null,
@@ -103,7 +130,14 @@ function getInitialState(node: ItemNode): PlacementState {
   }
 }
 
-export function MoveItemTool({ node }: { node: ItemNode }) {
+export function MoveItemTool({ node: source }: { node: ItemNode }) {
+  const node = useMemo(
+    () =>
+      source.metadata?.isNew
+        ? ((useScene.getState().nodes[source.id] as ItemNode) ?? source)
+        : source,
+    [source],
+  )
   const draftNode = useDraftNode()
 
   const meta =
@@ -111,6 +145,10 @@ export function MoveItemTool({ node }: { node: ItemNode }) {
       ? (node.metadata as Record<string, unknown>)
       : {}
   const isNew = !!meta.isNew
+  const isSceneDraft = useMemo(
+    () => isNew && !!useScene.getState().nodes[node.id],
+    [isNew, node.id],
+  )
 
   const cursor = usePlacementCoordinator({
     asset: node.asset,
@@ -119,21 +157,22 @@ export function MoveItemTool({ node }: { node: ItemNode }) {
     // items create their draft lazily inside the coordinator).
     slots: node.slots,
     // Duplicates start fresh in floor mode; wall/ceiling draft is created lazily by ensureDraft.
-    initialState: isNew
-      ? {
-          surface: 'floor',
-          wallId: null,
-          roofSegmentId: null,
-          ceilingId: null,
-          surfaceItemId: null,
-          shelfId: null,
-        }
-      : getInitialState(node),
+    initialState:
+      isNew && !isSceneDraft
+        ? {
+            surface: 'floor',
+            wallId: null,
+            roofSegmentId: null,
+            ceilingId: null,
+            surfaceItemId: null,
+            shelfId: null,
+          }
+        : getInitialState(node),
     // Preserve the original item's scale so Y-position calculations use the correct height.
     defaultScale: isNew ? node.scale : undefined,
-    preserveDragOffset: true,
+    preserveDragOffset: !isSceneDraft,
     initDraft: (gridPosition) => {
-      if (isNew) {
+      if (isNew && !isSceneDraft) {
         // Duplicate: floor items get a draft immediately; wall/ceiling
         // items are created lazily on surface entry.
         gridPosition.copy(new Vector3(...node.position))
@@ -142,7 +181,7 @@ export function MoveItemTool({ node }: { node: ItemNode }) {
         }
       } else {
         draftNode.adopt(node)
-        gridPosition.copy(new Vector3(...node.position))
+        gridPosition.copy(new Vector3(...draftNode.current!.position))
       }
     },
     onCommitted: () => {

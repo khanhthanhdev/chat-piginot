@@ -1,12 +1,42 @@
-import type { NodeDefinition } from '@pascal-app/core'
-import { buildWallFloorplan } from './floorplan'
-import { wallCurveAffordance, wallMoveEndpointAffordance } from './floorplan-affordances'
+import {
+  type AnyNodeId,
+  getWallBaseElevationForNodes,
+  getWallEffectiveHeightForNodes,
+  type NodeDefinition,
+  type WallNode as WallNodeType,
+} from '@pascal-app/core'
+import {
+  DRAFTING_SURFACE_EXTENSION_KEY,
+  type DraftingSurfaceExtension,
+  type FloorplanNodeExtension,
+  type NodePanelModel,
+  PANEL_MODEL_EXTENSION,
+} from '@pascal-app/editor'
+import { buildWallContextualDimensions } from './contextual-dimensions'
+import { hasWallCurveBlockingChildren } from './curve-eligibility'
+import { useWallDrawingMode } from './drawing-mode'
+import { buildWallFloorplan, computeWallFloorplanLevelData } from './floorplan'
+import {
+  wallCurveAffordance,
+  wallMoveEndpointAffordance,
+  wallThicknessAffordance,
+} from './floorplan-affordances'
 import { wallFloorplanMoveTarget } from './floorplan-move'
 import { wallFloorplanSiblingOverrides } from './floorplan-overrides'
+import {
+  matchWallMeasurementFeature,
+  resolveWallMeasurementFeature,
+  wallMeasurementFeatures,
+} from './measurement'
 import { wallPaint } from './paint'
+import { wallSettings } from './panel-model'
 import { wallParametrics } from './parametrics'
+import { wallQuickMeasurement } from './quick-measurement'
 import { WallNode } from './schema'
 import { wallSlots } from './slots'
+import { WALL_SPLIT_MAX_CUTS } from './split-preview'
+import { setWallSplitCuts } from './split-session'
+import { useWallSplit } from './split-store'
 
 /**
  * Wall — the Phase 3 stress test of the registry-driven node model.
@@ -18,16 +48,58 @@ import { wallSlots } from './slots'
  *   `renderer` + `system` keep wrap-exporting legacy WallRenderer +
  *   WallSystem + WallCutout.
  * Stage C: `def.floorplan` builder produces the mitered plan footprint
- *   polygon using `ctx.siblings` to assemble miter context.
+ *   polygon from shared floor-plan level data, with `ctx.siblings` as the
+ *   direct-caller fallback.
  *   floorplan-panel.tsx's `wallPolygons` short-circuits to [] when
  *   wall is registered.
  */
+const SPLIT_CUT_COUNTS = Array.from({ length: WALL_SPLIT_MAX_CUTS }, (_, index) =>
+  String(index + 1),
+)
+
 export const wallDefinition: NodeDefinition<typeof WallNode> = {
   kind: 'wall',
-  schemaVersion: 1,
+  snapProfile: 'structural',
+  schemaVersion: 9,
   schema: WallNode,
   category: 'structure',
   surfaceRole: 'wall',
+  extensions: {
+    [PANEL_MODEL_EXTENSION]: {
+      rows: ({ node, nodes, update }) => wallSettings(node, nodes, update),
+    } satisfies NodePanelModel<WallNodeType>,
+    [DRAFTING_SURFACE_EXTENSION_KEY]: {
+      kind: 'wall',
+      classifyFace: (node, localNormal) => {
+        if (node?.type !== 'wall') return null
+        const dx = node.end[0] - node.start[0]
+        const dz = node.end[1] - node.start[1]
+        const length = Math.hypot(dx, dz)
+        if (length <= 1e-9) return { face: 'unknown' }
+        const sideDot = localNormal[0] * (-dz / length) + localNormal[2] * (dx / length)
+        if (Math.abs(localNormal[1]) > 0.7) return { face: 'top' }
+        if (Math.abs(localNormal[1]) < 0.25 && Math.abs(sideDot) > 0.7) {
+          return { face: 'side', side: sideDot >= 0 ? 'front' : 'back' }
+        }
+        return { face: 'end' }
+      },
+    } satisfies DraftingSurfaceExtension,
+    'pascal:editor/floorplan': {
+      tool: () => import('./floorplan-tool'),
+      reshapeLayers: { split: () => import('./split-floorplan-layer') },
+      contextualDimensions: buildWallContextualDimensions,
+      actionMenu: {
+        actions: () => import('./actions'),
+        canCurve: ({ node, nodes }) =>
+          !hasWallCurveBlockingChildren(
+            node.children.flatMap((childId) => {
+              const child = nodes[childId as AnyNodeId]
+              return child ? [child] : []
+            }),
+          ),
+      },
+    } satisfies FloorplanNodeExtension<WallNode>,
+  },
 
   defaults: () => ({
     object: 'node',
@@ -48,6 +120,15 @@ export const wallDefinition: NodeDefinition<typeof WallNode> = {
     selectable: { hitVolume: 'bbox' },
     // Front + back faces host items (paintings, shelves, switches).
     surfaces: {
+      hosting: false,
+      top: {
+        height: (node, { nodes }) => {
+          const wall = node as WallNodeType
+          return (
+            getWallBaseElevationForNodes(wall, nodes) + getWallEffectiveHeightForNodes(wall, nodes)
+          )
+        },
+      },
       sides: { faces: 'all' },
     },
     duplicable: true,
@@ -57,15 +138,15 @@ export const wallDefinition: NodeDefinition<typeof WallNode> = {
     // preview through this entry rather than carrying a kind-name
     // arm.
     paint: wallPaint,
-    // Declared paintable slots (interior / exterior) with their default
-    // appearance — the same `{ slotId, label, default }` contract every other
-    // paintable kind exposes. Paint still writes the legacy inline fields via
-    // `wallPaint`; migrating those into `node.slots` is a later step.
-    slots: () => wallSlots(),
+    // Declared paintable slots with their default appearance — the same
+    // `{ slotId, label, default }` contract every other paintable kind exposes.
+    // Paint still writes the legacy inline fields for base faces via
+    // `wallPaint`; migrating those fully into `node.slots` is a later step.
+    slots: (node) => wallSlots(node as WallNodeType),
   },
 
   relations: {
-    hosts: ['door', 'window', 'item'],
+    hosts: ['door', 'window', 'item', 'lean-to-extension'],
     affectsSpatial: ['slab', 'ceiling', 'zone'],
     linkedBy: 'endpoint-match',
     cascadeDelete: 'descendants',
@@ -83,10 +164,12 @@ export const wallDefinition: NodeDefinition<typeof WallNode> = {
   // auto-slab live preview, history dances). Placement is wired via
   // `def.tool`.
   tool: () => import('./tool'),
+  preview: () => import('./preview'),
   affordanceTools: {
     curve: () => import('./curve-tool'),
     'move-endpoint': () => import('./move-endpoint-tool'),
     move: () => import('./move-tool'),
+    split: () => import('./split-tool'),
   },
 
   renderer: {
@@ -98,9 +181,18 @@ export const wallDefinition: NodeDefinition<typeof WallNode> = {
     // Priority 4 mirrors the legacy WallSystem's useFrame priority.
     priority: 4,
   },
-  // Stage C: floor-plan rendering. ctx.siblings provides other walls in
-  // the level so `calculateLevelMiters` can compute correct corner joins.
+  // Stage C: floor-plan rendering. Precomputes the level miter graph once
+  // per render pass, then the builder reads its own junctions by wall id.
+  computeFloorplanLevelData: computeWallFloorplanLevelData,
   floorplan: buildWallFloorplan,
+  measurement: {
+    features: (node) => wallMeasurementFeatures(node),
+    quickMeasure: (node) => wallQuickMeasurement(node),
+    match: (node, _ctx, point, maxDistance) =>
+      matchWallMeasurementFeature(node, point, maxDistance),
+    resolve: (node, _ctx, reference) => resolveWallMeasurementFeature(node, reference),
+  },
+  floorplanDependsOnSiblings: true,
   // 2D drag affordances triggered by `endpoint-handle` primitives in
   // `def.floorplan`'s output. Sister to `affordanceTools` (3D) — the
   // same legacy `MoveWallEndpointTool` flow, reachable from both the
@@ -108,25 +200,75 @@ export const wallDefinition: NodeDefinition<typeof WallNode> = {
   floorplanAffordances: {
     'move-endpoint': wallMoveEndpointAffordance,
     curve: wallCurveAffordance,
+    thickness: wallThicknessAffordance,
   },
   floorplanMoveTarget: wallFloorplanMoveTarget,
   floorplanSiblingOverrides: wallFloorplanSiblingOverrides,
-
   toolHints: [
     { key: 'Left click', label: 'Set wall start / end' },
-    { key: 'Shift', label: 'Free angle (no 15° snap)' },
+    {
+      key: 'R',
+      label: 'Shape',
+      chip: {
+        subscribe: (onChange) => useWallDrawingMode.subscribe(onChange),
+        value: () => useWallDrawingMode.getState().mode,
+        cycle: () => useWallDrawingMode.getState().toggle(),
+        labels: { line: 'Shape: Line', rectangle: 'Shape: Rectangle' },
+        icons: { line: 'lucide:minus', rectangle: 'lucide:square' },
+        tooltip: 'Wall shape — click or press R to toggle',
+      },
+    },
     { key: 'Esc', label: 'Cancel' },
   ],
+  // The split session (`split-session.ts`) is the wall's own reshape; the HUD
+  // shows these while it runs. The snapping chip comes from the scope.
+  affordanceHints: {
+    split: [
+      { key: 'Left click', label: 'Split at the marks' },
+      {
+        key: 'Scroll',
+        label: 'Cuts',
+        chip: {
+          subscribe: (onChange) => useWallSplit.subscribe(onChange),
+          value: () => String(useWallSplit.getState().draft?.cuts ?? 1),
+          cycle: () => {
+            const cuts = useWallSplit.getState().draft?.cuts ?? 1
+            setWallSplitCuts(cuts >= WALL_SPLIT_MAX_CUTS ? 1 : cuts + 1)
+          },
+          labels: Object.fromEntries(
+            SPLIT_CUT_COUNTS.map((count) => [
+              count,
+              count === '1' ? 'Cuts: 1' : `Cuts: ${count}, even`,
+            ]),
+          ),
+          icons: Object.fromEntries(SPLIT_CUT_COUNTS.map((count) => [count, 'lucide:scissors'])),
+          tooltip: 'Number of cuts — scroll or click to change',
+        },
+      },
+      {
+        key: 'Alt',
+        label: 'Free placement',
+        // Several cuts are evenly spaced, so there is nothing to place freely.
+        visible: {
+          subscribe: (onChange) => useWallSplit.subscribe(onChange),
+          value: () => (useWallSplit.getState().draft?.cuts ?? 1) === 1,
+        },
+      },
+      { key: 'Esc', label: 'Cancel' },
+    ],
+  },
 
   presentation: {
     label: 'Wall',
-    description: 'A straight or curved wall segment. Hosts doors, windows, and wall-mounted items.',
+    description:
+      'A straight or curved wall segment. Hosts doors, windows, lean-to extensions, and wall-mounted items.',
     icon: { kind: 'url', src: '/icons/wall.webp' },
     paletteSection: 'structure',
     paletteOrder: 10,
   },
 
   mcp: {
-    description: 'A wall segment defined by start + end points, with optional curve sagitta.',
+    description:
+      'A wall defined by endpoints and optional curve sagitta. wallType selects standard or curtain. curtainWall configures construction, framing, grids, glazing, spandrels, and zero-based panel overrides. Thickness is frame depth for curtain walls.',
   },
 }

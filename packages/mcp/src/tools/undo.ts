@@ -1,7 +1,8 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import type { SceneOperations } from '../operations'
-import { publishLiveSceneSnapshot } from './live-sync'
+import { DESTRUCTIVE_TOOL_ANNOTATIONS } from './annotations'
+import { liveSyncOutput, persistencePayload, publishLiveSceneSnapshot } from './live-sync'
 
 export const undoInput = {
   steps: z.number().int().positive().optional(),
@@ -9,6 +10,7 @@ export const undoInput = {
 
 export const undoOutput = {
   undone: z.number(),
+  ...liveSyncOutput,
 }
 
 export function registerUndo(server: McpServer, bridge: SceneOperations): void {
@@ -20,11 +22,13 @@ export function registerUndo(server: McpServer, bridge: SceneOperations): void {
         'Undo the most recent N steps in the scene history (default 1). Returns the number of steps actually undone.',
       inputSchema: undoInput,
       outputSchema: undoOutput,
+      annotations: DESTRUCTIVE_TOOL_ANNOTATIONS,
     },
     async ({ steps }) => {
       const undone = bridge.undo(steps ?? 1)
-      if (undone > 0) await publishLiveSceneSnapshot(bridge, 'undo')
-      const payload = { undone }
+      const persistence =
+        undone > 0 ? await publishLiveSceneSnapshot(bridge, 'undo') : ('published' as const)
+      const payload = { undone, ...persistencePayload(persistence) }
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
         structuredContent: payload,

@@ -1,34 +1,24 @@
 [project]
 name = "piginot-backend"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "LGO indoor-airflow inference service"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "matplotlib>=3.10.8",
-    "numpy>=2.4.3",
-    "onnxruntime>=1.26.0",
-    "pydantic>=2.12.0",
-    "scikit-learn>=1.8.0",
-    "torch>=2.10.0",
     "fastapi>=0.115.0",
-    "python-multipart>=0.0.9",
-    "uvicorn>=0.42.0",
-    "plotly>=6.6.0",
-    "fastmcp>=3.4.2",
+    "matplotlib==3.11.0",
+    "neuraloperator==2.0.0",
+    "numpy==2.4.4",
+    "pandas==3.0.3",
+    "scipy==1.18.0",
+    "torch==2.13.0",
+    "uvicorn[standard]>=0.30.0",
 ]
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cpu" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

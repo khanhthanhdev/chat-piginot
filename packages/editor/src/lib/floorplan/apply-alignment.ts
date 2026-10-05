@@ -2,10 +2,11 @@ import {
   type AlignmentAnchor,
   type AlignmentGuide,
   collectAlignmentAnchors,
-  resolveAlignment,
+  resolveLevelId,
   useScene,
 } from '@pascal-app/core'
-import { useAlignmentGuides } from '@pascal-app/editor'
+import useAlignmentGuides from '../../store/use-alignment-guides'
+import { resolveAlignmentForFloorplanView } from '../world-grid-snap'
 
 /**
  * Fixed Figma-style alignment threshold (meters) for floor-plan placement /
@@ -49,7 +50,7 @@ export function applyFloorplanAlignment(
     return { point: [point[0], point[1]], snapped: false, guides: [] }
   }
 
-  const result = resolveAlignment({
+  const result = resolveAlignmentForFloorplanView({
     moving: movingAnchors,
     candidates,
     threshold: opts?.threshold ?? FLOORPLAN_ALIGNMENT_THRESHOLD_M,
@@ -96,13 +97,21 @@ export function alignFloorplanDraftPoint(
     bypass?: boolean
     threshold?: number
     excludeIds?: readonly string[]
+    levelId?: string | null
   },
 ): [number, number] {
   if (opts?.bypass) {
     useAlignmentGuides.getState().clear()
     return [point[0], point[1]]
   }
-  let candidates = collectAlignmentAnchors(useScene.getState().nodes, FLOORPLAN_DRAFT_ALIGN_ID)
+  const nodes = useScene.getState().nodes
+  let candidates = collectAlignmentAnchors(nodes, FLOORPLAN_DRAFT_ALIGN_ID)
+  if (opts && 'levelId' in opts) {
+    candidates = candidates.filter((anchor) => {
+      const candidate = nodes[anchor.nodeId as keyof typeof nodes]
+      return candidate ? resolveLevelId(candidate, nodes) === opts.levelId : false
+    })
+  }
   if (opts?.excludeIds?.length) {
     const excluded = new Set(opts.excludeIds)
     candidates = candidates.filter((anchor) => !excluded.has(anchor.nodeId))

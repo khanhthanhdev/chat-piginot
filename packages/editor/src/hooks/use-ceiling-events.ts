@@ -7,11 +7,13 @@ import {
   sceneRegistry,
   useScene,
 } from '@pascal-app/core'
+import { isProceduralItem } from '@pascal-app/core/procedural-items'
 import { useViewer } from '@pascal-app/viewer'
 import { useThree } from '@react-three/fiber'
 import { useEffect, useRef } from 'react'
 import { type Object3D, Plane, Raycaster, Vector2, Vector3 } from 'three'
 import useEditor from '../store/use-editor'
+import { getMovingNode } from '../store/use-interaction-scope'
 
 const UP = new Vector3(0, 1, 0)
 
@@ -54,13 +56,18 @@ export function useCeilingEvents() {
   const hoveredRef = useRef<string | null>(null)
 
   useEffect(() => {
+    // XR placement is driven by the controller-ray bridge, never screen coordinates.
+    if (gl.xr.isPresenting) return
     const canvas = gl.domElement
 
     const isActive = (): boolean => {
       const ed = useEditor.getState()
       if (ed.selectedItem?.attachTo === 'ceiling') return true
-      const moving = ed.movingNode
-      return moving?.type === 'item' && moving.asset?.attachTo === 'ceiling'
+      const moving = getMovingNode()
+      return (
+        (moving?.type === 'item' && moving.asset?.attachTo === 'ceiling') ||
+        (isProceduralItem(moving) && moving.recipe.mounting?.attachTo === 'ceiling')
+      )
     }
 
     type Hit = { node: CeilingNode; mesh: Object3D; world: Vector3; local: Vector3 }

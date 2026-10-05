@@ -3,12 +3,13 @@
 import {
   type AnyNode,
   type AnyNodeId,
-  DEFAULT_WALL_HEIGHT,
   getWallCurveFrameAt,
   getWallCurveLength,
+  getWallPlaneTop,
   getWallThickness,
   isCurvedWall,
   resolveLevelId,
+  resolveWallTop,
   sceneRegistry,
   spatialGridManager,
   useScene,
@@ -33,8 +34,8 @@ import { EDITOR_LAYER } from '../../lib/constants'
  *   intersection      → ✕ cross   wall body (edge) → circle
  *
  * Subscribes to the shared `useWallSnapIndicator` store (published by the wall
- * draft + endpoint-move tools). Shares the indigo accent of
- * `Alignment3DGuideLayer` for visual consistency.
+ * draft + endpoint-move tools). The vertical mouse pillar and the corner
+ * (endpoint) square are green; the other floor glyphs are indigo.
  *
  * The point carries only XZ (building-local plan coords); like the alignment
  * guides it's lifted to the active level's building-local Y each frame so it
@@ -43,6 +44,7 @@ import { EDITOR_LAYER } from '../../lib/constants'
  */
 
 const BEACON_COLOR = 0x81_8c_f8 // indigo-400 — matches the alignment guide accent
+const MARKER_GREEN = 0x22_c5_5e // green-500 — vertical mouse marker + corner (endpoint) glyph
 const BEACON_HEIGHT = 2.5 // world-meter height of the pillar
 const BEACON_RADIUS = 0.018 // world-meter radius of the pillar
 const MARKER = 0.13 // world-meter base size of the floor glyph
@@ -60,6 +62,14 @@ const NO_RAYCAST = () => null
 // drag doesn't rebuild GPU buffers (mirrors the alignment guide layer).
 const beaconMaterial = new MeshBasicNodeMaterial({
   color: BEACON_COLOR,
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+  transparent: true,
+  opacity: 0.9,
+})
+const greenMarkerMaterial = new MeshBasicNodeMaterial({
+  color: MARKER_GREEN,
   depthTest: false,
   depthWrite: false,
   toneMapped: false,
@@ -121,7 +131,7 @@ export const WallSnapBeaconLayer = memo(function WallSnapBeaconLayer() {
       <mesh
         geometry={PILLAR_GEOMETRY}
         layers={EDITOR_LAYER}
-        material={beaconMaterial}
+        material={greenMarkerMaterial}
         position={[point.x, BEACON_HEIGHT / 2, point.z]}
         renderOrder={1002}
       />
@@ -138,15 +148,16 @@ type WallTopHighlightSegment = {
 
 function getWallTopY(wall: WallNode, nodes: Readonly<Record<string, AnyNode>>) {
   const levelId = resolveLevelId(wall, nodes as Record<string, AnyNode>)
-  const slabElevation = spatialGridManager.getSlabElevationForWall(
+  const support = spatialGridManager.getSlabSupportForWall(
     levelId,
     wall.start,
     wall.end,
     wall.curveOffset ?? 0,
     wall.thickness,
+    wall.supportSlabId,
   )
-  const wallHeight = wall.height ?? DEFAULT_WALL_HEIGHT
-  return (slabElevation > 0 ? slabElevation + wallHeight : wallHeight) + WALL_TOP_HIGHLIGHT_LIFT
+  const planeTop = getWallPlaneTop(wall, levelId, nodes as Record<string, AnyNode>)
+  return resolveWallTop(wall, planeTop, support.elevation) + WALL_TOP_HIGHLIGHT_LIFT
 }
 
 function buildHighlightSegment(start: [number, number], end: [number, number]) {
@@ -235,7 +246,7 @@ function SnapMarker({ kind, x, z }: { kind: WallSnapKind; x: number; z: number }
       <mesh
         geometry={FLAT_BOX_GEOMETRY}
         layers={EDITOR_LAYER}
-        material={beaconMaterial}
+        material={greenMarkerMaterial}
         position={[x, y, z]}
         renderOrder={1001}
         scale={[MARKER * 2, 1, MARKER * 2]}

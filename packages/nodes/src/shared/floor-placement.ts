@@ -1,6 +1,5 @@
 import {
   type AnyNode,
-  type EventSuffix,
   emitter,
   type GridEvent,
   movingFootprintAnchors,
@@ -13,21 +12,11 @@ import { Vector3 } from 'three'
 
 export const FLOOR_PLACEMENT_ALIGNMENT_THRESHOLD_M = 0.08
 
-export const FLOOR_PLACEMENT_CLICK_TRIGGER_KINDS = [
-  'shelf',
-  'item',
-  'slab',
-  'ceiling',
-  'wall',
-  'fence',
-  'column',
-  'roof',
-  'roof-segment',
-  'stair',
-  'stair-segment',
-] as const
-
 export type FloorPlacementClickTriggerEvent = GridEvent | NodeEvent<AnyNode>
+
+export function isForcePlacementEvent(event: FloorPlacementClickTriggerEvent): boolean {
+  return event.nativeEvent?.altKey === true
+}
 
 type FloorPlacementAlignmentArgs = {
   node: AnyNode
@@ -35,7 +24,8 @@ type FloorPlacementAlignmentArgs = {
   rawZ: number
   gridStep: number
   candidates: Parameters<typeof resolveAlignment>[0]['candidates']
-  bypassAlignment?: boolean
+  showAlignment?: boolean
+  applyAlignmentSnap?: boolean
   bypassGrid?: boolean
   rotationY?: number
 }
@@ -59,11 +49,13 @@ export function getLevelLocalSnappedPosition(
 
   worldVector.set(event.position[0], event.position[1], event.position[2])
   levelObject.updateWorldMatrix(true, false)
+  if (!bypassGrid) {
+    const [sx, sz] = snapPointToGrid([worldVector.x, worldVector.z], gridStep)
+    worldVector.x = sx
+    worldVector.z = sz
+  }
   levelObject.worldToLocal(worldVector)
-  const [sx, sz] = bypassGrid
-    ? [worldVector.x, worldVector.z]
-    : snapPointToGrid([worldVector.x, worldVector.z], gridStep)
-  return [sx, 0, sz]
+  return [worldVector.x, 0, worldVector.z]
 }
 
 export function resolveAlignedFloorPlacement({
@@ -72,7 +64,8 @@ export function resolveAlignedFloorPlacement({
   rawZ,
   gridStep,
   candidates,
-  bypassAlignment = false,
+  showAlignment = true,
+  applyAlignmentSnap = true,
   bypassGrid = false,
   rotationY = 0,
 }: FloorPlacementAlignmentArgs) {
@@ -81,7 +74,7 @@ export function resolveAlignedFloorPlacement({
   let az = sz
 
   const result =
-    !bypassAlignment && candidates.length > 0
+    showAlignment && candidates.length > 0
       ? resolveAlignment({
           moving: movingFootprintAnchors(node, sx, sz, rotationY),
           candidates,
@@ -89,7 +82,7 @@ export function resolveAlignedFloorPlacement({
         })
       : null
 
-  if (result?.snap) {
+  if (result?.snap && applyAlignmentSnap) {
     ax += result.snap.dx
     az += result.snap.dz
   }
@@ -98,6 +91,20 @@ export function resolveAlignedFloorPlacement({
     position: [ax, 0, az] as [number, number, number],
     guides: result?.guides ?? [],
   }
+}
+
+// Node-surface clicks (wall/slab/…) are synthesized on pointerup; the
+// browser's real `click` fires right after and would re-trigger the same
+// placement through the canvas-level `grid:click` listener, which R3F
+// stopPropagation cannot reach. Eat that one follow-up click.
+function swallowFollowUpBrowserClick() {
+  if (typeof window === 'undefined') return
+  const swallow = (e: Event) => {
+    e.stopPropagation()
+    e.preventDefault()
+  }
+  window.addEventListener('click', swallow, { capture: true, once: true })
+  setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 300)
 }
 
 export function stopPlacementCommitPropagation(event: FloorPlacementClickTriggerEvent) {
@@ -109,24 +116,29 @@ export function stopPlacementCommitPropagation(event: FloorPlacementClickTrigger
   }
   const direct = (event as { stopPropagation?: () => void }).stopPropagation
   if (typeof direct === 'function') direct.call(event)
+  if ('node' in event) swallowFollowUpBrowserClick()
 }
 
 export function subscribeFloorPlacementClicks(
   onClick: (event: FloorPlacementClickTriggerEvent) => void,
 ) {
   emitter.on('grid:click', onClick)
-  type SuffixedKey<K extends string> = `${K}:${EventSuffix}`
-  type ClickKey = SuffixedKey<(typeof FLOOR_PLACEMENT_CLICK_TRIGGER_KINDS)[number]>
-  for (const kind of FLOOR_PLACEMENT_CLICK_TRIGGER_KINDS) {
-    const key = `${kind}:click` as ClickKey
-    emitter.on(key, onClick as never)
-  }
+  emitter.on('node:click', onClick)
 
   return () => {
     emitter.off('grid:click', onClick)
-    for (const kind of FLOOR_PLACEMENT_CLICK_TRIGGER_KINDS) {
-      const key = `${kind}:click` as ClickKey
-      emitter.off(key, onClick as never)
-    }
+    emitter.off('node:click', onClick)
+  }
+}
+
+export function subscribeFloorPlacementDoubleClicks(
+  onDoubleClick: (event: FloorPlacementClickTriggerEvent) => void,
+) {
+  emitter.on('grid:double-click', onDoubleClick)
+  emitter.on('node:double-click', onDoubleClick)
+
+  return () => {
+    emitter.off('grid:double-click', onDoubleClick)
+    emitter.off('node:double-click', onDoubleClick)
   }
 }

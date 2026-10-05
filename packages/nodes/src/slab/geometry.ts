@@ -1,12 +1,29 @@
-import { type GeometryContext, getMaterialPresetByRef, type SlabNode } from '@pascal-app/core'
+import {
+  type AnyNode,
+  type AnyNodeId,
+  type BuildingNode,
+  type GeometryContext,
+  getLevelElevations,
+  getMaterialPresetByRef,
+  getRenderableSlabPolygon,
+  type LevelNode,
+  type SiteNode,
+  type SlabNode,
+  slabPolygonContextFromGeometry,
+  surfaceHeightAt,
+  terrainFieldOf,
+  useScene,
+} from '@pascal-app/core'
 import {
   applyMaterialPresetToMaterials,
+  buildTerrainPerimeterFillGeometry,
   type ColorPreset,
   createDefaultMaterial,
   createMaterial,
   createSurfaceRoleMaterial,
   generateSlabGeometry,
   type RenderShading,
+  registerMaterialCacheCleanup,
   resolveMaterialRef,
   resolveSlotDefaultMaterial,
 } from '@pascal-app/viewer'
@@ -20,6 +37,7 @@ import {
   type Texture,
   Vector3,
 } from 'three'
+import { creaseCrossings } from '../site/terrain-drape'
 import { SLAB_SIDE_SLOT_DEFAULT, SLAB_TOP_SLOT_DEFAULT, type SlabSlotId } from './slots'
 
 /**
@@ -41,6 +59,17 @@ type SlabMaterial = Material & {
 }
 
 const slabMaterialCache = new Map<string, Material>()
+registerMaterialCacheCleanup(() => {
+  const previous = [...slabMaterialCache.values()]
+  slabMaterialCache.clear()
+  const state = useScene.getState()
+  for (const node of Object.values(state.nodes)) {
+    if (node.type === 'slab') state.markDirty(node.id as AnyNodeId)
+  }
+  return () => {
+    for (const material of previous) material.dispose()
+  }
+})
 
 function getSlabSlotMaterial(
   node: SlabNode,
@@ -122,7 +151,10 @@ function splitSlabFacesByFacing(geometry: BufferGeometry): {
   const build = (data: { pos: number[]; uv: number[] }) => {
     const geo = new BufferGeometry()
     geo.setAttribute('position', new Float32BufferAttribute(data.pos, 3))
-    if (data.uv.length > 0) geo.setAttribute('uv', new Float32BufferAttribute(data.uv, 2))
+    if (data.uv.length > 0) {
+      geo.setAttribute('uv', new Float32BufferAttribute(data.uv, 2))
+      geo.setAttribute('uv2', new Float32BufferAttribute(data.uv.slice(), 2))
+    }
     geo.computeVertexNormals()
     return geo
   }
@@ -164,8 +196,88 @@ function getLegacySlabMaterial(node: SlabNode, shading: RenderShading): Material
   slabMaterial.depthWrite = true
   slabMaterial.needsUpdate = true
 
+  material.userData.__pascalCachedMaterial = true
   slabMaterialCache.set(cacheKey, material)
   return material
+}
+
+function terrainFillContext(ctx: GeometryContext | undefined) {
+  if (!ctx) return null
+  const level = ctx.parent
+  if (level?.type !== 'level' || !level.parentId) return null
+  const building = ctx.resolve<BuildingNode>(level.parentId as AnyNodeId)
+  if (building?.type !== 'building' || !building.parentId) return null
+  const site = ctx.resolve<SiteNode>(building.parentId as AnyNodeId)
+  if (site?.type !== 'site') return null
+  const field = terrainFieldOf(site)
+
+  const nodes: Record<string, AnyNode> = {
+    [site.id]: site,
+    [building.id]: building,
+    [level.id]: level as LevelNode,
+  }
+  for (const childId of building.children) {
+    const child = ctx.resolve<AnyNode>(childId as AnyNodeId)
+    if (child) nodes[child.id] = child
+  }
+  const elevation = getLevelElevations(nodes).get(level.id)
+  if (!elevation) return null
+  const baseWorldY = (building.position?.[1] ?? 0) + elevation.baseY
+  if (Math.abs(baseWorldY) >= 1e-4) return null
+
+  return {
+    baseWorldY,
+    building,
+    field,
+  }
+}
+
+function buildSlabTerrainFillGeometry(
+  node: SlabNode,
+  polygon: Array<[number, number]>,
+  ctx: GeometryContext | undefined,
+): BufferGeometry | null {
+  const terrain = terrainFillContext(ctx)
+  if (!terrain || polygon.length < 3) return null
+
+  let area2 = 0
+  for (let index = 0; index < polygon.length; index += 1) {
+    const [ax, az] = polygon[index]!
+    const [bx, bz] = polygon[(index + 1) % polygon.length]!
+    area2 += ax * bz - bx * az
+  }
+  const contour = area2 < 0 ? [...polygon].reverse() : polygon
+  const angle = terrain.building.rotation?.[1] ?? 0
+  const cos = Math.cos(angle)
+  const sin = Math.sin(angle)
+  const [offsetX, , offsetZ] = terrain.building.position ?? [0, 0, 0]
+  const toSite = (x: number, z: number): [number, number] => [
+    cos * x + sin * z + offsetX,
+    -sin * x + cos * z + offsetZ,
+  ]
+
+  const points: Array<[number, number]> = []
+  for (let index = 0; index < contour.length; index += 1) {
+    const [ax, az] = contour[index]!
+    const [bx, bz] = contour[(index + 1) % contour.length]!
+    const [siteAx, siteAz] = toSite(ax, az)
+    const [siteBx, siteBz] = toSite(bx, bz)
+    points.push([ax, az])
+    if (terrain.field) {
+      for (const t of creaseCrossings(terrain.field, siteAx, siteAz, siteBx, siteBz)) {
+        points.push([ax + (bx - ax) * t, az + (bz - az) * t])
+      }
+    }
+  }
+
+  const top = node.elevation - node.thickness
+  const localPoints = points.map(([x, z]) => ({ x, z }))
+  const bottomY = points.map(([x, z]) => {
+    const [siteX, siteZ] = toSite(x, z)
+    const ground = terrain.field ? surfaceHeightAt(terrain.field, siteX, siteZ) : 0
+    return Math.min(top, ground - terrain.baseWorldY)
+  })
+  return buildTerrainPerimeterFillGeometry(localPoints, bottomY, top, 1e-4)
 }
 
 export function buildSlabGeometry(
@@ -177,7 +289,8 @@ export function buildSlabGeometry(
   sceneTheme?: string,
 ): Group {
   const group = new Group()
-  const merged = generateSlabGeometry(node)
+  const polygonContext = slabPolygonContextFromGeometry(ctx)
+  const merged = generateSlabGeometry(node, polygonContext)
   const { top, side } = splitSlabFacesByFacing(merged)
   merged.dispose()
 
@@ -201,8 +314,37 @@ export function buildSlabGeometry(
     mesh.castShadow = true
     mesh.receiveShadow = true
     mesh.userData.slotId = slotId
-    if (elevation < 0) mesh.position.y = elevation
+    // Solid slabs bake [elevation − thickness, elevation] into the geometry;
+    // recessed shells are authored from floor to rim and translated so the
+    // floor sits at `elevation`.
+    if (node.recessed) mesh.position.y = elevation
     group.add(mesh)
+  }
+
+  if (node.fillToTerrain && !node.recessed) {
+    const terrainFill = buildSlabTerrainFillGeometry(
+      node,
+      getRenderableSlabPolygon(node, polygonContext),
+      ctx,
+    )
+    if (terrainFill) {
+      const mesh = new Mesh(
+        terrainFill,
+        getSlabSlotMaterial(
+          node,
+          'side',
+          shading,
+          textures,
+          colorPreset,
+          sceneTheme,
+          ctx?.materials,
+        ),
+      )
+      mesh.castShadow = true
+      mesh.receiveShadow = true
+      mesh.userData.slotId = 'side'
+      group.add(mesh)
+    }
   }
   return group
 }

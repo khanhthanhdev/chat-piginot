@@ -1,16 +1,33 @@
 import { sceneRegistry, useScene, type ZoneNode } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import { useFrame } from '@react-three/fiber'
+import { useEffect } from 'react'
 import { type Group, MathUtils, type Mesh } from 'three'
 import type { MeshBasicNodeMaterial } from 'three/webgpu'
+import { resolveOverlayPolicy } from '../../../lib/interaction/overlay-policy'
 import useEditor from '../../../store/use-editor'
+import useInteractionScope from '../../../store/use-interaction-scope'
 
 // Disable raycasting on zone geometry so clicks pass through to items underneath.
 // Zone selection in the editor is handled exclusively via the HTML label overlay.
 const noopRaycast = () => {}
 
 export const ZoneSystem = () => {
+  // Outside the zones layer (or during snapshot capture) zones unmount
+  // entirely — meshes AND drei <Html> labels, which cost per-frame matrix work
+  // + live DOM even at opacity 0. The renderer reads this viewer flag; the
+  // unmount cleanup restores the default so preview / first-person surfaces
+  // (which swap this system for ViewerZoneSystem) keep their labels.
+  const structureLayerState = useEditor((s) => s.structureLayer)
+  const isCaptureModeState = useEditor((s) => s.isCaptureMode)
+  useEffect(() => {
+    useViewer.getState().setShowZones(structureLayerState === 'zones' && !isCaptureModeState)
+    return () => useViewer.getState().setShowZones(true)
+  }, [structureLayerState, isCaptureModeState])
+
   useFrame((_, delta) => {
+    if (!useViewer.getState().showZones) return
+
     const structureLayer = useEditor.getState().structureLayer
     const editorMode = useEditor.getState().mode
     const selectedLevelId = useViewer.getState().selection.levelId
@@ -19,6 +36,11 @@ export const ZoneSystem = () => {
     // Snapshot capture is a clean, camera-only surface — never show zone
     // geometry or the HTML zone tags in the framed shot.
     const isCaptureMode = useEditor.getState().isCaptureMode
+
+    // During any active interaction zone labels step back entirely — they are
+    // not a primary editing concern and would distract / invite misclicks.
+    const zoneLabelsHidden =
+      resolveOverlayPolicy(useInteractionScope.getState().scope).zoneLabels === 'hidden'
 
     const zoneGeometryVisible = structureLayer === 'zones'
     const zones = sceneRegistry.byType.zone || new Set()
@@ -36,9 +58,13 @@ export const ZoneSystem = () => {
       const isDeleteHovered = editorMode === 'delete' && hoveredId === zoneId
 
       // Keep group visible (so <Html> labels stay active), hide/show meshes only.
-      // Show meshes when: in zone mode, selected, or delete-hovered.
-      if (!obj.visible) obj.visible = true
-      const meshVisible = !isCaptureMode && (zoneGeometryVisible || isSelected || isDeleteHovered)
+      // Show meshes when: in zone mode, selected, or delete-hovered. A zone the
+      // author hid (sidebar eye) is the one case where the group itself goes:
+      // otherwise this per-frame write would undo the renderer's `visible` prop.
+      const nodeVisible = zone?.visible !== false
+      if (obj.visible !== nodeVisible) obj.visible = nodeVisible
+      const meshVisible =
+        nodeVisible && !isCaptureMode && (zoneGeometryVisible || isSelected || isDeleteHovered)
       const targetOpacity = isCaptureMode
         ? 0
         : isSelected || isDeleteHovered
@@ -47,9 +73,13 @@ export const ZoneSystem = () => {
             ? 1
             : 0
 
+      // Raycast is re-disabled per frame (not once per group): the meshes
+      // remount whenever the zones layer toggles, so a one-shot flag on the
+      // persistent group would leave fresh meshes clickable.
       const walls = (obj as Group).getObjectByName('walls') as Mesh | undefined
       if (walls) {
         walls.visible = meshVisible
+        walls.raycast = noopRaycast
         const material = walls.material as MeshBasicNodeMaterial
         if (material?.userData?.uOpacity) {
           material.userData.uOpacity.value = MathUtils.lerp(
@@ -63,6 +93,7 @@ export const ZoneSystem = () => {
       const floor = (obj as Group).getObjectByName('floor') as Mesh | undefined
       if (floor) {
         floor.visible = meshVisible
+        floor.raycast = noopRaycast
         const material = floor.material as MeshBasicNodeMaterial
         if (material?.userData?.uOpacity) {
           material.userData.uOpacity.value = MathUtils.lerp(
@@ -73,18 +104,10 @@ export const ZoneSystem = () => {
         }
       }
 
-      // Disable raycasting once per zone object so geometry never intercepts clicks
-      if (!obj.userData.__raycastDisabled) {
-        obj.raycast = noopRaycast
-        obj.traverse((child) => {
-          child.raycast = noopRaycast
-        })
-        obj.userData.__raycastDisabled = true
-      }
-
       // Labels: visible on the current level (regardless of mode), but never
       // during snapshot capture.
-      const showLabel = !isCaptureMode && !!selectedLevelId && isOnSelectedLevel
+      const showLabel =
+        nodeVisible && !isCaptureMode && !zoneLabelsHidden && !!selectedLevelId && isOnSelectedLevel
       const labelOpacity = showLabel ? '1' : '0'
       const labelEl = document.getElementById(`${zoneId}-label`)
       if (labelEl && labelEl.style.opacity !== labelOpacity) {

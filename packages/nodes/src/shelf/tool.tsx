@@ -4,11 +4,16 @@ import {
   collectAlignmentAnchors,
   emitter,
   type GridEvent,
+  resolveSupportSlabPatch,
   ShelfNode,
   useScene,
 } from '@pascal-app/core'
 import {
   getFloorStackPreviewPosition,
+  isAlignmentGuideActive,
+  isGridSnapActive,
+  isMagneticSnapActive,
+  movementSfxStepKey,
   triggerSFX,
   useAlignmentGuides,
   useEditor,
@@ -29,7 +34,7 @@ import ShelfPreview from './preview'
 const ShelfTool = () => {
   const activeLevelId = useViewer((state) => state.selection.levelId)
   const cursorRef = useRef<Group>(null)
-  const previousSnapRef = useRef<[number, number] | null>(null)
+  const previousSnapRef = useRef<string | null>(null)
   const cursorVisibleRef = useRef(false)
   const [cursorVisible, setCursorVisible] = useState(false)
 
@@ -83,8 +88,9 @@ const ShelfTool = () => {
         rawZ: event.localPosition[2],
         gridStep: useEditor.getState().gridSnapStep,
         candidates: alignmentCandidates,
-        bypassAlignment: event.nativeEvent?.altKey === true || event.nativeEvent?.shiftKey === true,
-        bypassGrid: event.nativeEvent?.shiftKey === true,
+        showAlignment: isAlignmentGuideActive(),
+        applyAlignmentSnap: isMagneticSnapActive(),
+        bypassGrid: !isGridSnapActive(),
       })
       useAlignmentGuides.getState().set(guides)
 
@@ -97,13 +103,15 @@ const ShelfTool = () => {
       cursorRef.current?.position.set(...visualPosition)
       lastCursorRef.current = position
 
+      const nextSnapKey = movementSfxStepKey({
+        coords: [position[0], position[2]],
+        gridSnapActive: isGridSnapActive(),
+        gridStep: useEditor.getState().gridSnapStep,
+      })
       const prev = previousSnapRef.current
-      if (
-        event.nativeEvent?.shiftKey !== true &&
-        (!prev || prev[0] !== position[0] || prev[1] !== position[2])
-      ) {
+      if (prev !== nextSnapKey) {
         triggerSFX('sfx:grid-snap')
-        previousSnapRef.current = [position[0], position[2]]
+        previousSnapRef.current = nextSnapKey
       }
     }
 
@@ -118,21 +126,31 @@ const ShelfTool = () => {
           activeLevelId,
           event,
           useEditor.getState().gridSnapStep,
-          event.nativeEvent?.shiftKey === true,
+          !isGridSnapActive(),
         )
       const shelf = ShelfNode.parse({
         ...shelfDefinition.defaults(),
         name: 'Shelf',
         position,
         rotation: [0, 0, 0],
+        parentId: activeLevelId,
       })
-      useScene.getState().createNode(shelf, activeLevelId)
-      useViewer.getState().setSelection({ selectedIds: [shelf.id] })
+      const committedShelf = ShelfNode.parse({
+        ...shelf,
+        ...resolveSupportSlabPatch(shelf, useScene.getState().nodes),
+      })
+      useScene.getState().createNode(committedShelf, activeLevelId)
+      useViewer.getState().setSelection({ selectedIds: [committedShelf.id] })
       triggerSFX('sfx:item-place')
-      // The placed shelf is now a valid alignment target for the next one;
-      // refresh the candidate pool and drop the guide from this drop.
-      alignmentCandidates = collectAlignmentAnchors(useScene.getState().nodes, previewNode.id)
       useAlignmentGuides.getState().clear()
+      if (useEditor.getState().getContinuation('point') === 'repeat') {
+        // The placed shelf is now a valid alignment target for the next one.
+        alignmentCandidates = collectAlignmentAnchors(useScene.getState().nodes, previewNode.id)
+      } else {
+        cursorVisibleRef.current = false
+        setCursorVisible(false)
+        useEditor.getState().setTool(null)
+      }
 
       stopPlacementCommitPropagation(event)
     }

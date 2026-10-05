@@ -1,6 +1,6 @@
 'use client'
 
-import { useRegistry, useScene, type WindowNode } from '@pascal-app/core'
+import { useLiveNodeOverrides, useRegistry, useScene, type WindowNode } from '@pascal-app/core'
 import {
   createMaterial,
   DEFAULT_WINDOW_MATERIAL,
@@ -20,6 +20,8 @@ export const WindowRenderer = ({ node }: { node: WindowNode }) => {
   }, [node.id])
   const handlers = useNodeEvents(node, 'window')
   const shading = useViewer((s) => s.shading)
+  const liveOverrides = useLiveNodeOverrides((s) => s.get(node.id))
+  const renderNode = liveOverrides ? ({ ...node, ...liveOverrides } as WindowNode) : node
   const isTransient = !!(node.metadata as Record<string, unknown> | null)?.isTransient
 
   const material = useMemo(() => {
@@ -37,19 +39,19 @@ export const WindowRenderer = ({ node }: { node: WindowNode }) => {
   const mesh = (
     <mesh
       material={material}
-      position={node.position}
+      position={renderNode.position}
       ref={ref}
-      rotation={node.rotation}
-      visible={node.visible}
+      rotation={renderNode.rotation}
+      visible={renderNode.visible}
       {...(isTransient ? {} : handlers)}
     >
       <boxGeometry args={[0, 0, 0]} />
     </mesh>
   )
 
-  if (!node.roofSegmentId) return mesh
+  if (!renderNode.roofSegmentId) return mesh
   return (
-    <RoofFaceHostFrame roofFace={node.roofFace} roofSegmentId={node.roofSegmentId}>
+    <RoofFaceHostFrame roofFace={renderNode.roofFace} roofSegmentId={renderNode.roofSegmentId}>
       {mesh}
     </RoofFaceHostFrame>
   )

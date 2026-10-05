@@ -181,7 +181,7 @@ export default function TurbineVentPanel() {
       <PanelSection title="Dimensions">
         <SliderControl
           label="Diameter"
-          max={0.7}
+          max={1000}
           min={0.15}
           onChange={(v) => previewProp({ diameter: v })}
           onCommit={(v) => handleUpdate({ diameter: v })}
@@ -189,11 +189,11 @@ export default function TurbineVentPanel() {
           restoreOnCommit={false}
           step={0.01}
           unit="m"
-          value={Math.round(node.diameter * 100) / 100}
+          value={node.diameter}
         />
         <SliderControl
           label="Height"
-          max={0.9}
+          max={1000}
           min={0.2}
           onChange={(v) => previewProp({ height: v })}
           onCommit={(v) => handleUpdate({ height: v })}
@@ -201,7 +201,7 @@ export default function TurbineVentPanel() {
           restoreOnCommit={false}
           step={0.01}
           unit="m"
-          value={Math.round(node.height * 100) / 100}
+          value={node.height}
         />
         <SliderControl
           label="Neck Height"
@@ -213,7 +213,7 @@ export default function TurbineVentPanel() {
           restoreOnCommit={false}
           step={0.01}
           unit="m"
-          value={Math.round((node.neckHeight ?? 0.09) * 100) / 100}
+          value={node.neckHeight ?? 0.09}
         />
         <SliderControl
           label="Vanes"
@@ -266,7 +266,7 @@ export default function TurbineVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[0] ?? 0) * 100) / 100}
+          value={node.position[0] ?? 0}
         />
         <SliderControl
           label="Y"
@@ -285,7 +285,7 @@ export default function TurbineVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[1] ?? 0) * 100) / 100}
+          value={node.position[1] ?? 0}
         />
         <SliderControl
           label="Z"
@@ -301,7 +301,7 @@ export default function TurbineVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[2] ?? 0) * 100) / 100}
+          value={node.position[2] ?? 0}
         />
         <SliderControl
           label="Rotation"

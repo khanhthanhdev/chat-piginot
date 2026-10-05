@@ -20,5 +20,5 @@ data/visualizations/
 app/training/
 checkpoints/
 Dockerfile-best-practices.md
-saved_weights/*
-!saved_weights/ginot_trained_multicase.pth
+models/
+test_data/

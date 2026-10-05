@@ -1,6 +1,6 @@
 {
   "name": "@pascal-app/viewer",
-  "version": "0.9.1",
+  "version": "1.0.3",
   "description": "3D viewer component for Pascal building editor",
   "type": "module",
   "main": "./dist/index.js",
@@ -10,6 +10,16 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./capture": {
+      "types": "./dist/capture/index.d.ts",
+      "import": "./dist/capture/index.js",
+      "default": "./dist/capture/index.js"
+    },
+    "./capture/preview": {
+      "types": "./dist/capture/preview.d.ts",
+      "import": "./dist/capture/preview.js",
+      "default": "./dist/capture/preview.js"
     }
   },
   "files": [
@@ -17,16 +27,18 @@
     "README.md"
   ],
   "scripts": {
-    "build": "node_modules/typescript-7/bin/tsc --build",
-    "dev": "node_modules/typescript-7/bin/tsc --build --watch",
+    "build": "tsc --build",
+    "dev": "tsgo --build --watch",
+    "test": "bun test src",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "@pascal-app/core": "^0.9.1",
+    "@pascal-app/core": "^1.0.3",
     "@react-three/drei": "^10",
     "@react-three/fiber": "^9",
     "react": "^18 || ^19",
-    "three": "^0.184"
+    "react-dom": "^18 || ^19",
+    "three": "^0.186"
   },
   "dependencies": {
     "three-bvh-csg": "^0.0.18",
@@ -34,12 +46,14 @@
     "zustand": "^5"
   },
   "devDependencies": {
+    "@pascal-app/core": "^1.0.3",
     "@pascal/typescript-config": "*",
+    "@react-three/test-renderer": "^9.1.0",
     "@types/node": "^22",
     "@types/react": "^19.2.2",
+    "@types/react-dom": "19.2.2",
     "@types/three": "^0.184.0",
-    "typescript": "6.0.3",
-    "typescript-7": "npm:typescript@7.0.1-rc"
+    "typescript": "6.0.3"
   },
   "keywords": [
     "3d",
@@ -53,7 +67,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/pascalorg/editor.git",
+    "url": "git+https://github.com/pascalorg/editor.git",
     "directory": "packages/viewer"
   },
   "license": "MIT",

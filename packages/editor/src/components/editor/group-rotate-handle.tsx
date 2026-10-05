@@ -4,6 +4,8 @@ import {
   type AnyNode,
   type AnyNodeId,
   DEFAULT_ANGLE_STEP,
+  pauseSpaceDetection,
+  resumeSpaceDetection,
   useLiveNodeOverrides,
   useLiveTransforms,
   useScene,
@@ -11,18 +13,26 @@ import {
 import { useViewer } from '@pascal-app/viewer'
 import { createPortal, type ThreeEvent, useThree } from '@react-three/fiber'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { OrthographicCamera, Plane, Vector2, Vector3 } from 'three'
+import { OrthographicCamera, Plane, type Ray, Vector2, Vector3 } from 'three'
+import { GROUP_MOVE_DRAG_LABEL, GROUP_ROTATE_DRAG_LABEL } from '../../lib/contextual-help'
+import { isHistoryShortcut } from '../../lib/history'
 import { sfxEmitter } from '../../lib/sfx-bus'
-import useEditor from '../../store/use-editor'
+import { intersectSpatialDragPlane } from '../../lib/spatial-drag-plane'
+import { getSpatialPointerId, spatialPointerInput } from '../../lib/spatial-pointer-input'
+import useEditor, { isAngleSnapActive } from '../../store/use-editor'
+import useInteractionScope, {
+  useActiveHandleDrag,
+  useMovingNode,
+} from '../../store/use-interaction-scope'
 import { suppressBoxSelectForPointer } from '../tools/select/box-select-state'
 import {
   CORNER_OFFSET,
   classifyParticipant,
   collectParticipants,
   computeGroupBox,
-  expandToComponent,
+  computeGroupPlanBox,
   levelFrame,
-  type Vec2,
+  rotateGroupPatches,
   type Vec3,
 } from './group-transform-shared'
 import {
@@ -32,14 +42,13 @@ import {
   createRotateArrowHandleGeometry,
   createRotateArrowHitAreaGeometry,
   GuideRing,
-  InvisibleHandleHitArea,
-  NO_RAYCAST,
   RotationGuide,
   type RotationGuideData,
   swallowNextClick,
   useArrowMaterial,
   useInvisibleHitAreaMaterial,
 } from './node-arrow-handles'
+import { useMeshSettleEpoch } from './use-mesh-settle-epoch'
 
 /**
  * Group-rotate gizmo. When 2+ transformable nodes in the active level frame are
@@ -55,11 +64,14 @@ export function GroupRotateHandle() {
   const selectedIds = useViewer((s) => s.selection.selectedIds)
   const levelId = useViewer((s) => s.selection.levelId)
   const mode = useEditor((s) => s.mode)
-  const movingNode = useEditor((s) => s.movingNode)
+  const movingNode = useMovingNode()
+  const activeHandleDrag = useActiveHandleDrag()
   const isFloorplanHovered = useEditor((s) => s.isFloorplanHovered)
   // Re-derive participants whenever the scene mutates (e.g. after a commit).
   // Drags only touch `useLiveNodeOverrides`, so this does not fire mid-drag.
   const nodes = useScene((s) => s.nodes)
+  // Re-measure the pivot/corner once the meshes settle after a scene change.
+  const meshEpoch = useMeshSettleEpoch(nodes)
 
   const participantIds = useMemo(
     () =>
@@ -69,23 +81,27 @@ export function GroupRotateHandle() {
     [selectedIds, levelId, nodes],
   )
 
-  // Gate on the explicit selection (so a single connected wall still gets the
-  // per-node handles), but transform the full connected wall/fence component so
-  // attached structure rotates rigidly as one piece.
-  const fullIds = useMemo(
-    () => expandToComponent(participantIds, nodes, levelId),
-    [participantIds, levelId, nodes],
-  )
-
   const shouldRender =
-    participantIds.length >= 2 && mode !== 'delete' && !movingNode && !isFloorplanHovered
+    participantIds.length >= 2 &&
+    mode !== 'delete' &&
+    !movingNode &&
+    !isFloorplanHovered &&
+    // Hide while the sibling move gizmo drags the group — the frozen corner
+    // this handle would sit at goes stale as the group slides under it.
+    activeHandleDrag?.label !== GROUP_MOVE_DRAG_LABEL
 
   if (!shouldRender) return null
   // Remount when the moving set changes so the rest pivot re-seeds cleanly.
-  return <GroupRotateHandleInner ids={fullIds} key={fullIds.join(',')} />
+  return (
+    <GroupRotateHandleInner
+      ids={participantIds}
+      key={participantIds.join(',')}
+      meshEpoch={meshEpoch}
+    />
+  )
 }
 
-function GroupRotateHandleInner({ ids }: { ids: string[] }) {
+function GroupRotateHandleInner({ ids, meshEpoch }: { ids: string[]; meshEpoch: number }) {
   const { camera, raycaster, gl, scene } = useThree()
   const arrowGeometry = useMemo(() => createRotateArrowHandleGeometry(), [])
   const hitGeometry = useMemo(() => createRotateArrowHitAreaGeometry(), [])
@@ -109,31 +125,56 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
   const baseScale = zoom * ARROW_SCALE * 1.05
   const scale = (isHovered ? 1.12 : 1) * baseScale
 
-  // World-space bounding box of the selected meshes. Levels are axis-aligned in
-  // XZ, so world XZ coincides with each node's level-local placement — letting
-  // us rotate `position` / `start` / `end` directly against the pivot without
-  // per-node frame conversion.
-  //   - `pivot`  = bbox center (XZ), Y at the group's base → the rotation origin
-  //   - `corner` = front-right bbox corner at mid-height → where the gizmo sits
+  // Both rest points come from the level-frame box (the dashed boxes' box, also
+  // keyboard R/T's pivot), carried to world so they stay on it under a rotated
+  // building; the world mesh box only supplies heights.
+  //   - `pivot`  = box center, Y at the group's base → the rotation origin
+  //   - `corner` = far box corner at mid-height → where the gizmo sits
   const rest = useMemo(() => {
+    void meshEpoch
     const box = computeGroupBox(ids)
     if (!box) return null
-    const pivot = new Vector3((box.min.x + box.max.x) / 2, box.min.y, (box.min.z + box.max.z) / 2)
-    const corner = new Vector3(
-      box.max.x + CORNER_OFFSET,
-      (box.min.y + box.max.y) / 2,
-      box.max.z + CORNER_OFFSET,
-    )
+    const levelId = useViewer.getState().selection.levelId
+    const { matrix } = levelFrame(levelId)
+    const plan = computeGroupPlanBox(ids, levelId)
+    const pivot = plan
+      ? new Vector3((plan.minX + plan.maxX) / 2, 0, (plan.minZ + plan.maxZ) / 2).applyMatrix4(
+          matrix,
+        )
+      : new Vector3((box.min.x + box.max.x) / 2, 0, (box.min.z + box.max.z) / 2)
+    pivot.y = box.min.y
+    const corner = plan
+      ? new Vector3(plan.maxX + CORNER_OFFSET, 0, plan.maxZ + CORNER_OFFSET).applyMatrix4(matrix)
+      : new Vector3(box.max.x + CORNER_OFFSET, 0, box.max.z + CORNER_OFFSET)
+    corner.y = (box.min.y + box.max.y) / 2
     return { pivot, corner }
-  }, [ids])
+  }, [ids, meshEpoch])
 
   if (!rest) return null
   const active = isDragging && frozenRest.current ? frozenRest.current : rest
   const corner = active.corner
 
+  const onHoverEnter = (event: ThreeEvent<PointerEvent>) => {
+    event.stopPropagation()
+    setIsHovered(true)
+    if (document.body.style.cursor !== 'grabbing') document.body.style.cursor = 'grab'
+  }
+  const onHoverLeave = (event: ThreeEvent<PointerEvent>) => {
+    event.stopPropagation()
+    setIsHovered(false)
+    if (document.body.style.cursor === 'grab') document.body.style.cursor = ''
+  }
+
   const activate = (event: ThreeEvent<PointerEvent>) => {
+    if (event.button !== 0) return
     event.stopPropagation()
     suppressBoxSelectForPointer(event)
+    const spatialPointerId = getSpatialPointerId(event.nativeEvent)
+    const spatialRay = spatialPointerId ? event.ray.clone() : null
+    const pointerTarget = event.object as typeof event.object & {
+      releasePointerCapture?: (pointerId: number) => void
+      setPointerCapture?: (pointerId: number) => void
+    }
 
     frozenRest.current = { pivot: rest.pivot.clone(), corner: rest.corner.clone() }
     const center = rest.pivot.clone()
@@ -165,6 +206,10 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
       if (s.kind === 'endpoint') {
         reach(s.start[0], s.start[1])
         reach(s.end[0], s.end[1])
+      } else if (s.kind === 'polygon') {
+        for (const [x, z] of s.polygon) {
+          reach(x, z)
+        }
       } else {
         reach(s.position[0], s.position[2])
       }
@@ -180,75 +225,59 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
       )
     }
 
-    setNDC(event.nativeEvent.clientX, event.nativeEvent.clientY)
-    raycaster.setFromCamera(ndc, camera)
+    if (!spatialRay) {
+      setNDC(event.nativeEvent.clientX, event.nativeEvent.clientY)
+      raycaster.setFromCamera(ndc, camera)
+    }
     const hit = new Vector3()
-    if (!raycaster.ray.intersectPlane(plane, hit)) return
+    if (!intersectSpatialDragPlane(spatialRay ?? raycaster.ray, plane, hit)) return
     const initialAngle = angleOf(hit)
+    if (spatialPointerId) pointerTarget.setPointerCapture?.(event.pointerId)
+    let altKey = event.nativeEvent.altKey
 
     document.body.style.cursor = 'grabbing'
     sfxEmitter.emit('sfx:item-pick')
     useViewer.getState().setInputDragging(true)
     useScene.temporal.getState().pause()
+    useInteractionScope.getState().begin({
+      kind: 'handle-drag',
+      nodeId: ids[0] ?? '',
+      handle: GROUP_ROTATE_DRAG_LABEL,
+    })
     setIsDragging(true)
 
-    const onMove = (e: PointerEvent) => {
-      setNDC(e.clientX, e.clientY)
-      raycaster.setFromCamera(ndc, camera)
+    const applyRay = (ray: Ray, freeRotation = false) => {
       const moveHit = new Vector3()
-      if (!raycaster.ray.intersectPlane(plane, moveHit)) return
+      if (!intersectSpatialDragPlane(ray, plane, moveHit)) return
       let delta = angleOf(moveHit) - initialAngle
       while (delta > Math.PI) delta -= 2 * Math.PI
       while (delta < -Math.PI) delta += 2 * Math.PI
-      if (!e.shiftKey) delta = Math.round(delta / DEFAULT_ANGLE_STEP) * DEFAULT_ANGLE_STEP
+      if (!freeRotation && isAngleSnapActive())
+        delta = Math.round(delta / DEFAULT_ANGLE_STEP) * DEFAULT_ANGLE_STEP
 
-      // Orbit each node's anchor point(s) CCW by `delta` (atan2 x→z sense) and
-      // turn its yaw by `-delta` to match three.js Y-rotation handedness (same
-      // convention as the single-item rotate handle in item/definition.ts).
-      // Endpoint nodes (walls/fences) have no yaw — swinging both endpoints
-      // around the pivot rotates them rigidly; their curveOffset sagitta is
-      // rotation-invariant, so arcs are preserved.
-      const cos = Math.cos(delta)
-      const sin = Math.sin(delta)
-      const rot = (x: number, z: number): Vec2 => {
-        const dx = x - localCenter.x
-        const dz = z - localCenter.z
-        return [localCenter.x + dx * cos - dz * sin, localCenter.z + dx * sin + dz * cos]
-      }
-      const overrideEntries: Array<readonly [string, Record<string, unknown>]> = []
+      // Shared rigid-rotation math (also used by the keyboard group R/T);
+      // see `rotateGroupPatches` for the orbit/yaw handedness contract.
+      const overrideEntries = rotateGroupPatches(
+        starts,
+        links,
+        { x: localCenter.x, z: localCenter.z },
+        delta,
+      )
+      const patchById = new Map(overrideEntries)
       const liveTransforms = useLiveTransforms.getState()
       for (const s of starts) {
-        if (s.kind === 'endpoint') {
-          overrideEntries.push([
-            s.id,
-            { start: rot(s.start[0], s.start[1]), end: rot(s.end[0], s.end[1]) },
-          ])
-        } else {
-          const [px, pz] = rot(s.position[0], s.position[2])
-          const position: Vec3 = [px, s.position[1], pz]
-          const rotation =
-            s.kind === 'vec3'
-              ? ([s.rotation[0], s.rotation[1] - delta, s.rotation[2]] as Vec3)
-              : s.rotation - delta
-          overrideEntries.push([s.id, { position, rotation }])
-          if (s.kind === 'scalar') {
-            liveTransforms.set(s.id, { position, rotation: s.rotation - delta })
+        if (s.kind === 'scalar') {
+          const patch = patchById.get(s.id)
+          if (patch) {
+            liveTransforms.set(s.id, {
+              position: patch.position as Vec3,
+              rotation: patch.rotation as number,
+            })
           }
         }
         useScene.getState().markDirty(s.id)
       }
-
-      // Drag each linked neighbour's shared endpoint to the same rotated spot
-      // (rot is deterministic, so it lands exactly on the selected wall's
-      // rotated endpoint), keeping the junction welded; the far end stays put.
       for (const l of links) {
-        overrideEntries.push([
-          l.id,
-          {
-            start: l.startLinked ? rot(l.start[0], l.start[1]) : l.start,
-            end: l.endLinked ? rot(l.end[0], l.end[1]) : l.end,
-          },
-        ])
         useScene.getState().markDirty(l.id)
       }
       useLiveNodeOverrides.getState().setMany(overrideEntries)
@@ -272,8 +301,14 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
         })
       }
     }
+    const onMove = (e: PointerEvent) => {
+      setNDC(e.clientX, e.clientY)
+      raycaster.setFromCamera(ndc, camera)
+      applyRay(raycaster.ray, e.altKey)
+    }
 
     const affectedIds: AnyNodeId[] = [...starts.map((s) => s.id), ...links.map((l) => l.id)]
+    let releaseSpatialCapture: (() => void) | null = null
     const clearLivePreviews = () => {
       const overrides = useLiveNodeOverrides.getState()
       const liveTransforms = useLiveTransforms.getState()
@@ -288,9 +323,17 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onCancel)
+      window.removeEventListener('keydown', onKeyDown, true)
+      window.removeEventListener('keyup', onKeyUp, true)
+      releaseSpatialCapture?.()
+      releaseSpatialCapture = null
+      if (spatialPointerId) pointerTarget.releasePointerCapture?.(event.pointerId)
       if (document.body.style.cursor === 'grabbing') document.body.style.cursor = ''
       useScene.temporal.getState().resume()
       useViewer.getState().setInputDragging(false)
+      useInteractionScope
+        .getState()
+        .endIf((s) => s.kind === 'handle-drag' && s.handle === GROUP_ROTATE_DRAG_LABEL)
       setIsDragging(false)
       setGuide(null)
       frozenRest.current = null
@@ -315,8 +358,12 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
       const updates = commitFromOverrides()
       // Resume before the commit so the single batched `updateNodes` is the
       // one tracked set — collapsing the whole group rotation into one undo.
+      // Space detection stays out: a rigid rotation of existing walls must
+      // not re-create the room's auto floors/ceilings at the new bearing.
+      pauseSpaceDetection()
       useScene.temporal.getState().resume()
       if (updates.length > 0) useScene.getState().updateNodes(updates)
+      resumeSpaceDetection()
       clearLivePreviews()
       cleanup()
     }
@@ -327,6 +374,23 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
       cleanup()
     }
 
+    // Escape / ⌘Z abort the rotate — capture phase so they win over the global
+    // use-keyboard arms (⌘Z must never history-jump under a live pointer).
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Alt') {
+        altKey = true
+        return
+      }
+      if (e.key !== 'Escape' && !isHistoryShortcut(e)) return
+      e.preventDefault()
+      e.stopPropagation()
+      swallowNextClick()
+      onCancel()
+    }
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Alt') altKey = false
+    }
+
     dragCleanupRef.current = () => {
       clearLivePreviews()
       cleanup()
@@ -334,9 +398,22 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
     for (const id of affectedIds) {
       useLiveTransforms.getState().clear(id)
     }
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    window.addEventListener('pointercancel', onCancel)
+    if (spatialPointerId && spatialRay) {
+      releaseSpatialCapture = spatialPointerInput.capture(spatialPointerId, {
+        onMove: (ray) => {
+          spatialRay.copy(ray)
+          applyRay(spatialRay, altKey)
+        },
+        onRelease: onUp,
+        onCancel,
+      })
+    } else {
+      window.addEventListener('pointermove', onMove)
+      window.addEventListener('pointerup', onUp)
+      window.addEventListener('pointercancel', onCancel)
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    window.addEventListener('keyup', onKeyUp, true)
   }
 
   return createPortal(
@@ -347,27 +424,35 @@ function GroupRotateHandleInner({ ids }: { ids: string[] }) {
         </group>
       )}
       <group position={[corner.x, corner.y, corner.z]}>
-        <InvisibleHandleHitArea
+        {/* Fat invisible grab target (torus wrapping the arrow). A plain
+            default-layer mesh with the standard raycast — the shared
+            `InvisibleHandleHitArea` (EDITOR_LAYER + custom raycast) never
+            received pointer events in this portalled context: R3F's
+            `createPortal` gives the portal root its own fresh `Raycaster`
+            (default mask = layer 0 only), so the EDITOR_LAYER enable applied
+            to the root raycaster in `custom-camera-controls` never reaches
+            it. Harmless render-wise — the material is colorWrite:false /
+            depthWrite:false, so nothing leaks into thumbnails or the ink
+            pass. A proper fix would enable EDITOR_LAYER on the portal
+            raycaster from inside the portal. */}
+        <mesh
+          frustumCulled={false}
           geometry={hitGeometry}
           material={hitMaterial}
           onPointerDown={activate}
-          onPointerEnter={(event) => {
-            event.stopPropagation()
-            setIsHovered(true)
-            if (document.body.style.cursor !== 'grabbing') document.body.style.cursor = 'grab'
-          }}
-          onPointerLeave={(event) => {
-            event.stopPropagation()
-            setIsHovered(false)
-            if (document.body.style.cursor === 'grab') document.body.style.cursor = ''
-          }}
+          onPointerEnter={onHoverEnter}
+          onPointerLeave={onHoverLeave}
+          {...({ pointerEventsOrder: 10 } as Record<string, unknown>)}
           scale={baseScale}
         />
         <mesh
           frustumCulled={false}
           geometry={arrowGeometry}
           material={arrowMaterial}
-          raycast={NO_RAYCAST}
+          onPointerDown={activate}
+          onPointerEnter={onHoverEnter}
+          onPointerLeave={onHoverLeave}
+          {...({ pointerEventsOrder: 10 } as Record<string, unknown>)}
           renderOrder={1010}
           scale={scale}
         />

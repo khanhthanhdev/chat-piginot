@@ -1,16 +1,25 @@
 import {
   ColumnNode as ColumnNodeSchema,
   type ColumnNode as ColumnNodeType,
+  type GroupMoveSnapArgs,
+  type GroupMoveSnapResult,
   type HandleDescriptor,
   type NodeDefinition,
 } from '@pascal-app/core'
-import { buildColumnFloorplan } from './floorplan'
+import { withHostedChildren } from '../shared/hosted-resize'
+import {
+  collectStructuralGridAxes,
+  resolveStructuralGridSnap,
+} from '../structural-grid/coordination'
+import { buildColumnFloorplan, computeColumnFloorplanLevelData } from './floorplan'
 import { columnResizeAffordance, columnRotateAffordance } from './floorplan-affordances'
 import { columnFloorplanMoveTarget } from './floorplan-move'
+import { columnHostedPolicy } from './hosted-resize'
 import { columnPaint } from './paint'
 import { columnParametrics } from './parametrics'
 import { ColumnNode } from './schema'
 import { columnSlots } from './slots'
+import { columnSurfaceProvider } from './surface'
 
 // Limits + offsets shared with the in-world arrows. Mirrors the floors
 // the renderer clamps to (`Math.max(0.2, node.height)` etc.) so a drag
@@ -186,6 +195,17 @@ const STYLES_WITH_TOP_SPREAD = new Set<ColumnNodeType['supportStyle']>([
   'v-frame',
 ])
 
+function isLeanToManagedColumn(node: ColumnNodeType): boolean {
+  const metadata = node.metadata
+  return (
+    metadata !== null &&
+    typeof metadata === 'object' &&
+    !Array.isArray(metadata) &&
+    metadata.managedByLeanTo !== undefined &&
+    metadata.leanToRole === 'post'
+  )
+}
+
 // Resolve the column's visible XZ footprint half-extents per supportStyle
 // + crossSection. Vertical supports use the shaft geometry (radius for
 // round / octagonal / sixteen-sided, width/depth for square / rectangular);
@@ -275,7 +295,9 @@ function columnHandles(node: ColumnNodeType): HandleDescriptor<ColumnNodeType>[]
   //    - round / octagonal / sixteen-sided → single radius arrow
   //    - square                            → uniform width+depth
   //    - rectangular                       → width + depth (independent)
-  const handles: HandleDescriptor<ColumnNodeType>[] = [columnHeightHandle()]
+  const handles: HandleDescriptor<ColumnNodeType>[] = []
+  const managedByLeanTo = isLeanToManagedColumn(node)
+  if (!managedByLeanTo) handles.push(columnHeightHandle())
   if (node.supportStyle !== 'vertical') {
     handles.push(columnBraceHandle('x'), columnBraceHandle('z'))
     if (STYLES_WITH_BOTTOM_SPREAD.has(node.supportStyle)) {
@@ -284,6 +306,9 @@ function columnHandles(node: ColumnNodeType): HandleDescriptor<ColumnNodeType>[]
     if (STYLES_WITH_TOP_SPREAD.has(node.supportStyle)) {
       handles.push(columnBraceTopSpreadHandle())
     }
+  } else if (managedByLeanTo) {
+    // Lean-to sync owns the post's structural height and footprint. Keep
+    // rotation user-owned so asymmetric styles such as K-braces can be flipped.
   } else if (ROUND_CROSS_SECTIONS.has(node.crossSection)) {
     handles.push(columnRadiusHandle())
   } else if (node.crossSection === 'square') {
@@ -291,27 +316,44 @@ function columnHandles(node: ColumnNodeType): HandleDescriptor<ColumnNodeType>[]
   } else {
     handles.push(columnAxisHandle('x'), columnAxisHandle('z'))
   }
-  handles.push(columnRotateHandle(), columnMoveHandle())
-  return handles
+  handles.push(columnRotateHandle())
+  if (!managedByLeanTo) handles.push(columnMoveHandle())
+  return handles.map((handle) => withHostedChildren(handle, columnHostedPolicy))
+}
+
+function resolveColumnStructuralGridMoveSnap({
+  candidatePosition,
+  nodes,
+  levelId,
+}: GroupMoveSnapArgs): GroupMoveSnapResult | null {
+  const snap = resolveStructuralGridSnap(
+    [candidatePosition[0], candidatePosition[2]],
+    collectStructuralGridAxes(nodes, levelId),
+  )
+  return snap ? { position: [snap.point[0], candidatePosition[1], snap.point[1]] } : null
 }
 
 /**
  * Column — Stage A registration. Wrap-export of the legacy
  * `ColumnRenderer` (no system — column geometry is computed inline in
- * the renderer). Inspector / move / floorplan still go through legacy
- * paths via panel-manager.tsx / item-move-tool.tsx / floorplan-panel.tsx
- * (their hardcoded `case 'column':` entries fire before the registry
- * fallback).
+ * the renderer). Inspector / floorplan still go through legacy paths via
+ * panel-manager.tsx / floorplan-panel.tsx (their hardcoded `case 'column':`
+ * entries fire before the registry fallback).
  *
- * Capabilities: column doesn't declare `movable` because its move is
- * bespoke (legacy MoveColumnTool snaps to slab + free placement on
- * the X/Z plane with rotation).
+ * Capabilities: column declares the generic `movable` (translate on XZ
+ * with grid snap), so its 3D move runs through the shared
+ * `MoveRegistryNodeTool` — which gives it grid/line/off snapping, alignment,
+ * R/T rotation, slab-elevation lift, and the `collides` red/green placement
+ * box for free. (2D move still routes through `floorplanMoveTarget`, which
+ * wins the 2D dispatch.)
  *
  * Defaults computed via stub-parse so we leverage every zod
  * `.default()` annotation on the schema (~60 fields).
  */
 export const columnDefinition: NodeDefinition<typeof ColumnNode> = {
   kind: 'column',
+  snapProfile: 'item',
+  facingIndicator: true,
   schemaVersion: 1,
   schema: ColumnNode,
   category: 'structure',
@@ -324,22 +366,41 @@ export const columnDefinition: NodeDefinition<typeof ColumnNode> = {
   },
 
   capabilities: {
+    surfacePlacement: 'floor-only',
     selectable: { hitVolume: 'bbox' },
-    duplicable: true,
+    surfaces: {
+      top: { height: (node) => (node as ColumnNodeType).height },
+      hosting: columnSurfaceProvider,
+    },
+    duplicable: { subtree: true },
     deletable: true,
+    // Generic 3D translate-on-XZ via `MoveRegistryNodeTool` (grid snap + the
+    // mode-driven snapping the overhaul standardised). 2D move keeps using
+    // `floorplanMoveTarget`, which wins the 2D move dispatch.
+    movable: {
+      axes: ['x', 'z'],
+      gridSnap: true,
+      groupMoveSnapPose: resolveColumnStructuralGridMoveSnap,
+    },
     slots: (node) => columnSlots(node as ColumnNodeType),
     paint: columnPaint,
-    // Slab elevation lift via the generic `<FloorElevationSystem>`.
+    // Slab elevation lift via the generic `<FloorElevationSystem>` + the
+    // placement/collision box. Use the VISIBLE footprint (round → radius,
+    // square → width, rectangular → width/depth, plus brace spread) so the
+    // box, slab-overlap, and collision all track the real column size rather
+    // than the raw width/depth (stale for a round column resized by radius).
     floorPlaced: {
       footprint: (node) => {
         const column = node as ColumnNodeType
+        const { halfX, halfZ } = columnFootprintHalf(column)
         return {
-          dimensions: [column.width, column.height, column.depth] as [number, number, number],
+          dimensions: [halfX * 2, column.height, halfZ * 2] as [number, number, number],
           // Column stores Y rotation as a scalar; the slab-overlap query
           // expects the full Euler tuple.
           rotation: [0, column.rotation, 0] as [number, number, number],
         }
       },
+      collides: true,
     },
   },
 
@@ -350,12 +411,7 @@ export const columnDefinition: NodeDefinition<typeof ColumnNode> = {
     kind: 'parametric',
     module: () => import('./renderer'),
   },
-  // Stage D — 3D move-tool (registry-driven). Replaces the legacy
-  // `MoveColumnTool` in editor's dispatcher. Same 0.5m grid snap +
-  // live-transform preview the legacy used.
-  affordanceTools: {
-    move: () => import('./move-tool'),
-  },
+  preview: () => import('./renderer').then(({ ColumnPreview }) => ({ default: ColumnPreview })),
   // Registry-driven placement tool — renders a translucent `ColumnPreview`
   // ghost at the cursor (mirroring the shelf build tool) instead of the
   // bare sphere the legacy editor-side `ColumnTool` showed. `ToolManager`'s
@@ -363,9 +419,10 @@ export const columnDefinition: NodeDefinition<typeof ColumnNode> = {
   tool: () => import('./tool'),
   toolHints: [
     { key: 'Left click', label: 'Place column' },
-    { key: 'Shift', label: 'Free place' },
     { key: 'Esc', label: 'Cancel' },
   ],
+  computeFloorplanLevelData: computeColumnFloorplanLevelData,
+  floorplanDependsOnSiblings: true,
   floorplan: buildColumnFloorplan,
   // 2D body move routes through this kind-specific target so the column
   // aligns by its footprint *edges* (and snaps flush to wall faces) instead

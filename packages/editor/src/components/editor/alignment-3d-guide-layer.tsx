@@ -1,7 +1,6 @@
 'use client'
 
 import { type AlignmentGuide, sceneRegistry } from '@pascal-app/core'
-import { useAlignmentGuides } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
 import { Html } from '@react-three/drei'
 import { useFrame } from '@react-three/fiber'
@@ -9,6 +8,7 @@ import { memo, useMemo, useRef } from 'react'
 import { BoxGeometry, CircleGeometry, type Group, Vector3 } from 'three'
 import { MeshBasicNodeMaterial } from 'three/webgpu'
 import { EDITOR_LAYER } from '../../lib/constants'
+import useAlignmentGuides from '../../store/use-alignment-guides'
 import { formatMeasurement } from './measurement-pill'
 
 /**
@@ -49,6 +49,14 @@ const guideMaterial = new MeshBasicNodeMaterial({
   toneMapped: false,
   transparent: true,
 })
+const DOT_COLOR = 0x22_c5_5e // green-500 — matches the wall-snap marker
+const dotMaterial = new MeshBasicNodeMaterial({
+  color: DOT_COLOR,
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+  transparent: true,
+})
 const DASH_GEOMETRY = new BoxGeometry(1, 1, 1)
 const DOT_GEOMETRY = new CircleGeometry(1, 24)
 
@@ -58,6 +66,7 @@ export const Alignment3DGuideLayer = memo(function Alignment3DGuideLayer() {
   const guides = useAlignmentGuides((s) => s.guides)
   const levelId = useViewer((s) => s.selection.levelId)
   const unit = useViewer((s) => s.unit)
+  const metricNotation = useViewer((s) => s.metricNotation)
   const groupRef = useRef<Group>(null)
 
   // Guides carry only XZ in WORLD coords; their Y has to track the active
@@ -77,16 +86,24 @@ export const Alignment3DGuideLayer = memo(function Alignment3DGuideLayer() {
   return (
     <group ref={groupRef}>
       {guides.map((guide, i) => (
-        <GuideLine guide={guide} key={i} unit={unit} />
+        <GuideLine guide={guide} key={i} metricNotation={metricNotation} unit={unit} />
       ))}
     </group>
   )
 })
 
-function GuideLine({ guide, unit }: { guide: AlignmentGuide; unit: 'metric' | 'imperial' }) {
+function GuideLine({
+  guide,
+  metricNotation,
+  unit,
+}: {
+  guide: AlignmentGuide
+  metricNotation: 'meters' | 'millimeters'
+  unit: 'metric' | 'imperial'
+}) {
   const { x: fx, z: fz } = guide.from
   const { x: tx, z: tz } = guide.to
-  const distLabel = formatMeasurement(guide.distance, unit)
+  const distLabel = formatMeasurement(guide.distance, unit, metricNotation)
 
   // Lay out the dash centres along the from→to direction. The ribbon
   // stretches the dash period up if the line is long enough to exceed the
@@ -150,7 +167,7 @@ function Dot({ position }: { position: Vec3 }) {
     <mesh
       geometry={DOT_GEOMETRY}
       layers={EDITOR_LAYER}
-      material={guideMaterial}
+      material={dotMaterial}
       position={position}
       renderOrder={1001}
       rotation={[-Math.PI / 2, 0, 0]}

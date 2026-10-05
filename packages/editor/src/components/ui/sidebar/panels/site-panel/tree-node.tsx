@@ -1,10 +1,11 @@
-import { type AnyNode, type AnyNodeId, emitter, useScene } from '@pascal-app/core'
+import { type AnyNode, type AnyNodeId, emitter, nodeRegistry, useScene } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import { ChevronRight } from 'lucide-react'
 import { AnimatePresence, motion } from 'motion/react'
 import { forwardRef, memo, useEffect, useRef } from 'react'
 import { resolveNodeSelectionTarget } from '../../../../../lib/selection-routing'
 import useEditor from '../../../../../store/use-editor'
+import { expandSessionSelectionForNode } from '../../../../../store/use-session-groups'
 
 export function handleTreeSelection(
   e: React.MouseEvent,
@@ -48,7 +49,13 @@ export function handleTreeSelection(
     }
   }
 
-  setSelection({ selectedIds: [nodeId] })
+  if (e.altKey) {
+    setSelection({ selectedIds: [nodeId] })
+    return false
+  }
+
+  const expanded = expandSessionSelectionForNode(nodeId)
+  setSelection({ selectedIds: expanded && expanded.length > 1 ? expanded : [nodeId] })
   return false
 }
 
@@ -100,6 +107,7 @@ import { SlabTreeNode } from './slab-tree-node'
 import { SolarPanelTreeNode } from './solar-panel-tree-node'
 import { SpawnTreeNode } from './spawn-tree-node'
 import { StairTreeNode } from './stair-tree-node'
+import { UnitTreeNode } from './unit-tree-node'
 import { WallTreeNode } from './wall-tree-node'
 import { WindowTreeNode } from './window-tree-node'
 import { ZoneTreeNode } from './zone-tree-node'
@@ -110,6 +118,12 @@ interface TreeNodeProps {
   isLast?: boolean
 }
 
+type TreeNodeComponent = React.ComponentType<{
+  depth: number
+  isLast?: boolean
+  nodeId: AnyNodeId
+}>
+
 // Per-kind tree-node components keyed by `node.type`. Lookup replaces
 // the legacy switch — adding a kind to this map is now the only edit
 // needed in this file (the switch's `case '<kind>':` clauses were
@@ -117,16 +131,16 @@ interface TreeNodeProps {
 // outside the registry; future work moves these to a
 // `def.presentation`-driven generic tree-node and removes this map
 // entirely).
-const treeNodeByType: Record<
-  string,
-  React.ComponentType<{ depth: number; isLast?: boolean; nodeId: AnyNodeId }>
-> = {
+const treeNodeByType: Record<string, TreeNodeComponent> = {
   building: BuildingTreeNode as React.ComponentType<{
     depth: number
     isLast?: boolean
     nodeId: AnyNodeId
   }>,
+  cabinet: RegistryTreeNode,
+  'cabinet-module': RegistryTreeNode,
   'box-vent': RegistryTreeNode,
+  'block': RegistryTreeNode,
   ceiling: CeilingTreeNode,
   chimney: ChimneyTreeNode,
   dormer: DormerTreeNode,
@@ -153,12 +167,16 @@ const treeNodeByType: Record<
   wall: WallTreeNode,
   fence: FenceTreeNode,
   gutter: GutterTreeNode,
+  measurement: RegistryTreeNode,
   'ridge-vent': RegistryTreeNode,
   'turbine-vent': RegistryTreeNode,
   cupola: RegistryTreeNode,
   'eyebrow-vent': RegistryTreeNode,
+  skylight: RegistryTreeNode,
   roof: RoofTreeNode,
+  scan: RegistryTreeNode,
   stair: StairTreeNode,
+  unit: UnitTreeNode,
   door: DoorTreeNode,
   window: WindowTreeNode,
   zone: ZoneTreeNode as React.ComponentType<{
@@ -169,17 +187,30 @@ const treeNodeByType: Record<
   item: ItemTreeNode,
 }
 
+export function getTreeNodeComponent(nodeType: string): TreeNodeComponent {
+  return treeNodeByType[nodeType] ?? RegistryTreeNode
+}
+
 export const TreeNode = memo(function TreeNode({ nodeId, depth = 0, isLast }: TreeNodeProps) {
+  // Registry-driven row hiding (`def.tree.hidden`) — primitive boolean
+  // selector so unrelated scene updates don't re-render every row.
+  const shouldHide = useScene((state) => {
+    const node = state.nodes[nodeId]
+    if (!node) return false
+    return nodeRegistry.get(node.type)?.tree?.hidden?.(node, state.nodes) ?? false
+  })
   const nodeType = useScene((state) => state.nodes[nodeId]?.type)
+  if (shouldHide) return null
   if (!nodeType) return null
-  const Component = treeNodeByType[nodeType]
-  if (!Component) return null
+  const Component = getTreeNodeComponent(nodeType)
   return <Component depth={depth} isLast={isLast} nodeId={nodeId} />
 })
 
 interface TreeNodeWrapperProps {
   nodeId?: string
   icon: React.ReactNode
+  /** Keep the icon's own color when unselected (color dots are the identity). */
+  keepIconColor?: boolean
   label: React.ReactNode
   depth: number
   hasChildren: boolean
@@ -205,6 +236,7 @@ export const TreeNodeWrapper = forwardRef<HTMLDivElement, TreeNodeWrapperProps>(
     {
       nodeId,
       icon,
+      keepIconColor,
       label,
       depth,
       hasChildren,
@@ -299,7 +331,7 @@ export const TreeNodeWrapper = forwardRef<HTMLDivElement, TreeNodeWrapperProps>(
             <span
               className={cn(
                 'flex h-5 w-5 shrink-0 items-center justify-center transition-all duration-200',
-                !isSelected && 'opacity-60 grayscale',
+                !isSelected && !keepIconColor && 'opacity-60 grayscale',
               )}
             >
               {icon}

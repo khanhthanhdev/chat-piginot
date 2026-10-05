@@ -1,0 +1,1 @@
+"""LGO inference service entrypoint."""

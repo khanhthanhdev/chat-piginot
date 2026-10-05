@@ -1,10 +1,17 @@
 'use client'
 
-import { emitter, type GridEvent, HvacEquipmentNode, useScene } from '@pascal-app/core'
-import { triggerSFX, useEditor } from '@pascal-app/editor'
+import {
+  emitter,
+  type GridEvent,
+  HvacEquipmentNode,
+  resolveSupportSlabPatch,
+  useScene,
+} from '@pascal-app/core'
+import { isGridSnapActive, isMagneticSnapActive, triggerSFX, useEditor } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
 import { Html } from '@react-three/drei'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { subscribeAccessorySnapping } from '../shared/accessory-snapping'
 import { alignDrawPoint, clearDrawAlignment } from '../shared/draw-alignment'
 import { LevelOffsetGroup } from '../shared/level-offset-group'
 import { hvacEquipmentDefinition } from './definition'
@@ -29,13 +36,19 @@ function snap(value: number, step: number): number {
  */
 const HvacEquipmentTool = () => {
   const activeLevelId = useViewer((s) => s.selection.levelId)
+  const toolDefaults = useEditor((s) => s.toolDefaults['hvac-equipment'])
   const [cursor, setCursor] = useState<[number, number, number] | null>(null)
   const [yaw, setYaw] = useState(0)
   const yawRef = useRef(0)
 
   const previewNode = useMemo(
-    () => HvacEquipmentNode.parse({ ...hvacEquipmentDefinition.defaults(), name: 'Furnace' }),
-    [],
+    () =>
+      HvacEquipmentNode.parse({
+        ...hvacEquipmentDefinition.defaults(),
+        ...toolDefaults,
+        name: 'Furnace',
+      }),
+    [toolDefaults],
   )
   const ghost = useMemo(() => {
     const group = buildHvacEquipmentGeometry(previewNode)
@@ -53,31 +66,42 @@ const HvacEquipmentTool = () => {
     if (!activeLevelId) return
 
     const resolve = (event: GridEvent): [number, number, number] => {
-      const step = event.nativeEvent?.shiftKey === true ? 0 : useEditor.getState().gridSnapStep
+      const step = isGridSnapActive() ? useEditor.getState().gridSnapStep : 0
       return [snap(event.localPosition[0], step), 0, snap(event.localPosition[2], step)]
     }
 
     // Grid-snap the cursor, then layer Figma-style alignment so the unit lines
-    // up with ducts, other equipment, and items as it's placed (Shift = free,
-    // no snap + no guides).
+    // up with ducts, other equipment, and items as it's placed. Grid + lines
+    // follow the active snapping mode (the contextual HUD chip — Shift cycles
+    // it); `'off'` is the no-snap bypass.
     const resolveAligned = (event: GridEvent): [number, number, number] =>
       alignDrawPoint(resolve(event), {
-        applySnap: true,
-        bypass: event.nativeEvent?.shiftKey === true,
+        applySnap: isMagneticSnapActive(),
+        bypass: !isMagneticSnapActive(),
       })
 
-    const onMove = (event: GridEvent) => setCursor(resolveAligned(event))
+    let lastEvent: GridEvent | null = null
+    const onMove = (event: GridEvent) => {
+      lastEvent = event
+      setCursor(resolveAligned(event))
+    }
 
     const onClick = (event: GridEvent) => {
       const position = resolveAligned(event)
       const unit = HvacEquipmentNode.parse({
         ...hvacEquipmentDefinition.defaults(),
+        ...toolDefaults,
         name: 'Furnace',
         position,
         rotation: yawRef.current,
+        parentId: activeLevelId,
       })
-      useScene.getState().createNode(unit, activeLevelId)
-      useViewer.getState().setSelection({ selectedIds: [unit.id] })
+      const committedUnit = HvacEquipmentNode.parse({
+        ...unit,
+        ...resolveSupportSlabPatch(unit, useScene.getState().nodes),
+      })
+      useScene.getState().createNode(committedUnit, activeLevelId)
+      useViewer.getState().setSelection({ selectedIds: [committedUnit.id] })
       triggerSFX('sfx:item-place')
     }
 
@@ -96,16 +120,20 @@ const HvacEquipmentTool = () => {
       triggerSFX('sfx:item-rotate')
     }
 
+    const unsubscribeSnapping = subscribeAccessorySnapping(() => {
+      if (lastEvent) onMove(lastEvent)
+    })
     emitter.on('grid:move', onMove)
     emitter.on('grid:click', onClick)
     window.addEventListener('keydown', onKeyDown, true)
     return () => {
+      unsubscribeSnapping()
       emitter.off('grid:move', onMove)
       emitter.off('grid:click', onClick)
       window.removeEventListener('keydown', onKeyDown, true)
       clearDrawAlignment()
     }
-  }, [activeLevelId])
+  }, [activeLevelId, toolDefaults])
 
   if (!activeLevelId || !cursor) return null
 
@@ -122,10 +150,6 @@ const HvacEquipmentTool = () => {
       >
         <div className="flex items-center gap-2 whitespace-nowrap rounded-full border border-border/60 bg-background/90 px-4 py-1.5 text-xs tabular-nums shadow-sm backdrop-blur">
           <span className="font-medium text-foreground">R/T rotate</span>
-          <span aria-hidden className="text-muted-foreground">
-            ·
-          </span>
-          <span className="text-muted-foreground">⇧ smooth</span>
         </div>
       </Html>
     </LevelOffsetGroup>

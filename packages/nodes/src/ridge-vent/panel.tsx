@@ -157,7 +157,7 @@ export default function RidgeVentPanel() {
       <PanelSection title="Dimensions">
         <SliderControl
           label="Length"
-          max={8}
+          max={1000}
           min={0.5}
           onChange={(v) => handleUpdate({ length: v })}
           onCommit={(v) => handleUpdate({ length: v })}
@@ -165,7 +165,7 @@ export default function RidgeVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round(node.length * 100) / 100}
+          value={node.length}
         />
         <SliderControl
           label="Width"
@@ -177,7 +177,7 @@ export default function RidgeVentPanel() {
           restoreOnCommit={false}
           step={0.01}
           unit="m"
-          value={Math.round(node.width * 100) / 100}
+          value={node.width}
         />
         <SliderControl
           label="Height"
@@ -189,7 +189,7 @@ export default function RidgeVentPanel() {
           restoreOnCommit={false}
           step={0.005}
           unit="m"
-          value={Math.round(node.height * 1000) / 1000}
+          value={node.height}
         />
       </PanelSection>
 
@@ -212,12 +212,10 @@ export default function RidgeVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[0] ?? 0) * 100) / 100}
+          value={node.position[0] ?? 0}
         />
         <SliderControl
           label="Y"
-          max={2}
-          min={-2}
           onChange={(v) =>
             handleUpdate({
               position: [node.position[0] ?? 0, v, node.position[2] ?? 0],
@@ -232,7 +230,7 @@ export default function RidgeVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[1] ?? 0) * 100) / 100}
+          value={node.position[1] ?? 0}
         />
         <SliderControl
           label="Z"
@@ -252,7 +250,7 @@ export default function RidgeVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[2] ?? 0) * 100) / 100}
+          value={node.position[2] ?? 0}
         />
         <SliderControl
           label="Rotation"

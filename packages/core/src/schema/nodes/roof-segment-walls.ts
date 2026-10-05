@@ -1,5 +1,5 @@
 import type { RoofSegmentNode } from './roof-segment'
-import { getSegmentSlopeFrame } from './roof-segment'
+import { getDutchRoofMetrics, getSegmentSlopeFrame } from './roof-segment'
 
 /**
  * Wall-face math for roof segments — the vertical surfaces a wall-mounted
@@ -16,7 +16,9 @@ import { getSegmentSlopeFrame } from './roof-segment'
  * (`getVol(wallThickness / 2, 0, 0, …)`): the volume is the segment
  * footprint extended outward by `wallThickness / 2`, which drops the eave
  * line by `(wallThickness / 2) · tanθ` and raises the ridge by the same
- * amount so the apex stays at `wallHeight + activeRh`.
+ * amount so the apex stays at `wallHeight + activeRh` unless the eave
+ * hits the CSG minimum. The base stays at 0; the eave is raised to at
+ * least 0.05 above it to avoid sinking the shell into the supporting wall.
  */
 
 export type RoofWallFaceId = 'front' | 'back' | 'right' | 'left'
@@ -53,6 +55,7 @@ type SegmentWallInputs = Pick<
       | 'mansardSteepHeightRatio'
       | 'dutchHipWidthRatio'
       | 'dutchHipHeightRatio'
+      | 'dutchWaistLengthRatio'
     >
   >
 
@@ -75,7 +78,7 @@ function getWallVolumeFrame(node: SegmentWallInputs): WallVolumeFrame {
   const autoDrop = (wallThickness / 2) * tanTheta
   const wV = Math.max(0.01, node.width + wallThickness)
   const dV = Math.max(0.01, node.depth + wallThickness)
-  const eaveY = Math.max(0.01, node.wallHeight - autoDrop)
+  const eaveY = Math.max(0.05, node.wallHeight - autoDrop)
   let rh = activeRh
   if (activeRh > 0) {
     rh = activeRh + autoDrop
@@ -173,8 +176,31 @@ function buildFaceProfile(
         [0, peakY],
       ]
     }
-    // hip / mansard / dutch slope on every side (dutch gablets are
-    // recessed from the wall plane), so only the base rect is placeable.
+    case 'dutch': {
+      const metrics = getDutchRoofMetrics(node)
+      const isDutchGableFace =
+        (metrics.axis === 'x' && isEnd) ||
+        (metrics.axis === 'z' && (id === 'front' || id === 'back'))
+      if (!isDutchGableFace) return rectProfile(length, eaveY)
+
+      const shoulderInset =
+        metrics.axis === 'x' ? metrics.shoulderInsetAlongDepth : metrics.shoulderInsetAlongWidth
+      if (!(shoulderInset > 0.001)) return rectProfile(length, eaveY)
+
+      const shoulderLo = Math.max(0, shoulderInset)
+      const shoulderHi = Math.min(length, length - shoulderInset)
+      if (!(shoulderHi - shoulderLo > 0.02)) return rectProfile(length, eaveY)
+
+      return [
+        [0, 0],
+        [length, 0],
+        [length, eaveY],
+        [shoulderHi, eaveY],
+        [length / 2, peakY],
+        [shoulderLo, eaveY],
+        [0, eaveY],
+      ]
+    }
     default:
       return rectProfile(length, eaveY)
   }

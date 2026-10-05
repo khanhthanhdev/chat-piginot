@@ -6,9 +6,20 @@ import type {
   RoofSegmentNode,
   WallNode,
 } from '@pascal-app/core'
+import type { FloorplanNodeExtension } from '@pascal-app/editor'
+import { curtainOpeningResizeMax } from '../shared/curtain-opening-limits'
+import {
+  buildDoorFloorplanSchedule,
+  computeDoorFloorplanLevelData,
+} from '../shared/opening-documentation'
 import { publishOpeningResizeGuides } from '../shared/opening-guides-runtime'
+import { createOpeningPropertyPreview } from '../shared/opening-property-preview'
+import { openingPropertyPreviewHost } from '../shared/opening-property-preview-host'
 import { readRoofFaceHeightMax, readRoofFaceWidthMax } from '../shared/roof-opening-host'
 import { buildRoofWallOpeningCut } from '../shared/roof-wall-opening-cut'
+import { readHostWallCeiling } from '../shared/wall-opening-ceiling'
+import { wallFloorplanSiblingOverrides } from '../wall/floorplan-overrides'
+import { buildDoorContextualDimensions } from './contextual-dimensions'
 import { scaleHandleHeight } from './door-math'
 import { buildDoorFloorplan } from './floorplan'
 import { doorWidthAffordance } from './floorplan-affordances'
@@ -33,12 +44,6 @@ function readWallLength(door: DoorNodeType, scene: { get: (id: AnyNodeId) => unk
   return Math.hypot(wall.end[0] - wall.start[0], wall.end[1] - wall.start[1])
 }
 
-function readWallHeight(door: DoorNodeType, scene: { get: (id: AnyNodeId) => unknown }): number {
-  if (!door.wallId) return Number.POSITIVE_INFINITY
-  const wall = scene.get(door.wallId as AnyNodeId) as WallNode | undefined
-  return wall?.height ?? Number.POSITIVE_INFINITY
-}
-
 // Width arrow on the door-local +X (right) or -X (left) side. Drag grows
 // the door from the anchored OPPOSITE edge; the door's wall-local center
 // re-centers so the anchored edge stays put.
@@ -56,7 +61,7 @@ function doorWidthHandle(side: 'left' | 'right'): HandleDescriptor<DoorNodeType>
       // limits read Infinity when wallId is unset).
       const roofMax = readRoofFaceWidthMax(n, scene, sign)
       if (roofMax !== null) return Math.max(MIN_DOOR_WIDTH, roofMax)
-      return readWallLength(n, scene)
+      return curtainOpeningResizeMax(n, scene.nodes(), 'x', sign) ?? readWallLength(n, scene)
     },
     currentValue: (n) => n.width,
     onDrag: (node) => publishOpeningResizeGuides(node, false),
@@ -98,8 +103,10 @@ function doorHeightHandle(): HandleDescriptor<DoorNodeType> {
     max: (n, scene) => {
       const roofMax = readRoofFaceHeightMax(n, scene, 1)
       if (roofMax !== null) return Math.max(MIN_DOOR_HEIGHT, roofMax)
+      const curtainMax = curtainOpeningResizeMax(n, scene.nodes(), 'y', 1)
+      if (curtainMax !== undefined) return curtainMax
       const bottom = n.position[1] - n.height / 2
-      return Math.max(MIN_DOOR_HEIGHT, readWallHeight(n, scene) - bottom)
+      return Math.max(MIN_DOOR_HEIGHT, readHostWallCeiling(n.wallId, scene) - bottom)
     },
     currentValue: (n) => n.height,
     onDrag: (node) => publishOpeningResizeGuides(node, false),
@@ -138,11 +145,47 @@ function doorMoveHandle(): HandleDescriptor<DoorNodeType> {
   }
 }
 
+function doorRadiusHandle(index: 0 | 1): HandleDescriptor<DoorNodeType> {
+  const sign = index === 0 ? -1 : 1
+  return {
+    kind: 'corner-radius',
+    corner: [sign, 1],
+    width: (node) => node.width,
+    height: (node) => node.height,
+    currentValue: (node) =>
+      node.openingRadiusMode === 'individual'
+        ? (node.openingTopRadii[index] ?? 0)
+        : node.cornerRadius,
+    max: (node) => Math.min(node.width / 2, node.height),
+    apply: (node, radius, _scene, modifiers) => {
+      if (!modifiers.shiftKey) {
+        return { openingShape: 'rounded', openingRadiusMode: 'all', cornerRadius: radius }
+      }
+      const radii =
+        node.openingRadiusMode === 'individual'
+          ? [...node.openingTopRadii]
+          : [node.cornerRadius, node.cornerRadius]
+      radii[index] = radius
+      return {
+        openingShape: 'rounded',
+        openingRadiusMode: 'individual',
+        openingTopRadii: radii as [number, number],
+      }
+    },
+    createPreview: (node) =>
+      createOpeningPropertyPreview<DoorNodeType>(node.id, openingPropertyPreviewHost),
+    visible: (node) => node.openingShape !== 'arch',
+    portal: 'grandparent',
+  }
+}
+
 const doorHandles: HandleDescriptor<DoorNodeType>[] = [
   doorMoveHandle(),
   doorWidthHandle('left'),
   doorWidthHandle('right'),
   doorHeightHandle(),
+  doorRadiusHandle(0),
+  doorRadiusHandle(1),
 ]
 
 /**
@@ -166,9 +209,17 @@ const doorHandles: HandleDescriptor<DoorNodeType>[] = [
  */
 export const doorDefinition: NodeDefinition<typeof DoorNode> = {
   kind: 'door',
-  schemaVersion: 1,
+  snapProfile: 'item',
+  facingIndicator: true,
+  schemaVersion: 2,
   schema: DoorNode,
   category: 'structure',
+  extensions: {
+    'pascal:editor/floorplan': {
+      contextualDimensions: buildDoorContextualDimensions,
+      schedule: buildDoorFloorplanSchedule,
+    } satisfies FloorplanNodeExtension<DoorNodeType>,
+  },
   surfaceRole: 'joinery',
 
   // Leverage the schema's zod `.default()` annotations to compute the
@@ -210,10 +261,12 @@ export const doorDefinition: NodeDefinition<typeof DoorNode> = {
   parametrics: doorParametrics,
   handles: doorHandles,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),
   },
+  preview: () => import('./preview'),
   system: {
     module: () => import('./system'),
     // Priority 3 mirrors the legacy DoorSystem (after animation at 2,
@@ -223,6 +276,12 @@ export const doorDefinition: NodeDefinition<typeof DoorNode> = {
   // Stage C: floor-plan polygon. Needs ctx.parent (the wall) to compute
   // direction + perpendicular for the cutout footprint.
   floorplan: buildDoorFloorplan,
+  computeFloorplanLevelData: computeDoorFloorplanLevelData,
+  floorplanDependsOnSiblings: true,
+  // Opening symbols position from `ctx.parent` (the host wall); merge the
+  // walls' live drag overrides so the symbol tracks a wall / group drag in
+  // realtime instead of jumping on commit.
+  floorplanSiblingOverrides: wallFloorplanSiblingOverrides,
   // Stage D — placement (`def.tool`) + move-on-wall (`def.
   // affordanceTools.move`). Both ports of the legacy tools at
   // `editor/components/tools/door/`, relocated into the kind folder and
@@ -250,7 +309,8 @@ export const doorDefinition: NodeDefinition<typeof DoorNode> = {
 
   toolHints: [
     { key: 'Left click', label: 'Place door on wall' },
-    { key: 'Shift', label: 'Free place' },
+    { key: 'R', label: 'Flip side' },
+    { key: 'Alt', label: 'Force place' },
     { key: 'Esc', label: 'Cancel' },
   ],
 

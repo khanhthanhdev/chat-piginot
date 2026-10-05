@@ -23,6 +23,11 @@ export const liquidLineDefinition: NodeDefinition<typeof LiquidLineNode> = {
   schema: LiquidLineNode,
   category: 'utility',
   distributionRole: 'run',
+  drafting: { cancelOnHistoryJump: true },
+  // Directional run: like a wall, drafting sets a direction, so it takes the
+  // structural snapping context (grid / lines / angles / off) with a 45° angle
+  // lock available as a cyclable mode.
+  snapProfile: 'structural',
 
   defaults: () => ({
     object: 'node',
@@ -102,7 +107,6 @@ export const liquidLineDefinition: NodeDefinition<typeof LiquidLineNode> = {
   toolHints: [
     { key: 'Click', label: 'Start liquid line' },
     { key: 'Click again', label: 'Place it (locked to 45°)' },
-    { key: 'Shift', label: 'Free angle' },
     { key: 'Alt + drag', label: 'Go vertical ↕, click to place' },
     { key: 'F', label: 'Follow: trace a lineset' },
     { key: 'Esc', label: 'Cancel' },

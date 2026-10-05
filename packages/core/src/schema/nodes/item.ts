@@ -130,7 +130,7 @@ export const ItemNode = BaseNode.extend({
   rotation: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
   scale: z.tuple([z.number(), z.number(), z.number()]).default([1, 1, 1]),
   side: z.enum(['front', 'back']).optional(),
-  children: z.array(objectId('item')).default([]),
+  children: z.array(z.string()).default([]),
 
   // Wall attachment properties (only used when asset.attachTo is "wall" or "wall-side")
   wallId: z.string().optional(),
@@ -142,6 +142,25 @@ export const ItemNode = BaseNode.extend({
   // mounts the node inside the face frame (`getRoofWallFaceFrame`).
   roofSegmentId: z.string().optional(),
   roofFace: z.enum(['front', 'back', 'right', 'left']).optional(),
+  // Alternative wall-like host: a planar block face. Position is
+  // FACE-LOCAL [u, v, normal offset], relative to the live face centroid.
+  // The renderer rebuilds the frame from the face normal so the item follows
+  // later edits that translate or slope the face.
+  blockFaceId: z.string().optional(),
+
+  // Persisted floor-support host (canonical doc — the same field on other
+  // floor-placed kinds and walls follows these rules). Written at
+  // placement/commit ONLY when overlapping slabs disagree on elevation
+  // (ambiguity); absent/null means "elect the support fresh on every
+  // read", which is the historical behavior. Read paths PREFER this slab
+  // while it still exists and still overlaps the node's footprint, and
+  // silently fall back to election otherwise. Deleting the host slab
+  // strips the field (deleteNodesAction); a host merely reshaped away is
+  // deliberately kept so hosting resumes if the slab's polygon returns.
+  // The sentinel value 'ground' (GROUND_SUPPORT_ID) pins the node to the
+  // level base — written when a pointer-capped commit elected the ground
+  // while a slab (e.g. an elevated deck) still overlapped the footprint.
+  supportSlabId: z.string().optional(),
 
   // Denormalized references to collections this node belongs to
   collectionIds: z.array(z.custom<CollectionId>()).optional(),

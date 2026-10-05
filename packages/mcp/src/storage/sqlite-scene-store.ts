@@ -25,7 +25,6 @@ import {
 } from './types'
 
 const DEFAULT_MAX_SCENE_BYTES = 10 * 1024 * 1024
-const DEFAULT_MAX_SCENE_REVISIONS = 50
 const DEFAULT_LIST_LIMIT = 100
 const MAX_NAME_LENGTH = 200
 const MIN_NAME_LENGTH = 1
@@ -37,8 +36,6 @@ export interface SqliteSceneStoreOptions {
   env?: NodeJS.ProcessEnv
   /** Maximum UTF-8 byte length of graph JSON. Defaults to 10 MB. */
   maxSceneBytes?: number
-  /** Maximum retained full snapshots per scene. Defaults to 50. */
-  maxSceneRevisions?: number
 }
 
 interface SceneRow {
@@ -73,10 +70,18 @@ interface ProjectPlaceholder {
   updatedAt: string
 }
 
+// `z.object()` strips keys it doesn't name, so every field that must survive a
+// save→load round trip has to be listed here. Values stay `unknown` rather than
+// being validated against `SceneMaterial`/`Collection`: nothing validates on the
+// way in, and `parseGraph` throws, so a strict shape here would let one odd
+// stored value make a saved scene permanently unloadable. Validation belongs on
+// the write path, where the caller can still react to it.
 const GraphSchema = z.object({
   nodes: z.record(z.string(), z.unknown()),
   rootNodeIds: z.array(z.string()),
   collections: z.record(z.string(), z.unknown()).optional(),
+  materials: z.record(z.string(), z.unknown()).optional(),
+  installedPlugins: z.array(z.string()).optional(),
 })
 
 /**
@@ -130,14 +135,6 @@ function resolveMaxSceneBytes(
   return parsed
 }
 
-function resolveMaxSceneRevisions(env: NodeJS.ProcessEnv, explicit?: number): number {
-  const value = explicit ?? Number.parseInt(env.PASCAL_SCENE_REVISION_LIMIT ?? '50', 10)
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new SceneInvalidError('maxSceneRevisions must be a positive integer')
-  }
-  return value
-}
-
 function rowToMeta(row: SceneRow): SceneMeta {
   const editorUrl = editorUrlForScene(row.id)
   return {
@@ -159,7 +156,8 @@ function rowToMeta(row: SceneRow): SceneMeta {
 }
 
 function editorUrlForScene(id: string): string {
-  return `/editor/${id}`
+  const origin = process.env.PASCAL_EDITOR_ORIGIN?.replace(/\/$/, '')
+  return origin ? `${origin}/scene/${encodeURIComponent(id)}` : `/editor/${id}`
 }
 
 function hashGraphJson(graphJson: string): string {
@@ -289,7 +287,6 @@ export class SqliteSceneStore implements SceneStore {
   readonly databasePath: string
 
   private readonly maxSceneBytes: number
-  private readonly maxSceneRevisions: number
   private readonly projectPlaceholders = new Map<string, ProjectPlaceholder>()
   private db: SqliteDatabase | null = null
   private dbPromise: Promise<SqliteDatabase> | null = null
@@ -298,7 +295,6 @@ export class SqliteSceneStore implements SceneStore {
     const env = opts.env ?? process.env
     this.databasePath = path.resolve(opts.databasePath ?? resolveDefaultDatabasePath(env))
     this.maxSceneBytes = resolveMaxSceneBytes(env, opts.maxSceneBytes)
-    this.maxSceneRevisions = resolveMaxSceneRevisions(env, opts.maxSceneRevisions)
   }
 
   async createProject(opts: ProjectCreateOptions): Promise<ProjectStatus> {
@@ -432,7 +428,6 @@ export class SqliteSceneStore implements SceneStore {
            scene_id, version, graph_json, author_kind, author_id, created_at
          ) VALUES (?, ?, ?, ?, ?, ?)`,
       ).run(id, version, graphJson, 'mcp', ownerId, now)
-      this.pruneRevisions(db, id)
 
       this.projectPlaceholders.delete(id)
 
@@ -541,7 +536,6 @@ export class SqliteSceneStore implements SceneStore {
              scene_id, version, graph_json, author_kind, author_id, created_at
            ) VALUES (?, ?, ?, ?, ?, ?)`,
       ).run(safeId, nextVersion, existing.graph_json, 'mcp', existing.owner_id, now)
-      this.pruneRevisions(db, safeId)
 
       return {
         ...rowToMeta(existing),
@@ -616,7 +610,6 @@ export class SqliteSceneStore implements SceneStore {
         db.exec('PRAGMA journal_mode = WAL')
         db.exec('PRAGMA busy_timeout = 5000')
         this.migrate(db)
-        this.pruneRevisions(db)
         this.db = db
         return db
       })()
@@ -700,18 +693,6 @@ export class SqliteSceneStore implements SceneStore {
         )
         .get(id),
     )
-  }
-
-  private pruneRevisions(db: SqliteDatabase, sceneId?: string): void {
-    db.query(
-      `DELETE FROM scene_revisions
-       WHERE (? IS NULL OR scene_id = ?)
-         AND version NOT IN (
-           SELECT version FROM scene_revisions AS kept
-           WHERE kept.scene_id = scene_revisions.scene_id
-           ORDER BY version DESC LIMIT ?
-         )`,
-    ).run(sceneId ?? null, sceneId ?? null, this.maxSceneRevisions)
   }
 
   private generateUniqueId(db: SqliteDatabase): string {

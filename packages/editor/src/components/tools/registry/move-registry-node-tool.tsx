@@ -3,44 +3,87 @@
 import '../../../three-types'
 
 import {
+  type AlignmentGuide,
   type AnyNode,
   type AnyNodeId,
   analyzePortConnectivity,
+  bboxCornerAnchors,
+  cascadeDirty,
   collectAlignmentAnchors,
-  type EventSuffix,
+  createSceneApi,
   emitter,
+  findLevelAncestorId,
+  footprintAABBFrom,
   type GridEvent,
+  type GroupMoveSnapResult,
+  getFloorPlacedFootprints,
+  type MovableConfig,
   movingFootprintAnchors,
+  NON_PHYSICAL_HOST_KINDS,
   type NodeEvent,
   nodeRegistry,
+  type ParentFrameSnapMatch,
   type PortConnectivity,
   resolveAlignment,
   resolveConnectivityUpdates,
+  resolveFacingIndicator,
+  resolveFrozenFloorPlacementPatch,
+  resolveSupportSlabPatch,
+  type SurfaceRejectReason,
   sceneRegistry,
   spatialGridManager,
   useLiveNodeOverrides,
   useLiveTransforms,
   useScene,
 } from '@pascal-app/core'
-import { useAlignmentGuides } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
+import { useFrame, useThree } from '@react-three/fiber'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type Group, Vector3 } from 'three'
 import { markToolCancelConsumed } from '../../../hooks/use-keyboard'
 import { commitFreshPlacementSubtree } from '../../../lib/fresh-planar-placement'
-import { stripPlacementMetadataFlags } from '../../../lib/placement-metadata'
-import { resolvePlanarCursorPosition } from '../../../lib/planar-cursor-placement'
+import {
+  isFreshPlacementMetadata,
+  stripPlacementMetadataFlags,
+} from '../../../lib/placement-metadata'
+import {
+  offsetPlanPositionByLocalCenter,
+  resolvePrioritizedPlanarCursorPosition,
+} from '../../../lib/planar-cursor-placement'
+import { resolveAttachmentPreviewRotation } from '../../../lib/rigid-plan-svg-transform'
+import { createMovementSfxTick } from '../../../lib/sfx/movement-tick'
 import { sfxEmitter } from '../../../lib/sfx-bus'
-import useEditor from '../../../store/use-editor'
+import { resolveSnapFlags } from '../../../lib/snapping-mode'
+import {
+  surfaceAttachmentId,
+  surfaceAttachmentUpdates,
+  updateSurfaceNode,
+} from '../../../lib/surface-attachment'
+import useAlignmentGuides from '../../../store/use-alignment-guides'
+import useEditor, {
+  getActiveSnappingMode,
+  isAlignmentGuideActive,
+  isGridSnapActive,
+  isMagneticSnapActive,
+} from '../../../store/use-editor'
+import useFacingPose from '../../../store/use-facing-pose'
+import useInteractionScope from '../../../store/use-interaction-scope'
 import { swallowNextClick } from '../../editor/node-arrow-handles'
 import { CursorSphere } from '../shared/cursor-sphere'
 import { DragBoundingBox } from '../shared/drag-bounding-box'
 import { getFloorStackPreviewPosition } from '../shared/floor-stack-preview'
 import { useFreshPlacementVisibility } from '../shared/fresh-placement-visibility'
 import { PlacementBox } from '../shared/placement-box'
+import {
+  type PointerSupportSurface,
+  resolvePointerSupportSurface,
+} from '../shared/pointer-support-cap'
+import { createItemSurfaceGridDispatch, createRegistryItemSurfaceMove } from './item-surface-move'
 
 /** Snap a world-plan coordinate to the editor's active grid step (0.5 / 0.25
  *  / 0.1 / 0.05), read live so changing the step mid-drag takes effect. */
 const snapToGridStep = (value: number) => {
+  if (!resolveSnapFlags(getActiveSnappingMode()).grid) return value
   const step = useEditor.getState().gridSnapStep
   return Math.round(value / step) * step
 }
@@ -48,8 +91,58 @@ const snapToGridStep = (value: number) => {
 /** 45° steps, matching the GLB item placement rotation. */
 const ROTATION_STEP = Math.PI / 4
 
+export function resolveMoveRotationStep(
+  freeRotation: number,
+  delta: number,
+  attachmentRotation: number | null,
+): number | null {
+  if (attachmentRotation !== null) return null
+  return freeRotation + delta
+}
+
 /** Default magnetic radius (meters, XZ) for `movable.portSnap`. */
 const PORT_SNAP_RADIUS_M = 0.5
+const VALID_COLOR = 0x22_c5_5e
+const INVALID_COLOR = 0xef_44_44
+
+type DragBoundsOverride = {
+  size: [number, number, number]
+  center?: [number, number, number]
+  centerY?: number
+}
+
+/**
+ * Alignment anchors for the moving node. When the kind declares
+ * `capabilities.dragBounds` with an off-origin `center` (a composite cabinet
+ * run whose modules extend past the node origin), the anchors come from that
+ * declared box instead of the origin-centred footprint.
+ */
+function movingDragBoundsAnchors(
+  node: AnyNode,
+  bounds: DragBoundsOverride | null,
+  x: number,
+  z: number,
+  rotationY: number,
+) {
+  if (!bounds?.center) return movingFootprintAnchors(node, x, z, rotationY)
+  const center = offsetPlanPositionByLocalCenter([x, 0, z], bounds.center, rotationY)
+  const aabb = footprintAABBFrom(center, bounds.size, rotationY)
+  return bboxCornerAnchors(node.id, aabb.minX, aabb.minZ, aabb.maxX, aabb.maxZ)
+}
+
+function alignmentGuideFromParentFrameMatch(match: ParentFrameSnapMatch): AlignmentGuide {
+  return {
+    axis: match.axis,
+    coord: match.axis === 'x' ? match.from.x : match.from.z,
+    from: match.from,
+    to: match.to,
+    anchor: match.from,
+    movingAnchorKind: 'corner',
+    candidateAnchorKind: 'corner',
+    candidateNodeId: match.candidateNodeId,
+    distance: Math.hypot(match.to.x - match.from.x, match.to.z - match.from.z),
+  }
+}
 
 /**
  * Magnetic port snap for a dragged node: if one of the node's own ports
@@ -115,24 +208,10 @@ const ALIGNMENT_THRESHOLD_M = 0.08
 /**
  * Generic move tool for any registry-backed kind.
  *
- * Imperative-only motion during drag:
- * - On every `grid:move` we mutate `sceneRegistry.nodes.get(id).position`
- *   directly. The node's store data is unchanged → the renderer doesn't
- *   re-render → R3F doesn't reapply `position={node.position}` → the
- *   imperative mutation sticks. Movement is smooth, framerate-locked,
- *   and React-free.
- *
- * Store update happens only on commit (single undoable action).
- *
- * Cancel imperatively snaps the mesh back to its original position and
- * resumes history without ever having touched the store mid-drag.
- *
- * **Commit triggers**: the tool listens for `grid:click` *and* the
- * common node click events (shelf / item / slab / ceiling / wall /
- * fence / column / roof / stair). A click on the grid plane fires
- * `grid:click`; a click on the moved node itself (or any other 3D
- * geometry the ray happens to land on) fires the corresponding node
- * click event. Without the node-click listeners, clicking on the
+ * **Commit triggers**: the tool listens for `grid:click` and the generic
+ * `node:click` event. A click on the grid plane fires `grid:click`; a click
+ * on the moved node itself (or any other 3D geometry the ray happens to land
+ * on) fires `node:click`. Without the node-click listener, clicking on the
  * cursor's own mesh during a move would silently drop the commit —
  * the user perceives "click did nothing" because the click hit the
  * vertical face of e.g. a shelf instead of the grid plane below it.
@@ -143,21 +222,50 @@ const ALIGNMENT_THRESHOLD_M = 0.08
  */
 type ClickTriggerEvent = GridEvent | NodeEvent<AnyNode>
 
-const CLICK_TRIGGER_KINDS = [
-  'shelf',
-  'item',
-  'slab',
-  'ceiling',
-  'wall',
-  'fence',
-  'column',
-  'roof',
-  'roof-segment',
-  'stair',
-  'stair-segment',
-] as const
-
-export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
+export function MoveRegistryNodeTool({ node: source }: { node: AnyNode }) {
+  const node = useMemo(
+    () =>
+      isFreshPlacementMetadata(source.metadata)
+        ? (useScene.getState().nodes[source.id] ?? source)
+        : source,
+    [source],
+  )
+  const itemSurfaceMove = useMemo(() => createRegistryItemSurfaceMove(node), [node])
+  const suppressRaycastsRef = useRef<(() => void) | null>(null)
+  const previewGroupRef = useRef<Group>(null)
+  useFrame(() => {
+    suppressRaycastsRef.current?.()
+    if (!previewGroupRef.current) return
+    const nodes = useScene.getState().nodes
+    const parentId = nodes[node.id]?.parentId ?? node.parentId
+    const parent = parentId ? nodes[parentId as AnyNodeId] : undefined
+    // Building-parented kinds already preview in the tool group's frame.
+    const levelId =
+      (parentId ? findLevelAncestorId(parentId as AnyNodeId, nodes) : null) ??
+      (parent?.type === 'building' ? null : useViewer.getState().selection.levelId)
+    previewGroupRef.current.position.y = levelId
+      ? (sceneRegistry.nodes.get(levelId)?.position.y ?? 0)
+      : 0
+  })
+  // Live camera ref — the pointer-surface cap reconstructs the cursor world
+  // ray (camera → grid hit) to find which walking surface is aimed at.
+  const camera = useThree((s) => s.camera)
+  const cameraRef = useRef(camera)
+  cameraRef.current = camera
+  // Level-local elevation of the surface the pointer ray points at,
+  // refreshed per grid move. Caps the floor-support election so a deck
+  // hanging above the aimed-at floor never lifts the dragged node.
+  const supportCapRef = useRef<number | null>(null)
+  const supportSurfaceRef = useRef<PointerSupportSurface | null>(null)
+  // Kinds whose `position` lives in a host parent's local frame declare
+  // `movable.parentFrame` (cabinet module ↔ its run). The tool converts the
+  // plan-frame cursor through the capability's hooks and previews via
+  // `useLiveNodeOverrides` so the parent's composite geometry re-flows.
+  const parentFrame = nodeRegistry.get(node.type)?.capabilities?.movable?.parentFrame ?? null
+  const frameParent = useMemo(
+    () => parentFrame?.resolveParent(node, useScene.getState().nodes) ?? null,
+    [parentFrame, node],
+  )
   const originalPosition: [number, number, number] = useMemo(
     () =>
       'position' in node && Array.isArray((node as { position?: unknown }).position)
@@ -183,7 +291,6 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
     return 0
   }, [node])
   const [cursorPosition, setCursorPosition] = useState<[number, number, number]>(originalPosition)
-  const previousSnapRef = useRef<[number, number] | null>(null)
   /**
    * The latest snapped cursor position from `grid:move`. We commit at
    * THIS position regardless of which event variant fires the click —
@@ -208,31 +315,103 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
   // and bumped by R/T. Applied imperatively + mirrored to `useLiveTransforms`,
   // and committed to the scene on drop.
   const rotationRef = useRef(originalRotationY)
+  const freeRotationRef = useRef(originalRotationY)
+  const attachmentRotationRef = useRef<number | null>(null)
   // Snapshot of which ducts / fittings are mated to this node's ports at
   // drag-start (duct fittings only). Drives the "connected ductwork follows"
   // behaviour: connected nodes preview through `useLiveNodeOverrides` during
   // the drag and commit alongside the moved node on drop. Null for kinds with
   // no ports, so every other movable kind is unaffected.
   const connectivityRef = useRef<PortConnectivity | null>(null)
+  // Node ids touched by a parent-frame kind's derived live preview, such as
+  // linked cabinet corner runs. This is separate from port connectivity so
+  // each preview channel can be cleared independently.
+  const parentFramePreviewIdsRef = useRef<AnyNodeId[]>([])
   // Node ids this drag has pushed live overrides onto — cleared on
   // commit / cancel / unmount so a follow-on drag starts clean.
   const overriddenIdsRef = useRef<AnyNodeId[]>([])
 
-  // Shelf placement shows the same green/red footprint box GLB items use
-  // (instead of the vertical-arrow cursor) and refuses an invalid drop unless
-  // Shift forces it. The footprint comes from the kind's `floorPlaced`
-  // capability so this stays generic if we ever opt other kinds in.
-  const isShelf = node.type === 'shelf'
-  const boxDimensions = useMemo(
+  // Colliding floor kinds (item / shelf / column) show the same green/red
+  // footprint box GLB items use (instead of the vertical-arrow cursor) and
+  // refuse an invalid drop unless Alt forces it. The gate + footprint both come
+  // from the kind's declarative `floorPlaced` capability, so opting a new kind
+  // in is just `collides: true` — no change here.
+  // Parent-frame kinds skip the world-frame floor-collision check — their
+  // position isn't in the level frame the spatial grid indexes. They may
+  // still provide a parent-frame collision check and use the same bounds box.
+  const collides =
+    !frameParent && nodeRegistry.get(node.type)?.capabilities?.floorPlaced?.collides === true
+  // Snapshot the scene once at drag-start — bounds depend on `node` (locked
+  // for the lifetime of this tool) and any sibling state the kind reads. If a
+  // future kind needs live sibling state mid-drag, switch to a subscribed
+  // selector; for v1 (elevator shaft, cabinet run) start-time is correct and
+  // avoids subscribing the whole `nodes` map.
+  const dragBounds = useMemo(
+    (): DragBoundsOverride | null =>
+      (nodeRegistry.get(node.type)?.capabilities?.dragBounds?.(node, useScene.getState().nodes) as
+        | DragBoundsOverride
+        | undefined) ?? null,
+    [node],
+  )
+  const parentFrameCollides = Boolean(
+    frameParent && parentFrame?.isValidPosition && dragBounds?.size,
+  )
+  // Collision extents: the declared drag bounds (composite kinds — a cabinet
+  // run spans its modules) win over the single-node footprint.
+  const resolvedFootprint = useMemo(
     () =>
-      isShelf
-        ? (nodeRegistry.get(node.type)?.capabilities?.floorPlaced?.footprint?.(node)?.dimensions ??
-          null)
-        : null,
-    [isShelf, node],
+      dragBounds?.size ??
+      nodeRegistry.get(node.type)?.capabilities?.floorPlaced?.footprint?.(node)?.dimensions ??
+      null,
+    [dragBounds, node],
+  )
+  const boxDimensions = useMemo(
+    () => (collides || parentFrameCollides ? resolvedFootprint : null),
+    [collides, parentFrameCollides, resolvedFootprint],
   )
   const [valid, setValid] = useState(true)
-  const [cursorRotationY, setCursorRotationY] = useState(originalRotationY)
+  const [surfaceRejection, setSurfaceRejection] = useState<SurfaceRejectReason | null>(null)
+  const previewRotationY = useCallback(
+    (rotationY = rotationRef.current) =>
+      parentFrame && frameParent
+        ? parentFrame.parentRotationY(frameParent, useScene.getState().nodes) + rotationY
+        : itemSurfaceMove?.hosted
+          ? itemSurfaceMove.planPose(lastCursorRef.current, rotationY).rotationY
+          : rotationY,
+    [parentFrame, frameParent, itemSurfaceMove],
+  )
+  const visualPositionFor = useCallback(
+    (position: [number, number, number], rotationY = rotationRef.current) => {
+      if (parentFrame && frameParent) {
+        return parentFrame.localToPlan(frameParent, position, useScene.getState().nodes)
+      }
+      if (itemSurfaceMove?.hosted) return itemSurfaceMove.planPose(position, rotationY).position
+      return getFloorStackPreviewPosition({
+        node: useScene.getState().nodes[node.id] ?? node,
+        position,
+        rotation: (() => {
+          const r = (node as { rotation?: unknown }).rotation
+          return Array.isArray(r)
+            ? [(r[0] as number) ?? 0, rotationY, (r[2] as number) ?? 0]
+            : rotationY
+        })(),
+        maxElevation: supportCapRef.current,
+      })
+    },
+    [parentFrame, frameParent, node, itemSurfaceMove],
+  )
+  const canonicalPositionFromPlan = useCallback(
+    (planX: number, localY: number, planZ: number): [number, number, number] =>
+      parentFrame && frameParent
+        ? parentFrame.planToLocal(frameParent, planX, localY, planZ, useScene.getState().nodes)
+        : [planX, localY, planZ],
+    [parentFrame, frameParent],
+  )
+  const originalPlanPosition = useMemo(
+    () => visualPositionFor(originalPosition, originalRotationY),
+    [originalPosition, originalRotationY, visualPositionFor],
+  )
+  const [cursorRotationY, setCursorRotationY] = useState(() => previewRotationY(originalRotationY))
   const { isFreshPlacement, previewVisible, revealFreshPlacement, useAbsoluteCursorPlacement } =
     useFreshPlacementVisibility({ node })
   // Kinds that declare `movable.cursorAttached` (duct fittings) pin to the
@@ -244,52 +423,75 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
   // a register collar drops onto a duct run end. Reads `def.ports` through
   // the core registry, so it stays layer-clean (no @pascal-app/nodes import).
   const portSnapConfig = nodeRegistry.get(node.type)?.capabilities?.movable?.portSnap ?? null
-  // Mirrors of `valid` / Shift for the event handlers inside the effect, which
+  // Kind-owned magnetic snap for the generic 3D move path. Cabinets use this
+  // to settle a dragged run flush against a wall without forking the move tool.
+  const groupMoveSnapConfig =
+    nodeRegistry.get(node.type)?.capabilities?.movable?.groupMoveSnap ?? null
+  const groupMoveSnapPoseConfig =
+    nodeRegistry.get(node.type)?.capabilities?.movable?.groupMoveSnapPose ?? null
+  const movableValidityConfig =
+    (nodeRegistry.get(node.type)?.capabilities?.movable as MovableConfig | undefined) ?? null
+  const gridSnapPositionConfig =
+    nodeRegistry.get(node.type)?.capabilities?.movable?.gridSnapPosition ?? null
+  // Mirrors of `valid` / Alt for the event handlers inside the effect, which
   // can't read React state without stale closures.
   const validRef = useRef(true)
-  const shiftRef = useRef(false)
+  const altRef = useRef(false)
 
   const exitMoveMode = useCallback(() => {
     useEditor.getState().setMovingNode(null)
   }, [])
 
   useEffect(() => {
+    const ownsSubtree = useInteractionScope.getState().adoptSubtree(node.id)
     useScene.temporal.getState().pause()
-    previousSnapRef.current = null
+    const movementSfx = createMovementSfxTick()
     dragAnchorRef.current = null
     hasMovedRef.current = false
     rotationRef.current = originalRotationY
-    shiftRef.current = false
+    freeRotationRef.current = originalRotationY
+    attachmentRotationRef.current = null
+    altRef.current = false
     validRef.current = true
+    // No pointer surface known yet — uncapped election (the node keeps its
+    // persisted host / committed elevation until the first grid move).
+    supportCapRef.current = null
+    supportSurfaceRef.current = null
     // Re-sync the box transform to the (possibly new) node. `node` changes
     // without this component remounting whenever a positioned preset re-arms a
     // fresh clone after a drop, or the user picks a different catalog tile —
     // and `useState` only honours its initial value, so without this the box
     // would keep the previous clone's rotation/position until the next R/T.
-    setCursorRotationY(originalRotationY)
+    setCursorRotationY(previewRotationY(originalRotationY))
     lastCursorRef.current = originalPosition
+    let floorY = originalPosition[1]
+    let centeredAfterHost = false
     let committed = false
     const isNew = isFreshPlacement
 
     const baseRotation = (node as { rotation?: unknown }).rotation
-    const toCommitRotation = (y: number): number | [number, number, number] =>
-      Array.isArray(baseRotation)
-        ? [(baseRotation[0] as number) ?? 0, y, (baseRotation[2] as number) ?? 0]
-        : y
+    const toCommitRotation = (y: number): number | [number, number, number] => {
+      const live = useScene.getState().nodes[node.id]
+      const rotation =
+        live && surfaceAttachmentId(live) && 'rotation' in live ? live.rotation : baseRotation
+      return Array.isArray(rotation) ? [rotation[0] ?? 0, y, rotation[2] ?? 0] : y
+    }
 
-    const getVisualPosition = (
-      position: [number, number, number],
-      rotationY = rotationRef.current,
-    ): [number, number, number] => {
-      return getFloorStackPreviewPosition({
-        node,
-        position,
-        rotation: toCommitRotation(rotationY),
-      })
+    const currentLevelId = () =>
+      useViewer.getState().selection.levelId ??
+      (itemSurfaceMove ? findLevelAncestorId(node.id, useScene.getState().nodes) : node.parentId)
+
+    const getVisualPosition = visualPositionFor
+    const applyMeshPose = (position: [number, number, number], rotationY = rotationRef.current) => {
+      const object = sceneRegistry.nodes.get(node.id)
+      if (!object) return
+      object.position.set(...position)
+      object.rotation.y = rotationY
     }
     const markMovedNodeDirty = () => {
       if (useScene.getState().nodes[node.id]) {
-        useScene.getState().markDirty(node.id as AnyNodeId)
+        for (const id of cascadeDirty(node.id as AnyNodeId, { scene: createSceneApi(useScene) }))
+          useScene.getState().markDirty(id)
       }
     }
 
@@ -332,35 +534,142 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       }
     }
 
+    const syncParentFramePreview = (position: [number, number, number]) => {
+      if (!frameParent) return
+      const entries: Array<readonly [AnyNodeId, Record<string, unknown>]> = [
+        [node.id as AnyNodeId, { position, rotation: rotationRef.current }],
+      ]
+      const derivedEntries = parentFrame?.previewOverrides?.({
+        node,
+        parent: frameParent,
+        position,
+        sceneApi: createSceneApi(useScene),
+      })
+      if (derivedEntries) {
+        for (const [id, values] of derivedEntries) {
+          if (id === node.id) continue
+          entries.push([id, values as Record<string, unknown>])
+        }
+      }
+
+      const nextIds = new Set(entries.map(([id]) => id))
+      for (const id of parentFramePreviewIdsRef.current) {
+        if (!nextIds.has(id)) useLiveNodeOverrides.getState().clear(id)
+      }
+      useLiveNodeOverrides.getState().setMany(entries)
+      parentFramePreviewIdsRef.current = [...nextIds]
+
+      const scene = useScene.getState()
+      for (const [id] of entries) {
+        if (scene.nodes[id]) scene.markDirty(id)
+      }
+      if (frameParent.id !== node.id) scene.markDirty(frameParent.id as AnyNodeId)
+    }
+
+    const clearParentFramePreview = () => {
+      if (!frameParent) return
+      const ids = new Set<AnyNodeId>([node.id as AnyNodeId, ...parentFramePreviewIdsRef.current])
+      const scene = useScene.getState()
+      for (const id of ids) {
+        useLiveNodeOverrides.getState().clear(id)
+        if (scene.nodes[id]) scene.markDirty(id)
+      }
+      parentFramePreviewIdsRef.current = []
+      scene.markDirty(frameParent.id as AnyNodeId)
+    }
+
     setCursorPosition(getVisualPosition(originalPosition, originalRotationY))
 
     // Re-run the floor-collision check at the live cursor + rotation and push
-    // the result to the box colour. Shift forces a valid (green) override so
-    // the user can drop on top of an existing item on purpose. Only shelves
-    // show the box, so this no-ops for every other movable kind.
+    // the result to the box colour. Alt (free place) forces a valid (green)
+    // override so the user can drop on top of an existing item on purpose. Only
+    // shelves show the box, so this no-ops for every other movable kind.
     const recomputeValidity = () => {
-      if (!boxDimensions) return
-      if (shiftRef.current) {
-        validRef.current = true
-        setValid(true)
+      const rejection = itemSurfaceMove?.rejection ?? null
+      setSurfaceRejection(rejection)
+      if (rejection) {
+        validRef.current = false
+        setValid(false)
         return
       }
-      const levelId = useViewer.getState().selection.levelId ?? node.parentId
+      if (!boxDimensions && !movableValidityConfig) return
+      if (altRef.current || itemSurfaceMove?.hosted) {
+        const valid = !itemSurfaceMove?.hosted || itemSurfaceMove.valid
+        validRef.current = valid
+        setValid(valid)
+        return
+      }
+      if (parentFrameCollides && frameParent && parentFrame?.isValidPosition) {
+        const candidate = {
+          ...(node as Record<string, unknown>),
+          position: lastCursorRef.current,
+        } as AnyNode
+        const validPosition = parentFrame.isValidPosition({
+          node: candidate,
+          parent: frameParent,
+          position: lastCursorRef.current,
+          nodes: useScene.getState().nodes as Record<string, AnyNode>,
+        })
+        validRef.current = validPosition
+        setValid(validPosition)
+        return
+      }
+      const levelId = currentLevelId()
       if (!levelId) {
         validRef.current = true
         setValid(true)
         return
       }
-      const [x, y, z] = lastCursorRef.current
-      const { valid: placeable } = spatialGridManager.canPlaceOnFloor(
-        levelId,
-        [x, y, z],
-        boxDimensions,
-        [0, rotationRef.current, 0],
-        [node.id],
-      )
-      validRef.current = placeable
-      setValid(placeable)
+      const livePosition = lastCursorRef.current
+      const liveRotation = previewRotationY(rotationRef.current)
+      const floorPlaced = nodeRegistry.get(node.type)?.capabilities?.floorPlaced
+      const effectiveNode = {
+        ...((useScene.getState().nodes[node.id] ?? node) as Record<string, unknown>),
+        position: livePosition,
+        rotation: Array.isArray((node as { rotation?: unknown }).rotation)
+          ? [
+              ((node as { rotation?: unknown }).rotation as [number?, number?, number?])[0] ?? 0,
+              rotationRef.current,
+              ((node as { rotation?: unknown }).rotation as [number?, number?, number?])[2] ?? 0,
+            ]
+          : rotationRef.current,
+      } as AnyNode
+      const footprints = floorPlaced
+        ? getFloorPlacedFootprints(floorPlaced, effectiveNode, { nodes: useScene.getState().nodes })
+        : []
+      const resolvedFootprints: Array<{
+        position: [number, number, number]
+        dimensions: [number, number, number]
+        rotation: [number, number, number]
+      }> = footprints.map((footprint) => ({
+        position: footprint.position ?? livePosition,
+        dimensions: footprint.dimensions,
+        rotation: footprint.rotation,
+      }))
+      const { valid: placeable } =
+        resolvedFootprints.length > 0
+          ? spatialGridManager.canPlaceOnFloorFootprints(levelId, resolvedFootprints, [node.id])
+          : boxDimensions
+            ? spatialGridManager.canPlaceOnFloor(
+                levelId,
+                getVisualPosition(livePosition),
+                boxDimensions,
+                [0, liveRotation, 0],
+                [node.id],
+              )
+            : { valid: true }
+      const kindValid = movableValidityConfig?.isValidPosition
+        ? movableValidityConfig.isValidPosition({
+            node: effectiveNode,
+            position: livePosition,
+            rotation: rotationRef.current,
+            levelId: levelId as AnyNodeId | null,
+            nodes: useScene.getState().nodes as Record<string, AnyNode>,
+          })
+        : true
+      const positionValid = placeable && kindValid
+      validRef.current = positionValid
+      setValid(positionValid)
     }
     recomputeValidity()
 
@@ -372,10 +681,12 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
     // passes through the moved mesh and continues to the grid plane,
     // so `grid:move` keeps firing and the cursor tracks correctly.
     // We restore the original raycast on cleanup.
-    const mesh = sceneRegistry.nodes.get(node.id)
     const restoreRaycasts: Array<() => void> = []
-    if (mesh) {
-      mesh.traverse((child) => {
+    const suppressed = new WeakSet<object>()
+    const suppressRaycasts = () => {
+      sceneRegistry.nodes.get(node.id)?.traverse((child) => {
+        if (suppressed.has(child)) return
+        suppressed.add(child)
         const original = child.raycast
         child.raycast = () => {}
         restoreRaycasts.push(() => {
@@ -383,6 +694,9 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
         })
       })
     }
+    // Reparenting remounts the renderer, so new meshes must also let the cursor ray through.
+    suppressRaycastsRef.current = suppressRaycasts
+    suppressRaycasts()
 
     // Static alignment candidates — anchors of every OTHER alignable object
     // (items, walls, fences, slabs, ceilings, columns) ON THE SAME LEVEL,
@@ -394,7 +708,7 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
     const alignmentCandidates = collectAlignmentAnchors(
       useScene.getState().nodes,
       node.id,
-      useViewer.getState().selection.levelId ?? node.parentId,
+      currentLevelId(),
     )
 
     // Connectivity snapshot (existing port-bearing nodes only — fresh
@@ -407,34 +721,203 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       if (snapshot.connections.length > 0) connectivityRef.current = snapshot
     }
 
+    const applySurfacePose = (pose: { position: [number, number, number]; rotationY: number }) => {
+      lastCursorRef.current = pose.position
+      rotationRef.current = pose.rotationY
+      freeRotationRef.current = pose.rotationY
+      attachmentRotationRef.current = null
+      centeredAfterHost = true
+      dragAnchorRef.current = null
+      hasMovedRef.current = true
+      revealFreshPlacement()
+      setCursorPosition(getVisualPosition(pose.position))
+      setCursorRotationY(previewRotationY(pose.rotationY))
+      useAlignmentGuides.getState().clear()
+      recomputeValidity()
+    }
+    const detachSurface = (
+      worldPosition: [number, number, number],
+      leaveEvent?: NodeEvent<AnyNode>,
+    ) => {
+      const pose = leaveEvent
+        ? itemSurfaceMove?.leave(leaveEvent, rotationRef.current)
+        : itemSurfaceMove?.detach(worldPosition, rotationRef.current)
+      if (!pose) return
+      floorY = 0
+      const pointed = resolvePointerSupportSurface(cameraRef.current, worldPosition)
+      supportCapRef.current = pointed?.elevation ?? null
+      supportSurfaceRef.current = pointed
+      applySurfacePose(pose)
+      applyMeshPose(pose.position)
+    }
+    let lastSurfaceEvent: NodeEvent<AnyNode> | null = null
+    const onItemMove = (event: NodeEvent<AnyNode>) => {
+      if (committed || !resolvedFootprint || !itemSurfaceMove) return
+      lastSurfaceEvent = event
+      const pose = itemSurfaceMove.enter(event, resolvedFootprint, rotationRef.current)
+      if (pose) {
+        applySurfacePose(pose)
+        // Compare floor and host movement in the same plan frame, never host-local storage.
+        const point = new Vector3(...pose.worldPosition)
+        const levelId = currentLevelId()
+        if (levelId) sceneRegistry.nodes.get(levelId)?.worldToLocal(point)
+        movementSfx.tick({
+          coords: [point.x, point.z],
+          gridSnapActive: isGridSnapActive(),
+          gridStep: useEditor.getState().gridSnapStep,
+        })
+      } else {
+        if (
+          itemSurfaceMove.hosted &&
+          (itemSurfaceMove.rejection === 'footprint-outside-surface' ||
+            itemSurfaceMove.rejection === 'footprint-exceeds-host' ||
+            itemSurfaceMove.rejection === 'no-surface')
+        )
+          detachSurface(event.position)
+        recomputeValidity()
+      }
+    }
+    const onItemLeave = (event: NodeEvent<AnyNode>) => {
+      if (!itemSurfaceMove?.hosted || committed) return
+      if (event.node.id !== useScene.getState().nodes[node.id]?.parentId) return
+      event.stopPropagation()
+      detachSurface(event.position, event)
+    }
+
     const onGridMove = (event: GridEvent) => {
-      const rawX = event.localPosition[0]
-      const rawZ = event.localPosition[2]
+      const blocked = Boolean(itemSurfaceMove?.blocksGrid(event, cameraRef.current))
+      if (!committed && !blocked) {
+        itemSurfaceMove?.clearRejectionForGrid(event)
+        detachSurface(event.position)
+      }
+      if (committed || blocked) return
+      // The pointer decides the target surface AND the cursor plan point,
+      // both resolved from the true camera ray in one place. The event's
+      // own hit can't be used directly: its plane rides at the ghost's
+      // last height, so whenever that plane sits on a different storey
+      // than the aimed-at surface the hit XZ is perspective-skewed along
+      // the ray — electing at that skewed point is what made a drag over
+      // a deck-above-a-floor hop between the two surfaces (each hop moved
+      // the plane, which re-skewed the next hit, which flipped the
+      // election back). Cap and XZ from the same ray ∩ pointed-surface
+      // test are plane-height independent, so the elected surface is a
+      // single fixed point per pointer ray.
+      const pointed = resolvePointerSupportSurface(cameraRef.current, event.position)
+      supportCapRef.current = pointed?.elevation ?? null
+      supportSurfaceRef.current = pointed
+      const rawX = pointed?.localPoint?.[0] ?? event.localPosition[0]
+      const rawZ = pointed?.localPoint?.[2] ?? event.localPosition[2]
       revealFreshPlacement()
 
-      const resolved = resolvePlanarCursorPosition({
+      const magnetic = isMagneticSnapActive()
+      const attachmentEnabled = magnetic || isGridSnapActive()
+      const absolute = useAbsoluteCursorPlacement || cursorAttached || centeredAfterHost
+      const centerOffset: [number, number, number] =
+        absolute && dragBounds?.center
+          ? offsetPlanPositionByLocalCenter(
+              [0, 0, 0],
+              dragBounds.center,
+              previewRotationY(freeRotationRef.current),
+            )
+          : [0, 0, 0]
+      let attachmentRotationY: number | null = null
+      const resolved = resolvePrioritizedPlanarCursorPosition({
         cursor: [rawX, rawZ],
-        original: [originalPosition[0], originalPosition[2]],
+        original: [originalPlanPosition[0], originalPlanPosition[2]],
         anchor: dragAnchorRef.current,
-        mode: useAbsoluteCursorPlacement || cursorAttached ? 'absolute' : 'relative',
-        snap: event.nativeEvent?.shiftKey === true ? (value) => value : snapToGridStep,
+        mode: absolute ? 'absolute' : 'relative',
+        localCenter: dragBounds?.center,
+        rotationY: previewRotationY(freeRotationRef.current),
+        // Snap follows the mode (raw in Off via snapToGridStep); Alt = force only.
+        snap: gridSnapPositionConfig ? undefined : snapToGridStep,
+        snapPoint:
+          isGridSnapActive() && gridSnapPositionConfig
+            ? ([planX, planZ]) => {
+                const snappedPosition = gridSnapPositionConfig({
+                  node,
+                  // Kind-owned grid hooks exchange origins and apply their own footprint offsets.
+                  candidatePosition: canonicalPositionFromPlan(
+                    planX - centerOffset[0],
+                    floorY,
+                    planZ - centerOffset[2],
+                  ),
+                  candidateRotation: freeRotationRef.current,
+                  movingIds: [node.id as AnyNodeId],
+                  nodes: useScene.getState().nodes as Record<string, AnyNode>,
+                  levelId: (currentLevelId() as AnyNodeId | null) ?? null,
+                  gridStep: useEditor.getState().gridSnapStep,
+                })
+                const snappedPlanPosition = getVisualPosition(
+                  snappedPosition,
+                  freeRotationRef.current,
+                )
+                return [
+                  snappedPlanPosition[0] + centerOffset[0],
+                  snappedPlanPosition[2] + centerOffset[2],
+                ]
+              }
+            : undefined,
+        resolveAttachment:
+          attachmentEnabled && (groupMoveSnapPoseConfig || groupMoveSnapConfig)
+            ? ([planX, planZ]) => {
+                const snapArgs: Parameters<NonNullable<typeof groupMoveSnapPoseConfig>>[0] = {
+                  node,
+                  candidatePosition: canonicalPositionFromPlan(planX, floorY, planZ),
+                  candidateRotation:
+                    absolute && dragBounds?.center ? freeRotationRef.current : rotationRef.current,
+                  movingIds: [node.id as AnyNodeId],
+                  nodes: useScene.getState().nodes as Record<string, AnyNode>,
+                  levelId: (currentLevelId() as AnyNodeId | null) ?? null,
+                }
+                const snappedPosition: GroupMoveSnapResult | null = groupMoveSnapPoseConfig
+                  ? groupMoveSnapPoseConfig(snapArgs)
+                  : (() => {
+                      const position = groupMoveSnapConfig?.(snapArgs)
+                      return position ? { position } : null
+                    })()
+                if (!snappedPosition) return null
+                attachmentRotationY = snappedPosition.rotation ?? null
+                const snappedPlanPosition = getVisualPosition(
+                  snappedPosition.position,
+                  snappedPosition.rotation ?? rotationRef.current,
+                )
+                return [snappedPlanPosition[0], snappedPlanPosition[2]]
+              }
+            : undefined,
       })
       dragAnchorRef.current = resolved.anchor
       let [x, z] = resolved.point
+      const attachmentSnapped = resolved.attachmentSnapped
+      attachmentRotationRef.current = attachmentSnapped ? attachmentRotationY : null
+      const nextRotationY = resolveAttachmentPreviewRotation(
+        freeRotationRef.current,
+        attachmentRotationRef.current,
+      )
+      if (nextRotationY !== rotationRef.current) {
+        rotationRef.current = nextRotationY
+        setCursorRotationY(previewRotationY(nextRotationY))
+      }
 
       // Figma-style alignment snap layered on top of grid snap: when the
       // moving item's edge lines up (on X or Z) with another item's edge,
-      // snap and publish a guide. The guide connects to the nearest real
-      // corner of the candidate (resolver tie-break), so the dot always sits
-      // on an actual point. Alt bypasses alignment; Shift bypasses all snap.
-      const bypass = event.nativeEvent?.altKey === true || event.nativeEvent?.shiftKey === true
-      if (!bypass && alignmentCandidates.length > 0) {
+      // publish a guide. The guide connects to the nearest real corner of the
+      // candidate (resolver tie-break), so the dot always sits on an actual
+      // point. Alignment "lines" are DISPLAYED in every mode except Off
+      // (isAlignmentGuideActive); the magnetic pull toward them applies only in
+      // 'lines' mode (magnetic). Alt is force-place, not a snap bypass.
+      if (!attachmentSnapped && isAlignmentGuideActive() && alignmentCandidates.length > 0) {
         const result = resolveAlignment({
-          moving: movingFootprintAnchors(node, x, z, rotationRef.current),
+          moving: movingDragBoundsAnchors(
+            node,
+            dragBounds,
+            x,
+            z,
+            previewRotationY(rotationRef.current),
+          ),
           candidates: alignmentCandidates,
           threshold: ALIGNMENT_THRESHOLD_M,
         })
-        if (result.snap) {
+        if (result.snap && magnetic) {
           x += result.snap.dx
           z += result.snap.dz
         }
@@ -446,7 +929,7 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       // Magnetic port snap (duct terminals): mate a collar onto a nearby
       // duct run end. Takes precedence over grid / alignment snap; Alt
       // bypasses. Only kinds that opted in via `movable.portSnap`.
-      if (!bypass && portSnapConfig) {
+      if (magnetic && portSnapConfig) {
         // Build the preview node at the ORIGINAL position but with the LIVE
         // rotation so `def.ports` reflects any mid-drag R/T rotation. Without
         // this the snap solver mates the pre-rotation collar and commit then
@@ -460,7 +943,61 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
         }
       }
 
-      const position: [number, number, number] = [x, originalPosition[1], z]
+      let position = canonicalPositionFromPlan(x, floorY, z)
+      if (
+        !attachmentSnapped &&
+        (magnetic || isGridSnapActive()) &&
+        parentFrame?.magneticSnap &&
+        frameParent
+      ) {
+        const preSnapPosition = position
+        const snappedPosition = parentFrame.magneticSnap(
+          node,
+          frameParent,
+          position,
+          useScene.getState().nodes,
+        )
+        if (
+          snappedPosition[0] !== position[0] ||
+          snappedPosition[1] !== position[1] ||
+          snappedPosition[2] !== position[2]
+        ) {
+          position = snappedPosition
+          const snappedPlanPosition = getVisualPosition(position)
+          x = snappedPlanPosition[0]
+          z = snappedPlanPosition[2]
+        }
+        if (isAlignmentGuideActive() && parentFrame.magneticSnapMatches) {
+          const guides = parentFrame
+            .magneticSnapMatches(
+              node,
+              frameParent,
+              preSnapPosition,
+              snappedPosition,
+              useScene.getState().nodes,
+            )
+            .map(alignmentGuideFromParentFrameMatch)
+          if (guides.length > 0) useAlignmentGuides.getState().set(guides)
+        }
+      }
+      if (!parentFrame && pointed?.sourceNodeId) {
+        const rotation = toCommitRotation(rotationRef.current)
+        const effectiveNode = {
+          ...((useScene.getState().nodes[node.id] ?? node) as Record<string, unknown>),
+          position,
+          rotation,
+        } as AnyNode
+        position = resolveFrozenFloorPlacementPatch(
+          effectiveNode,
+          { ...useScene.getState().nodes, [node.id]: effectiveNode },
+          {
+            position,
+            rotation,
+            elevation: pointed.elevation,
+            preferredSlabId: pointed.supportSlabId,
+          },
+        ).position
+      }
       const visualPosition = getVisualPosition(position)
       hasMovedRef.current = true
       setCursorPosition(visualPosition)
@@ -468,7 +1005,7 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       recomputeValidity()
 
       // Pure imperative: move the mesh via its registered Object3D ref.
-      sceneRegistry.nodes.get(node.id)?.position.set(...visualPosition)
+      applyMeshPose(position)
       // Publish to `useLiveTransforms` so the 2D floor plan can mirror
       // the drag in real-time (the floor-plan layer subscribes to this
       // store and overrides the node's rendered position when an entry
@@ -479,18 +1016,38 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       // the absolute world plan position here. Polygon-based kinds
       // (slab / ceiling / fence) follow a different delta contract —
       // their floor-plan move-targets handle the override themselves.
+      // The pointer surface cap rides along so FloorElevationSystem's
+      // per-frame Y agrees with this tool's preview.
       useLiveTransforms.getState().set(node.id, {
         position,
         rotation: rotationRef.current,
+        supportElevationCap: supportCapRef.current ?? undefined,
       })
+      syncParentFramePreview(position)
       markMovedNodeDirty()
       // Carry connected ductwork along (preview only — committed on drop).
       previewConnectivity(position, rotationRef.current)
 
-      const prev = previousSnapRef.current
-      if (event.nativeEvent?.shiftKey !== true && (!prev || prev[0] !== x || prev[1] !== z)) {
-        sfxEmitter.emit('sfx:grid-snap')
-        previousSnapRef.current = [x, z]
+      const soundStep = {
+        coords: [x, z],
+        gridSnapActive: isGridSnapActive() && !attachmentSnapped,
+        gridStep: useEditor.getState().gridSnapStep,
+      }
+      if (itemSurfaceMove) {
+        movementSfx.schedule(
+          soundStep,
+          () => !itemSurfaceMove.blocksGrid(event, cameraRef.current),
+          true,
+        )
+      } else movementSfx.tick(soundStep, true)
+    }
+
+    const gridDispatch = createItemSurfaceGridDispatch(onGridMove)
+    const receiveGridMove = (event: GridEvent) => {
+      if (itemSurfaceMove?.hosted) gridDispatch.schedule(event)
+      else {
+        gridDispatch.cancel()
+        onGridMove(event)
       }
     }
 
@@ -510,8 +1067,8 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
      *  AND scene updated) — never the original.
      */
     const commitAtCursor = (event: ClickTriggerEvent) => {
-      // One physical click can reach here twice: node clicks (`slab:click`,
-      // `item:click`, …) are synthesized on *pointerup* (`use-node-events`),
+      // One physical click can reach here twice: `node:click` is synthesized
+      // on *pointerup* (`use-node-events`),
       // while `grid:click` rides the browser's native *click* event from a
       // canvas DOM listener (`use-grid-events`) that deliberately ignores
       // stopPropagation — and this effect stays subscribed until React
@@ -519,24 +1076,47 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       // finds the fresh draft already deleted and takes the orphan re-create
       // path below, minting a hidden ghost copy and replaying the SFX.
       if (committed) return
+      gridDispatch.flush()
+      movementSfx.flush()
+      if (itemSurfaceMove?.rejection || (itemSurfaceMove?.hosted && !itemSurfaceMove.valid)) return
       // Ignore a commit that fires before the cursor has moved into place —
       // it's the stray trailing click of whatever armed this move, not a
       // deliberate drop. Prevents preset re-arm from double-placing.
       if (!hasMovedRef.current) return
       // Refuse a drop on an invalid (red) footprint, matching the GLB item
-      // tool — unless Shift is held to force placement. Other kinds carry no
-      // validity box (`validRef` stays true), so they're never blocked.
-      if (!validRef.current && !shiftRef.current) return
+      // tool — unless Alt (free place) is held to force placement. Other kinds
+      // carry no validity box (`validRef` stays true), so they're never blocked.
+      if (!validRef.current && !altRef.current) return
       const position: [number, number, number] = [...lastCursorRef.current]
 
       const rotation = toCommitRotation(rotationRef.current)
-      const visualPosition = getVisualPosition(position)
       let committedId = node.id as AnyNodeId
 
       if (useScene.getState().nodes[node.id]) {
-        const data = {
+        const effectiveNode = {
+          ...((useScene.getState().nodes[node.id] ?? node) as Record<string, unknown>),
           position,
           rotation,
+        } as AnyNode
+        const data = {
+          ...(itemSurfaceMove ? { parentId: effectiveNode.parentId } : {}),
+          position,
+          rotation,
+          // The pointer cap makes the persisted host reproduce the capped
+          // election — a drop under a deck stores the aimed-at lower slab
+          // (or the ground), not the deck hanging above.
+          ...resolveSupportSlabPatch(
+            effectiveNode,
+            {
+              ...useScene.getState().nodes,
+              [node.id]: effectiveNode,
+            },
+            {
+              maxElevation: supportCapRef.current,
+              preferredSlabId: supportSurfaceRef.current?.supportSlabId,
+              pinSupport: supportSurfaceRef.current?.sourceNodeId != null,
+            },
+          ),
           ...(isNew
             ? {
                 metadata: stripPlacementMetadataFlags(node.metadata),
@@ -546,11 +1126,13 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
         } as Partial<AnyNode>
 
         if (isNew) {
-          const finalId = commitFreshPlacementSubtree(node.id as AnyNodeId, data)
-          if (finalId) {
-            committed = true
-            committedId = finalId
-          }
+          const finalId = commitFreshPlacementSubtree(node.id as AnyNodeId, data, (reason) => {
+            setSurfaceRejection(reason)
+            setValid(false)
+          })
+          if (!finalId) return
+          committed = true
+          committedId = finalId
         } else {
           // Fold the connected-ductwork follow-updates into the SAME
           // batch as the moved node so the whole thing is one undo step.
@@ -560,10 +1142,36 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
                 buildPreviewNode(position, rotationRef.current),
               ).filter((u) => useScene.getState().nodes[u.id])
             : []
+          const surfaceId = surfaceAttachmentId(effectiveNode)
+          itemSurfaceMove?.restore()
           useScene.temporal.getState().resume()
           useScene
             .getState()
-            .updateNodes([{ id: node.id as AnyNodeId, data }, ...connectivityUpdates])
+            .updateNodes([
+              { id: node.id as AnyNodeId, data },
+              ...surfaceAttachmentUpdates(node.id, effectiveNode.parentId, surfaceId),
+              ...connectivityUpdates,
+            ])
+          // Kind-owned derived-state maintenance after a parent-frame move
+          // (cabinet run re-flow + linked corner-run re-anchor). Runs in the
+          // resumed window so its writes are undoable alongside the move.
+          if (parentFrame?.onCommit && frameParent) {
+            const liveNode = useScene.getState().nodes[node.id as AnyNodeId]
+            const liveParent = useScene.getState().nodes[frameParent.id as AnyNodeId]
+            if (liveNode && liveParent) {
+              parentFrame.onCommit(liveNode, liveParent, createSceneApi(useScene))
+              const committedNodes = useScene.getState().nodes
+              const committedParent = committedNodes[frameParent.id as AnyNodeId]
+              if (committedParent) {
+                useScene
+                  .getState()
+                  .updateNode(
+                    committedParent.id,
+                    resolveSupportSlabPatch(committedParent, committedNodes),
+                  )
+              }
+            }
+          }
           useScene.temporal.getState().pause()
           committed = true
         }
@@ -577,9 +1185,25 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
             metadata: {},
             position,
             rotation,
-          })
+          }) as AnyNode
+          const committedNode = def.schema.parse({
+            ...reparsed,
+            parentId: node.parentId,
+            ...resolveSupportSlabPatch(
+              { ...reparsed, parentId: node.parentId } as AnyNode,
+              {
+                ...useScene.getState().nodes,
+                [reparsed.id]: reparsed,
+              },
+              {
+                maxElevation: supportCapRef.current,
+                preferredSlabId: supportSurfaceRef.current?.supportSlabId,
+                pinSupport: supportSurfaceRef.current?.sourceNodeId != null,
+              },
+            ),
+          }) as AnyNode
           useScene.temporal.getState().resume()
-          useScene.getState().createNode(reparsed as AnyNode, node.parentId as AnyNodeId)
+          useScene.getState().createNode(committedNode, node.parentId as AnyNodeId)
           useScene.temporal.getState().pause()
           committed = true
         }
@@ -592,11 +1216,8 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       // Connected ductwork is now committed to the store — drop its live
       // overrides so the renderers read the canonical path/position.
       clearConnectivityOverrides()
-      const mesh = sceneRegistry.nodes.get(node.id)
-      if (mesh) {
-        mesh.position.set(...visualPosition)
-        mesh.rotation.y = rotationRef.current
-      }
+      clearParentFramePreview()
+      applyMeshPose(position)
 
       useAlignmentGuides.getState().clear()
       if (isNew && committed) {
@@ -624,10 +1245,10 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
     // item placement keys (and the "Rotate" hints the move HUD shows). Applied
     // imperatively + mirrored to the live transform; committed on drop.
     const onKeyDown = (e: KeyboardEvent) => {
-      // Hold Shift to force placement on an invalid (red) footprint, matching
-      // the GLB item tool. Recolour the box to green while held.
-      if (e.key === 'Shift') {
-        shiftRef.current = true
+      // Hold Alt (free place) to force placement on an invalid (red) footprint,
+      // matching the GLB item tool. Recolour the box to green while held.
+      if (e.key === 'Alt') {
+        altRef.current = true
         recomputeValidity()
         return
       }
@@ -637,37 +1258,74 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       else if (e.key === 't' || e.key === 'T') delta = -ROTATION_STEP
       else return
       e.preventDefault()
+      const nextFreeRotation = resolveMoveRotationStep(
+        freeRotationRef.current,
+        delta,
+        attachmentRotationRef.current,
+      )
+      if (nextFreeRotation === null) return
       sfxEmitter.emit('sfx:item-rotate')
-      rotationRef.current += delta
-      setCursorRotationY(rotationRef.current)
-      const position = lastCursorRef.current
+      const hostedPose = itemSurfaceMove?.rotate(nextFreeRotation)
+      let position = hostedPose?.position ?? lastCursorRef.current
+      if (
+        !hostedPose &&
+        hasMovedRef.current &&
+        (useAbsoluteCursorPlacement || cursorAttached) &&
+        dragBounds?.center
+      ) {
+        const planCenter = offsetPlanPositionByLocalCenter(
+          getVisualPosition(position),
+          dragBounds.center,
+          previewRotationY(rotationRef.current),
+        )
+        const planOrigin = offsetPlanPositionByLocalCenter(
+          planCenter,
+          [-dragBounds.center[0], 0, -dragBounds.center[2]],
+          previewRotationY(nextFreeRotation),
+        )
+        position = canonicalPositionFromPlan(planOrigin[0], position[1], planOrigin[2])
+      }
+      lastCursorRef.current = position
+      freeRotationRef.current = hostedPose?.rotationY ?? nextFreeRotation
+      rotationRef.current = freeRotationRef.current
+      setCursorRotationY(previewRotationY(rotationRef.current))
       const visualPosition = getVisualPosition(position)
       setCursorPosition(visualPosition)
-      const m = sceneRegistry.nodes.get(node.id)
-      if (m) {
-        m.position.set(...visualPosition)
-        m.rotation.y = rotationRef.current
-      }
-      useLiveTransforms.getState().set(node.id, {
-        position,
-        rotation: rotationRef.current,
-      })
+      applyMeshPose(position)
+      if (!itemSurfaceMove?.hosted)
+        useLiveTransforms.getState().set(node.id, {
+          position,
+          rotation: rotationRef.current,
+          supportElevationCap: supportCapRef.current ?? undefined,
+        })
+      syncParentFramePreview(position)
       markMovedNodeDirty()
       // Rotating the fitting swings its collars — connected ducts follow.
       previewConnectivity(position, rotationRef.current)
       // Rotation changes the footprint's collision span — re-check validity.
-      recomputeValidity()
+      if (!itemSurfaceMove?.hosted && itemSurfaceMove?.rejection && lastSurfaceEvent)
+        onItemMove(lastSurfaceEvent)
+      else recomputeValidity()
     }
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Shift') {
-        shiftRef.current = false
+      if (e.key === 'Alt') {
+        altRef.current = false
         recomputeValidity()
       }
     }
     window.addEventListener('keydown', onKeyDown)
     window.addEventListener('keyup', onKeyUp)
 
-    emitter.on('grid:move', onGridMove)
+    const surfaceKinds = Array.from(nodeRegistry.entries(), ([kind]) => kind).filter(
+      (kind) => !NON_PHYSICAL_HOST_KINDS.includes(kind),
+    )
+    for (const kind of surfaceKinds) {
+      emitter.on(`${kind}:enter` as never, onItemMove)
+      emitter.on(`${kind}:move` as never, onItemMove)
+      emitter.on(`${kind}:leave` as never, onItemLeave)
+      emitter.on(`${kind}:click` as never, commitAtCursor)
+    }
+    emitter.on('grid:move', receiveGridMove)
     emitter.on('grid:click', commitAtCursor)
 
     const onPlacementDragPointerUp = (event: PointerEvent) => {
@@ -685,27 +1343,20 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
     }
     window.addEventListener('pointerup', onPlacementDragPointerUp)
 
-    // Listen on every common kind's click event too. mitt's typing keeps
-    // `${kind}:click` as a fixed union so the cast is safe at runtime —
-    // we're just routing them through the shared commit path.
-    type SuffixedKey<K extends string> = `${K}:${EventSuffix}`
-    type ClickKey = SuffixedKey<(typeof CLICK_TRIGGER_KINDS)[number]>
-    for (const kind of CLICK_TRIGGER_KINDS) {
-      const key = `${kind}:click` as ClickKey
-      emitter.on(key, commitAtCursor as never)
-    }
+    emitter.on('node:click', commitAtCursor)
 
     const onCancel = () => {
+      movementSfx.cancel()
+      gridDispatch.cancel()
       useLiveTransforms.getState().clear(node.id)
       clearConnectivityOverrides()
+      clearParentFramePreview()
       if (isNew) {
-        useScene.getState().deleteNode(node.id as AnyNodeId)
+        updateSurfaceNode(node.id, {}, null)
+        if (!ownsSubtree) useScene.getState().deleteNode(node.id)
       } else {
-        const m = sceneRegistry.nodes.get(node.id)
-        if (m) {
-          m.position.set(...getVisualPosition(originalPosition, originalRotationY))
-          m.rotation.y = originalRotationY
-        }
+        itemSurfaceMove?.restore()
+        applyMeshPose(originalPosition, originalRotationY)
         markMovedNodeDirty()
       }
       useAlignmentGuides.getState().clear()
@@ -716,15 +1367,21 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
     emitter.on('tool:cancel', onCancel)
 
     return () => {
+      movementSfx.cancel()
+      gridDispatch.cancel()
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
-      emitter.off('grid:move', onGridMove)
+      suppressRaycastsRef.current = null
+      for (const kind of surfaceKinds) {
+        emitter.off(`${kind}:enter` as never, onItemMove)
+        emitter.off(`${kind}:move` as never, onItemMove)
+        emitter.off(`${kind}:leave` as never, onItemLeave)
+        emitter.off(`${kind}:click` as never, commitAtCursor)
+      }
+      emitter.off('grid:move', receiveGridMove)
       emitter.off('grid:click', commitAtCursor)
       window.removeEventListener('pointerup', onPlacementDragPointerUp)
-      for (const kind of CLICK_TRIGGER_KINDS) {
-        const key = `${kind}:click` as ClickKey
-        emitter.off(key, commitAtCursor as never)
-      }
+      emitter.off('node:click', commitAtCursor)
       emitter.off('tool:cancel', onCancel)
       // Restore the moved meshes' raycast so they're hoverable / selectable
       // again after the drag ends.
@@ -733,64 +1390,101 @@ export function MoveRegistryNodeTool({ node }: { node: AnyNode }) {
       // unmount / commit paths uniformly.
       useAlignmentGuides.getState().clear()
       const finalisedBy2D = useEditor.getState().movingNodeOrigin === '2d'
-      if (!(committed || isNew || finalisedBy2D)) {
+      if (!committed && !finalisedBy2D && (!isNew || (!ownsSubtree && itemSurfaceMove))) {
         useLiveTransforms.getState().clear(node.id)
         clearConnectivityOverrides()
-        sceneRegistry.nodes
-          .get(node.id)
-          ?.position.set(...getVisualPosition(originalPosition, originalRotationY))
+        clearParentFramePreview()
+        itemSurfaceMove?.restore()
+        applyMeshPose(originalPosition, originalRotationY)
         markMovedNodeDirty()
       }
       useScene.temporal.getState().resume()
     }
   }, [
     boxDimensions,
+    resolvedFootprint,
+    itemSurfaceMove,
+    dragBounds,
+    canonicalPositionFromPlan,
+    parentFrame,
+    frameParent,
+    parentFrameCollides,
     cursorAttached,
     portSnapConfig,
+    groupMoveSnapConfig,
+    groupMoveSnapPoseConfig,
+    movableValidityConfig,
+    gridSnapPositionConfig,
     exitMoveMode,
     isFreshPlacement,
     node,
     originalPosition,
+    originalPlanPosition,
     originalRotationY,
+    previewRotationY,
     revealFreshPlacement,
     useAbsoluteCursorPlacement,
+    visualPositionFor,
   ])
 
-  // Snapshot the scene once at drag-start — bounds depend on `node` (locked
-  // for the lifetime of this tool) and any sibling state the kind reads. If a
-  // future kind needs live sibling state mid-drag, switch to a subscribed
-  // selector; for v1 (elevator shaft height from level set) start-time is
-  // correct and avoids subscribing the whole `nodes` map.
-  const dragBounds = useMemo(
-    () =>
-      nodeRegistry.get(node.type)?.capabilities?.dragBounds?.(node, useScene.getState().nodes) ??
-      null,
-    [node],
-  )
+  // Forward-facing triangle for the footprint-box branch (item / shelf / column
+  // — anything that renders `<PlacementBox>`). Published to the editor-side
+  // overlay; the `<DragBoundingBox>` branch (e.g. stair, which has no centred
+  // footprint) publishes its own. The box is centred on `cursorPosition`, so
+  // the footprint centre is the origin. Clears on unmount.
+  const facing = resolveFacingIndicator(node.type)
+  useEffect(() => {
+    if (!previewVisible || !facing || !boxDimensions) return
+    useFacingPose.getState().set({
+      position: cursorPosition,
+      rotationY: cursorRotationY,
+      depth: boxDimensions[2],
+      center: dragBounds?.center ? [dragBounds.center[0], dragBounds.center[2]] : undefined,
+      reversed: facing.reversed,
+    })
+  }, [previewVisible, facing, boxDimensions, dragBounds, cursorPosition, cursorRotationY])
+  useEffect(() => () => useFacingPose.getState().clear(), [])
 
   if (!previewVisible) return null
 
-  if (boxDimensions) {
+  if (boxDimensions && !dragBounds?.center) {
     return (
-      <PlacementBox
-        dimensions={boxDimensions}
-        position={cursorPosition}
-        rotationY={cursorRotationY}
-        valid={valid}
-      />
+      <group ref={previewGroupRef}>
+        <PlacementBox
+          dimensions={boxDimensions}
+          position={cursorPosition}
+          rotationY={cursorRotationY}
+          valid={valid}
+        />
+      </group>
     )
   }
 
+  const dragCenterPosition =
+    dragBounds?.center && dragBounds.size
+      ? offsetPlanPositionByLocalCenter(cursorPosition, dragBounds.center, cursorRotationY)
+      : cursorPosition
+
   return (
-    <>
-      <CursorSphere color="#a78bfa" height={2.5} position={cursorPosition} />
+    <group ref={previewGroupRef}>
+      <CursorSphere color="#a78bfa" height={2.5} position={dragCenterPosition} />
       <DragBoundingBox
+        center={dragBounds?.center}
         centerY={dragBounds?.centerY}
+        color={
+          surfaceRejection
+            ? INVALID_COLOR
+            : boxDimensions
+              ? valid
+                ? VALID_COLOR
+                : INVALID_COLOR
+              : undefined
+        }
         nodeId={node.id}
         position={cursorPosition}
         rotationY={cursorRotationY}
         size={dragBounds?.size}
       />
-    </>
+    </group>
   )
 }

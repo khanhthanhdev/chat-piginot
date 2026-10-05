@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { AnyNode, AnyNodeId } from '@pascal-app/core/schema'
 import { z } from 'zod'
 import type { SceneOperations } from '../operations'
+import { READ_ONLY_TOOL_ANNOTATIONS } from './annotations'
 import { ErrorCode, throwMcpError } from './errors'
 import { NodeIdSchema } from './schemas'
 
@@ -14,6 +15,7 @@ export const measureOutput = {
   distanceMeters: z.number(),
   areaSqMeters: z.number().optional(),
   units: z.literal('meters'),
+  areaUnits: z.literal('square_meters').optional(),
 }
 
 /**
@@ -90,9 +92,10 @@ export function registerMeasure(server: McpServer, bridge: SceneOperations): voi
     {
       title: 'Measure',
       description:
-        'Measure distance (in meters) between two nodes, or the area of a polygon node when fromId === toId.',
+        'Measure distance (in meters) between two nodes, or the net area of a polygon node when fromId === toId.',
       inputSchema: measureInput,
       outputSchema: measureOutput,
+      annotations: READ_ONLY_TOOL_ANNOTATIONS,
     },
     async ({ fromId, toId }) => {
       const from = bridge.getNode(fromId as AnyNodeId)
@@ -108,11 +111,16 @@ export function registerMeasure(server: McpServer, bridge: SceneOperations): voi
       if (fromId === toId) {
         const n = from as AnyNode
         if (n.type === 'zone' || n.type === 'slab' || n.type === 'ceiling') {
-          const area = shoelaceArea(n.polygon as Array<[number, number]>)
+          const holes = n.type === 'zone' ? [] : n.holes
+          const holeArea = Array.isArray(holes)
+            ? holes.reduce((sum, hole) => sum + shoelaceArea(hole), 0)
+            : 0
+          const area = Math.max(0, shoelaceArea(n.polygon) - holeArea)
           const payload = {
             distanceMeters: 0,
             areaSqMeters: area,
             units: 'meters' as const,
+            areaUnits: 'square_meters' as const,
           }
           return {
             content: [{ type: 'text' as const, text: JSON.stringify(payload) }],

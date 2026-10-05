@@ -1,151 +1,72 @@
 import { type AnyNodeId, emitter, sceneRegistry, useScene, type WallNode } from '@pascal-app/core'
 import { useFrame } from '@react-three/fiber'
-import { useEffect, useRef } from 'react'
-import type { Material } from 'three'
+import { useEffect, useMemo } from 'react'
+import type { Camera, Material } from 'three'
 import { type Mesh, Vector3 } from 'three/webgpu'
-import useViewer from '../../store/use-viewer'
-import { getMaterialsForWall, getSelectionHighlightMaterials } from './wall-materials'
+import useViewer, { type WallMode } from '../../store/use-viewer'
+import {
+  sameMaterialArray,
+  WallCutoutCache,
+  type WallCutoutViewerStore,
+  wallHiddenFromFacing,
+} from './wall-cutout-cache'
+import {
+  getMaterialsForWall,
+  getSelectionHighlightMaterials,
+  type WallMaterialsResolver,
+} from './wall-materials'
+import { subscribeWallRebuilds } from './wall-rebuild-notifications'
 
-const tmpVec = new Vector3()
-const u = new Vector3()
 const v = new Vector3()
 
-function getWallHideState(
+export const WALL_CUTOUT_FRAME_PRIORITY = 0
+
+export function runWallCutoutFrame(
+  cache: WallCutoutCache,
+  { camera, clock }: { camera: Camera; clock: { elapsedTime: number } },
+) {
+  cache.update(camera, clock.elapsedTime)
+}
+
+/**
+ * Whether a wall should be hidden or see-through for the current camera and
+ * wall mode. Pure: reads only its arguments and the mesh's world direction.
+ *
+ * Exported so hosts rendering their own layers inside `<Viewer>` can match
+ * these semantics instead of re-deriving the facing test or inferring state
+ * from the assigned material variant.
+ */
+export function getWallHideState(
   wallNode: WallNode,
   wallMesh: Mesh,
-  wallMode: string,
+  wallMode: WallMode,
   cameraDir: Vector3,
 ): boolean {
-  let hideWall = wallNode.frontSide === 'interior' && wallNode.backSide === 'interior'
-
-  if (wallMode === 'up') {
-    hideWall = false
-  } else if (wallMode === 'down') {
-    hideWall = true
-  } else {
-    wallMesh.getWorldDirection(v)
-    if (v.dot(cameraDir) < 0) {
-      if (wallNode.frontSide === 'exterior' && wallNode.backSide !== 'exterior') {
-        hideWall = true
-      }
-    } else if (wallNode.backSide === 'exterior' && wallNode.frontSide !== 'exterior') {
-      hideWall = true
-    }
-  }
-
-  return hideWall
+  if (wallMode === 'up') return false
+  if (wallMode === 'down') return true
+  wallMesh.getWorldDirection(v)
+  return wallHiddenFromFacing(wallNode, wallMode, v.dot(cameraDir) < 0)
 }
 
-function sameMaterialArray(a: Material | Material[], b: Material[]): boolean {
-  return Array.isArray(a) && a.length === b.length && a.every((material, i) => material === b[i])
-}
+export const WallCutout = ({
+  viewerStore = useViewer,
+  materialResolver = getMaterialsForWall,
+}: {
+  viewerStore?: WallCutoutViewerStore
+  materialResolver?: WallMaterialsResolver
+}) => {
+  const cache = useMemo(
+    () => new WallCutoutCache(viewerStore, materialResolver),
+    [viewerStore, materialResolver],
+  )
 
-export const WallCutout = () => {
-  const lastCameraPosition = useRef(new Vector3())
-  const lastCameraTarget = useRef(new Vector3())
-  const lastUpdateTime = useRef(0)
-  const lastWallMode = useRef<string>(useViewer.getState().wallMode)
-  const lastShading = useRef(useViewer.getState().shading)
-  const lastNumberOfWalls = useRef(0)
-  const lastHighlightKey = useRef('')
-  const lastTextures = useRef(useViewer.getState().textures)
-  const lastColorPreset = useRef(useViewer.getState().colorPreset)
-  const lastSceneTheme = useRef(useViewer.getState().sceneTheme)
+  useEffect(() => subscribeWallRebuilds((id) => cache.rebuilt.add(id)), [cache])
 
-  useFrame(({ camera, clock }) => {
-    const wallMode = useViewer.getState().wallMode
-    const shading = useViewer.getState().shading
-    const textures = useViewer.getState().textures
-    const colorPreset = useViewer.getState().colorPreset
-    const sceneTheme = useViewer.getState().sceneTheme
-    const selectedIds = useViewer.getState().selection.selectedIds
-    const previewSelectedIds = useViewer.getState().previewSelectedIds
-    const hoveredId = useViewer.getState().hoveredId
-    const hoverHighlightMode = useViewer.getState().hoverHighlightMode
-    const currentTime = clock.elapsedTime
-    const currentCameraPosition = camera.position
-    camera.getWorldDirection(tmpVec)
-    tmpVec.add(currentCameraPosition)
-    const highlightedWallIds = new Set(
-      [...selectedIds, ...previewSelectedIds].filter(
-        (id) => useScene.getState().nodes[id as AnyNodeId]?.type === 'wall',
-      ),
-    )
-    const deleteHoveredWallId =
-      hoverHighlightMode === 'delete' &&
-      hoveredId &&
-      useScene.getState().nodes[hoveredId as AnyNodeId]?.type === 'wall'
-        ? hoveredId
-        : null
-    const highlightKey = `${Array.from(highlightedWallIds).sort().join('|')}::${deleteHoveredWallId ?? ''}`
+  useEffect(() => cache.subscribeLiveTransforms(), [cache])
 
-    const distanceMoved = currentCameraPosition.distanceTo(lastCameraPosition.current)
-    const directionChanged = tmpVec.distanceTo(lastCameraTarget.current)
-    const timeSinceUpdate = currentTime - lastUpdateTime.current
-
-    if (
-      ((distanceMoved > 0.5 || directionChanged > 0.3) && timeSinceUpdate > 0.1) ||
-      lastWallMode.current !== wallMode ||
-      lastShading.current !== shading ||
-      lastTextures.current !== textures ||
-      lastColorPreset.current !== colorPreset ||
-      lastSceneTheme.current !== sceneTheme ||
-      sceneRegistry.byType.wall!.size !== lastNumberOfWalls.current ||
-      lastHighlightKey.current !== highlightKey
-    ) {
-      lastCameraPosition.current.copy(currentCameraPosition)
-      lastCameraTarget.current.copy(tmpVec)
-      lastUpdateTime.current = currentTime
-      camera.getWorldDirection(u)
-
-      const walls = sceneRegistry.byType.wall!
-      walls.forEach((wallId) => {
-        const wallMesh = sceneRegistry.nodes.get(wallId)
-        if (!wallMesh) return
-        const wallNode = useScene.getState().nodes[wallId as WallNode['id']]
-        if (wallNode?.type !== 'wall') return
-
-        const hideWall = getWallHideState(wallNode, wallMesh as Mesh, wallMode, u)
-        const isDeleteHighlighted = deleteHoveredWallId === wallId
-        const isSelectionHighlighted = !isDeleteHighlighted && highlightedWallIds.has(wallId)
-        const materials = getMaterialsForWall(
-          wallNode,
-          shading,
-          textures,
-          colorPreset,
-          sceneTheme,
-          useScene.getState().materials,
-        )
-
-        if (wallMode === 'translucent') {
-          ;(wallMesh as Mesh).material = isDeleteHighlighted
-            ? materials.deleteTranslucent
-            : isSelectionHighlighted
-              ? getSelectionHighlightMaterials(materials.translucent)
-              : materials.translucent
-        } else if (hideWall) {
-          ;(wallMesh as Mesh).material = isDeleteHighlighted
-            ? materials.deleteInvisible
-            : isSelectionHighlighted
-              ? getSelectionHighlightMaterials(materials.invisible)
-              : materials.invisible
-        } else {
-          ;(wallMesh as Mesh).material = isDeleteHighlighted
-            ? materials.deleteVisible
-            : isSelectionHighlighted
-              ? getSelectionHighlightMaterials(materials.visible)
-              : materials.visible
-        }
-      })
-      lastWallMode.current = wallMode
-      lastShading.current = shading
-      lastTextures.current = textures
-      lastColorPreset.current = colorPreset
-      lastSceneTheme.current = sceneTheme
-      lastNumberOfWalls.current = sceneRegistry.byType.wall!.size
-      lastHighlightKey.current = highlightKey
-    }
-  })
+  // Camera changes reach PostProcessing (1) in this frame. WallSystem (4)
+  // notifies the next frame; WallBatchSystem (5) reads this frame's stamps.
+  useFrame((state) => runWallCutoutFrame(cache, state), WALL_CUTOUT_FRAME_PRIORITY)
 
   useEffect(() => {
     const snapshot = new Map<Mesh, Material | Material[]>()
@@ -156,12 +77,12 @@ export const WallCutout = () => {
         if (!wallMesh) return
         const wallNode = useScene.getState().nodes[wallId as AnyNodeId] as WallNode | undefined
         if (wallNode?.type !== 'wall') return
-        const mats = getMaterialsForWall(
+        const mats = materialResolver(
           wallNode,
-          useViewer.getState().shading,
-          useViewer.getState().textures,
-          useViewer.getState().colorPreset,
-          useViewer.getState().sceneTheme,
+          viewerStore.getState().shading,
+          viewerStore.getState().textures,
+          viewerStore.getState().colorPreset,
+          viewerStore.getState().sceneTheme,
           useScene.getState().materials,
         )
         const current = wallMesh.material as Material | Material[]
@@ -192,7 +113,7 @@ export const WallCutout = () => {
       emitter.off('thumbnail:before-capture', restoreForCapture)
       emitter.off('thumbnail:after-capture', reapplyAfterCapture)
     }
-  }, [])
+  }, [viewerStore, materialResolver])
 
   return null
 }

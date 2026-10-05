@@ -25,9 +25,23 @@ export type WallDraftSnapResult = {
    * the "magnetic" snap the beacon visualises; `null` for grid/angle-only.
    */
   snap: WallDraftSnapKind | null
+  /**
+   * Walls whose geometry produced the snap. Kept separate from `snap` so a
+   * caller can use geometry for XZ alignment while independently deciding
+   * whether the target is allowed to transfer its construction plane.
+   */
+  targetWallIds: string[]
 }
 
 export const WALL_JOIN_SNAP_RADIUS = 0.35
+// Tight capture radius for the connectivity snap that runs in NON-magnetic modes
+// (grid / off / angles). Joining an existing wall is treated as connectivity —
+// separate from the 'lines' magnetic alignment — so a room can still close in
+// those modes: within this distance of a wall the endpoint sticks onto it (and
+// the beacon shows); beyond it, positioning is left to the mode. Kept small so
+// only the last few cm near a wall stick, well above the room-detection junction
+// tolerance so a captured endpoint always registers as connected.
+export const WALL_CONNECT_SNAP_RADIUS = 0.05
 // Generous radius for snapping to an *existing* wall's endpoint while
 // drafting. Larger than `WALL_JOIN_SNAP_RADIUS` because endpoint snap
 // is the strongest user intent (closing a polygon, attaching to a
@@ -108,6 +122,53 @@ export function findWallSnapTarget(
   }
 
   return bestTarget
+}
+
+/**
+ * Wall ids that contain an already-resolved snap point.
+ *
+ * This is provenance, not another snap pass: the tolerance only absorbs float
+ * drift around a point the snap pipeline already chose.
+ */
+export function wallIdsAtSnapPoint(
+  point: WallPlanPoint,
+  walls: WallNode[],
+  ignoreWallIds?: string[],
+  tolerance = 1e-6,
+): string[] {
+  const ignored = new Set(ignoreWallIds ?? [])
+  const toleranceSquared = tolerance * tolerance
+  const ids: string[] = []
+
+  for (const wall of walls) {
+    if (ignored.has(wall.id)) continue
+    if (
+      distanceSquared(point, wall.start) <= toleranceSquared ||
+      distanceSquared(point, wall.end) <= toleranceSquared
+    ) {
+      ids.push(wall.id)
+      continue
+    }
+
+    if (isCurvedWall(wall)) {
+      const sampleCount = Math.max(8, Math.ceil(getWallCurveLength(wall) / 0.3))
+      for (let index = 1; index < sampleCount; index += 1) {
+        const frame = getWallCurveFrameAt(wall, index / sampleCount)
+        if (distanceSquared(point, [frame.point.x, frame.point.y]) <= toleranceSquared) {
+          ids.push(wall.id)
+          break
+        }
+      }
+      continue
+    }
+
+    const projected = projectPointOntoWall(point, wall)
+    if (projected && distanceSquared(point, projected) <= toleranceSquared) {
+      ids.push(wall.id)
+    }
+  }
+
+  return ids
 }
 
 /**
@@ -251,6 +312,53 @@ function nearestCandidate(
   return best
 }
 
+// Tolerance for "the committed endpoint actually lies on existing wall
+// geometry". Commit-time resolution (corner join, connect snap, split) puts
+// the endpoint exactly on the geometry, so this only needs to absorb float
+// drift — it is NOT a snap radius.
+export const WALL_CHAIN_JOIN_TOLERANCE = 1e-3
+
+/**
+ * True when a committed chain segment's resolved `end` lies on wall geometry
+ * (an endpoint, or a straight wall's interior) of a wall outside the current
+ * draft chain. The wall tools stop chaining there: a segment that tees into
+ * the existing network is a termination — continuing would draft the next
+ * segment on top of existing walls. `chainWallIds` excludes the chain's own
+ * segments (including the just-committed one) so edge/midpoint snaps onto a
+ * previous own segment don't read as a join. Curved wall interiors are
+ * skipped (their endpoints still count) — resolving an end onto a curve body
+ * is rare and continuing there matches the previous behaviour.
+ */
+export function chainEndJoinsExistingWall(
+  end: WallPlanPoint,
+  walls: WallNode[],
+  chainWallIds: string[],
+  tolerance = WALL_CHAIN_JOIN_TOLERANCE,
+): boolean {
+  const ignored = new Set(chainWallIds)
+  const toleranceSquared = tolerance * tolerance
+
+  for (const wall of walls) {
+    if (ignored.has(wall.id)) continue
+
+    if (
+      distanceSquared(end, wall.start) <= toleranceSquared ||
+      distanceSquared(end, wall.end) <= toleranceSquared
+    ) {
+      return true
+    }
+
+    if (isCurvedWall(wall)) continue
+
+    const projected = projectPointOntoWall(end, wall)
+    if (projected && distanceSquared(end, projected) <= toleranceSquared) {
+      return true
+    }
+  }
+
+  return false
+}
+
 /**
  * Discrete "special point" snap from the raw cursor, in priority order:
  *   1. corners (endpoints) — strongest intent, largest radius
@@ -265,12 +373,26 @@ export function findWallSpecialPointSnap(
   radii?: WallSnapRadii,
 ): WallDraftSnapResult | null {
   const endpoint = findWallEndpointFromRaw(point, walls, ignoreWallIds, radii?.endpoint)
-  if (endpoint) return { point: endpoint, snap: 'endpoint' }
+  if (endpoint) {
+    return {
+      point: endpoint,
+      snap: 'endpoint',
+      targetWallIds: wallIdsAtSnapPoint(endpoint, walls, ignoreWallIds),
+    }
+  }
 
   const midpoint = findWallMidpointFromRaw(point, walls, ignoreWallIds, radii?.midpoint)
   const intersection = findWallIntersectionFromRaw(point, walls, ignoreWallIds, radii?.intersection)
   return nearestCandidate(point, [
-    midpoint && { point: midpoint, snap: 'midpoint' },
-    intersection && { point: intersection, snap: 'intersection' },
+    midpoint && {
+      point: midpoint,
+      snap: 'midpoint',
+      targetWallIds: wallIdsAtSnapPoint(midpoint, walls, ignoreWallIds),
+    },
+    intersection && {
+      point: intersection,
+      snap: 'intersection',
+      targetWallIds: wallIdsAtSnapPoint(intersection, walls, ignoreWallIds),
+    },
   ])
 }

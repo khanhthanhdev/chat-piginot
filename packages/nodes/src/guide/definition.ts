@@ -10,6 +10,9 @@ import { GuideNode } from './schema'
  */
 export const guideDefinition: NodeDefinition<typeof GuideNode> = {
   kind: 'guide',
+  // Floorplan image reference: stripped from the bake, re-added live from
+  // scene_graph in the viewer (see plans → Part D; glb-reference-nodes.tsx).
+  bake: 'strip',
   schemaVersion: 1,
   schema: GuideNode,
   category: 'site',
@@ -33,6 +36,7 @@ export const guideDefinition: NodeDefinition<typeof GuideNode> = {
   // No dirty consumer rebuilds this kind — see NodeDefinition.dirtyTracking.
   dirtyTracking: false,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),

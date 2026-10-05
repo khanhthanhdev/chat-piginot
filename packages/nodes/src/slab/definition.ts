@@ -1,12 +1,36 @@
 import {
+  type AnyNode,
+  type AnyNodeId,
   type HandleDescriptor,
+  MIN_SLAB_THICKNESS,
+  markSlabChangeDependents,
   type NodeDefinition,
   pointInPolygon2D,
+  type SceneApi,
   type SlabNode as SlabNodeType,
+  syncStairRises,
 } from '@pascal-app/core'
+import {
+  clearStructuralElevationGuide,
+  DRAFTING_SURFACE_EXTENSION_KEY,
+  type DraftingSurfaceExtension,
+  type FloorplanNodeExtension,
+  publishStructuralElevationGuide,
+  resolveStructuralElevationSnap,
+} from '@pascal-app/editor'
+import { polygonMeasurementFeatures } from '../shared/polygon-measurement'
+import { sameOutlineSurfaceCounterparts } from '../shared/surface-counterparts'
+import {
+  applySlabBaseElevationChange,
+  applySlabThicknessChange,
+  applySlabTopChange,
+  getSlabBaseElevation,
+  slabElevationUpperBound,
+} from './elevation-limit'
 import { buildSlabFloorplan } from './floorplan'
 import {
   slabAddVertexAffordance,
+  slabDeleteVertexAffordance,
   slabMoveEdgeAffordance,
   slabMoveVertexAffordance,
 } from './floorplan-affordances'
@@ -14,11 +38,12 @@ import { slabFloorplanMoveTarget } from './floorplan-move'
 import { buildSlabGeometry } from './geometry'
 import { slabPaint } from './paint'
 import { slabParametrics } from './parametrics'
+import { slabQuickMeasurement } from './quick-measurement'
 import { SlabNode } from './schema'
 import { slabSlots } from './slots'
 
 const HEIGHT_HANDLE_OFFSET = 0.22
-const MIN_SLAB_ELEVATION = 0.02
+const MIN_SLAB_ELEVATION = -1
 
 function polygonVertexAverage(polygon: SlabNodeType['polygon']): [number, number] {
   if (polygon.length === 0) return [0, 0]
@@ -88,19 +113,59 @@ function slabHandleAnchor(slab: SlabNodeType): [number, number] {
   return best ?? fallback
 }
 
-// Slab height arrow — vertical chevron on solid slab surface near the
-// polygon center. Drags elevation (the extrusion thickness) with
-// `anchor: 'min'` so the bottom stays at world Y=0 and the top follows
-// the pointer. Same registry-handle pipeline as the column height arrow,
-// so live override + commit-on-release come for free.
-function slabHeightHandle(): HandleDescriptor<SlabNodeType> {
+function slabElevationGuideSource(slab: SlabNodeType) {
+  return {
+    nodeId: slab.id,
+    levelId: slab.parentId,
+    anchor: slabHandleAnchor(slab),
+  }
+}
+
+function slabChangePreviewOverrides(
+  slab: SlabNodeType,
+  patch: Partial<SlabNodeType>,
+  sceneApi: SceneApi,
+): ReadonlyArray<readonly [AnyNodeId, Partial<AnyNode>]> {
+  const next = { ...slab, ...patch } as SlabNodeType
+  const nodes = { ...sceneApi.nodes(), [slab.id]: next } as Record<AnyNodeId, AnyNode>
+  const previews = new Map<AnyNodeId, Partial<AnyNode>>()
+
+  markSlabChangeDependents(slab, next, nodes, (id) => previews.set(id, {}))
+  for (const update of syncStairRises(nodes)) {
+    const segment = nodes[update.id]
+    if (
+      segment?.type !== 'stair-segment' ||
+      !segment.parentId ||
+      !previews.has(segment.parentId as AnyNodeId)
+    ) {
+      continue
+    }
+    previews.set(update.id, update.data)
+  }
+
+  return [...previews]
+}
+
+function slabRecessedDepthHandle(): HandleDescriptor<SlabNodeType> {
   return {
     kind: 'linear-resize',
     axis: 'y',
     anchor: 'min',
     min: MIN_SLAB_ELEVATION,
+    max: (n, sceneApi) => slabElevationUpperBound(sceneApi.nodes(), n),
     currentValue: (n) => n.elevation ?? 0.05,
-    apply: (_n, newValue) => ({ elevation: newValue }),
+    magneticSnap: (n, newValue, sceneApi) =>
+      resolveStructuralElevationSnap(slabElevationGuideSource(n), newValue, sceneApi.nodes()),
+    onDrag: (n, sceneApi) =>
+      publishStructuralElevationGuide(
+        slabElevationGuideSource(n),
+        n.elevation ?? 0.05,
+        sceneApi.nodes(),
+      ),
+    onDragEnd: (n) => clearStructuralElevationGuide(n.id),
+    apply: (n, newValue) => applySlabTopChange(n, newValue),
+    previewOverrides: (n, newValue, sceneApi) =>
+      slabChangePreviewOverrides(n, applySlabTopChange(n, newValue), sceneApi),
     placement: {
       position: (n) => {
         const [cx, cz] = slabHandleAnchor(n)
@@ -111,8 +176,81 @@ function slabHeightHandle(): HandleDescriptor<SlabNodeType> {
   }
 }
 
-function slabHandles(_node: SlabNodeType): HandleDescriptor<SlabNodeType>[] {
-  return [slabHeightHandle()]
+function slabThicknessHandle(): HandleDescriptor<SlabNodeType> {
+  return {
+    kind: 'linear-resize',
+    axis: 'y',
+    anchor: 'min',
+    min: MIN_SLAB_THICKNESS,
+    max: (n, sceneApi) =>
+      Math.max(
+        MIN_SLAB_THICKNESS,
+        slabElevationUpperBound(sceneApi.nodes(), n) - getSlabBaseElevation(n),
+      ),
+    currentValue: (n) => n.thickness ?? 0.05,
+    magneticSnap: (n, newThickness, sceneApi) => {
+      const base = getSlabBaseElevation(n)
+      const snappedTop = resolveStructuralElevationSnap(
+        slabElevationGuideSource(n),
+        base + newThickness,
+        sceneApi.nodes(),
+      )
+      return Math.max(MIN_SLAB_THICKNESS, snappedTop - base)
+    },
+    onDrag: (n, sceneApi) =>
+      publishStructuralElevationGuide(
+        slabElevationGuideSource(n),
+        n.elevation ?? 0.05,
+        sceneApi.nodes(),
+      ),
+    onDragEnd: (n) => clearStructuralElevationGuide(n.id),
+    apply: (n, newThickness) => applySlabThicknessChange(n, newThickness),
+    previewOverrides: (n, newThickness, sceneApi) =>
+      slabChangePreviewOverrides(n, applySlabThicknessChange(n, newThickness), sceneApi),
+    placement: {
+      position: (n) => {
+        const [cx, cz] = slabHandleAnchor(n)
+        return [cx, (n.elevation ?? 0.05) + HEIGHT_HANDLE_OFFSET, cz]
+      },
+    },
+  }
+}
+
+function slabBaseElevationHandle(): HandleDescriptor<SlabNodeType> {
+  return {
+    kind: 'linear-resize',
+    axis: 'y',
+    anchor: 'min',
+    shape: 'tracker',
+    gridSnap: true,
+    min: (n) => MIN_SLAB_ELEVATION - (n.thickness ?? 0.05),
+    max: (n, sceneApi) => slabElevationUpperBound(sceneApi.nodes(), n) - (n.thickness ?? 0.05),
+    currentValue: (n) => getSlabBaseElevation(n),
+    magneticSnap: (n, newValue, sceneApi) =>
+      resolveStructuralElevationSnap(slabElevationGuideSource(n), newValue, sceneApi.nodes()),
+    onDrag: (n, sceneApi) =>
+      publishStructuralElevationGuide(
+        slabElevationGuideSource(n),
+        getSlabBaseElevation(n),
+        sceneApi.nodes(),
+      ),
+    onDragEnd: (n) => clearStructuralElevationGuide(n.id),
+    apply: (n, newBase) => applySlabBaseElevationChange(n, newBase),
+    previewOverrides: (n, newBase, sceneApi) =>
+      slabChangePreviewOverrides(n, applySlabBaseElevationChange(n, newBase), sceneApi),
+    placement: {
+      position: (n) => {
+        const [cx, cz] = slabHandleAnchor(n)
+        return [cx, getSlabBaseElevation(n), cz]
+      },
+    },
+  }
+}
+
+function slabHandles(node: SlabNodeType): HandleDescriptor<SlabNodeType>[] {
+  return node.recessed
+    ? [slabRecessedDepthHandle()]
+    : [slabThicknessHandle(), slabBaseElevationHandle()]
 }
 
 /**
@@ -133,10 +271,19 @@ function slabHandles(_node: SlabNodeType): HandleDescriptor<SlabNodeType>[] {
  */
 export const slabDefinition: NodeDefinition<typeof SlabNode> = {
   kind: 'slab',
+  snapProfile: 'structural',
   schemaVersion: 1,
   schema: SlabNode,
   category: 'structure',
   surfaceRole: 'floor',
+  extensions: {
+    [DRAFTING_SURFACE_EXTENSION_KEY]: {
+      kind: 'slab',
+    } satisfies DraftingSurfaceExtension,
+    'pascal:editor/floorplan': {
+      selectionCounterparts: sameOutlineSurfaceCounterparts,
+    } satisfies FloorplanNodeExtension,
+  },
 
   defaults: () => ({
     object: 'node',
@@ -147,6 +294,8 @@ export const slabDefinition: NodeDefinition<typeof SlabNode> = {
     holes: [],
     holeMetadata: [],
     elevation: 0.05,
+    thickness: 0.05,
+    recessed: false,
     autoFromWalls: false,
   }),
 
@@ -170,6 +319,16 @@ export const slabDefinition: NodeDefinition<typeof SlabNode> = {
 
   parametrics: slabParametrics,
   handles: slabHandles,
+  measurement: {
+    features: (node) =>
+      polygonMeasurementFeatures({
+        featurePrefix: 'slab',
+        height: node.elevation,
+        label: 'Slab',
+        polygon: node.polygon,
+      }),
+    quickMeasure: (node) => slabQuickMeasurement(node),
+  },
 
   // Stage D: kind-owned placement tool. Multi-click polygon drawing
   // with 15° angle snap (Shift to defeat).
@@ -187,6 +346,15 @@ export const slabDefinition: NodeDefinition<typeof SlabNode> = {
 
   // Stage B: pure geometry function.
   geometry: buildSlabGeometry,
+  // Dependency tracker only — dirties level slabs when walls / sibling
+  // slabs change, since the renderable polygon derives from level context.
+  system: {
+    module: () => import('./system'),
+    priority: 4,
+  },
+  // The fill reads walls + sibling slabs via ctx (per-edge render offsets),
+  // so committed sibling edits must invalidate the cached floor-plan entry.
+  floorplanDependsOnSiblings: true,
   // Stage C: floor-plan rendering. Legacy `slabPolygons` short-circuits
   // to [] when slab is registered (see floorplan-panel.tsx).
   floorplan: buildSlabFloorplan,
@@ -202,12 +370,12 @@ export const slabDefinition: NodeDefinition<typeof SlabNode> = {
     'move-vertex': slabMoveVertexAffordance,
     'add-vertex': slabAddVertexAffordance,
     'move-edge': slabMoveEdgeAffordance,
+    'delete-vertex': slabDeleteVertexAffordance,
   },
 
   toolHints: [
     { key: 'Left click', label: 'Trace slab outline' },
-    { key: 'Enter', label: 'Finish slab' },
-    { key: 'Shift', label: 'Free outline' },
+    { key: 'Enter', label: 'Finish slab', minDraftVertices: 3 },
     { key: 'Esc', label: 'Cancel' },
   ],
 

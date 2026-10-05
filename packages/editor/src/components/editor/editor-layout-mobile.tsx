@@ -83,18 +83,18 @@ export function EditorLayoutMobile({
   //   desktop "Furnish" action which itself opens the Items panel).
   // - Leaving Items while still furnishing exits the build mode.
   useEffect(() => {
-    const { phase, mode, setMode, setPhase } = useEditor.getState()
+    const { armToolMode, phase, mode, setPhase } = useEditor.getState()
     if (activePanel === 'ai' && mode === 'build') {
-      setMode('select')
+      armToolMode({ mode: 'select' })
       return
     }
     if (activePanel === 'items') {
       if (phase !== 'furnish') setPhase('furnish')
-      if (mode !== 'build') setMode('build')
+      if (mode !== 'build') armToolMode({ mode: 'build', tool: 'item' })
       return
     }
     if (phase === 'furnish' && mode === 'build') {
-      setMode('select')
+      armToolMode({ mode: 'select' })
     }
   }, [activePanel])
 
@@ -159,6 +159,11 @@ export function EditorLayoutMobile({
       const expandedThreshold = Math.max(SHEET_HANDLE_PX, defaultPx * 0.5)
       if (current > expandedThreshold) {
         sheetRef.current?.snapTo(SHEET_HANDLE_PX)
+        // Closing the sheet disarms any build tool back to select
+        const { armToolMode, mode } = useEditor.getState()
+        if (mode === 'build') {
+          armToolMode({ mode: 'select' })
+        }
       } else {
         sheetRef.current?.snapTo(defaultPx)
       }
@@ -231,6 +236,7 @@ export function EditorLayoutMobile({
             <div className="relative h-full w-full overflow-hidden">{viewerContent}</div>
             {overlays && (
               <div
+                data-viewer-bounds
                 className="pointer-events-none absolute inset-0 z-30"
                 style={{ transform: 'translateZ(0)' }}
               >

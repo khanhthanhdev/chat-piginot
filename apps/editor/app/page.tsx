@@ -1,9 +1,10 @@
 'use client'
 
 import { Editor, ItemsPanel } from '@pascal-app/editor'
-import { Hammer, Layers, Package, Settings } from 'lucide-react'
+import { Hammer, Layers, Package, Settings, Wind } from 'lucide-react'
 import Image from 'next/image'
 import Link from 'next/link'
+import { AirflowTab } from '@/components/airflow-tab'
 import { BuildTab } from '@/components/build-tab'
 import {
   CommunityViewerToolbarLeft,
@@ -65,6 +66,14 @@ const SIDEBAR_TABS = [
         width={32}
       />
     ),
+  },
+  {
+    id: 'airflow',
+    label: 'Airflow',
+    component: AirflowTab,
+    mobileDefaultSnap: 0.5,
+    mobileIcon: <Wind className="h-5 w-5" />,
+    icon: <Wind className="h-8 w-8 p-1" />,
   },
   {
     id: 'settings',

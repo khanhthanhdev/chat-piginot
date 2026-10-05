@@ -5,7 +5,9 @@ import {
   type ItemNode as ItemNodeType,
   type NodeDefinition,
 } from '@pascal-app/core'
-import { buildItemFloorplan } from './floorplan'
+import type { FloorplanNodeExtension } from '@pascal-app/editor'
+import { restingFloorplanAffectedIds } from '../shared/resting-surface-plan'
+import { buildItemContextualDimensions, buildItemFloorplan } from './floorplan'
 import { itemFloorplanMoveTarget } from './floorplan-move'
 import { itemPaint } from './paint'
 import { itemParametrics } from './parametrics'
@@ -166,10 +168,17 @@ function itemWallMoveHandle(): HandleDescriptor<ItemNodeType> {
  */
 export const itemDefinition: NodeDefinition<typeof ItemNode> = {
   kind: 'item',
-  schemaVersion: 1,
+  snapProfile: 'item',
+  facingIndicator: true,
+  schemaVersion: 2,
   schema: ItemNode,
   category: 'furnish',
   surfaceRole: 'furnishing',
+  extensions: {
+    'pascal:editor/floorplan': {
+      contextualDimensions: buildItemContextualDimensions,
+    } satisfies FloorplanNodeExtension<ItemNodeType>,
+  },
 
   // Defaults shape is cast: the schema requires a fully-typed `asset`
   // field, but in practice items are always created from the catalog
@@ -198,7 +207,15 @@ export const itemDefinition: NodeDefinition<typeof ItemNode> = {
 
   capabilities: {
     selectable: { hitVolume: 'bbox' },
-    duplicable: true,
+    surfaces: {
+      top: {
+        height: (node) => {
+          const item = node as ItemNodeType
+          return (item.asset.surface?.height ?? item.asset.dimensions[1]) * item.scale[1]
+        },
+      },
+    },
+    duplicable: { subtree: 'with-children' },
     deletable: true,
     paint: itemPaint,
     // Items participate in compositions — e.g. "table-with-plants",
@@ -214,7 +231,7 @@ export const itemDefinition: NodeDefinition<typeof ItemNode> = {
     // host app strips these via `getHostRefFields(def)` so the
     // descendant re-attaches against the new host geometry at
     // placement time.
-    hostRefFields: ['wallId', 'wallT', 'roofSegmentId', 'roofFace'],
+    hostRefFields: ['wallId', 'wallT', 'roofSegmentId', 'roofFace', 'blockFaceId'],
     // Floor items get lifted by slabs underneath via the generic
     // `<FloorElevationSystem>`. Wall- / ceiling-attached items live in
     // their parent's local frame and skip the lift via `applies`.
@@ -224,6 +241,7 @@ export const itemDefinition: NodeDefinition<typeof ItemNode> = {
         return { dimensions: getScaledDimensions(item), rotation: item.rotation }
       },
       applies: (node) => !(node as ItemNodeType).asset.attachTo,
+      collides: true,
     },
     // Recessed ceiling fixtures cut a hole in their host ceiling. The viewer's
     // CeilingSystem queries this capability on each child of a ceiling so it
@@ -280,6 +298,7 @@ export const itemDefinition: NodeDefinition<typeof ItemNode> = {
     kind: 'parametric',
     module: () => import('./renderer'),
   },
+  preview: () => import('./renderer').then(({ ItemPreview }) => ({ default: ItemPreview })),
   system: {
     module: () => import('./system'),
     // Same priority as the legacy ItemSystem.
@@ -304,6 +323,7 @@ export const itemDefinition: NodeDefinition<typeof ItemNode> = {
   // Stage C: floor-plan polygon. ctx.resolve walks the parent chain
   // (wall / nested item / level) to compute the world-space transform.
   floorplan: buildItemFloorplan,
+  floorplanAffectedIds: restingFloorplanAffectedIds,
   // 2D move-on-floorplan handler. Branches on `asset.attachTo`:
   // wall items snap to walls (like door / window), ceiling items
   // snap to ceiling polygons, floor items snap to slabs. attachTo
@@ -313,9 +333,9 @@ export const itemDefinition: NodeDefinition<typeof ItemNode> = {
 
   toolHints: [
     { key: 'Left click', label: 'Place item' },
-    { key: 'R', label: 'Rotate counterclockwise' },
-    { key: 'T', label: 'Rotate clockwise' },
-    { key: 'Shift', label: 'Free place' },
+    { key: 'R / T', label: 'Rotate' },
+    { key: 'Shift', label: 'Cycle snapping mode' },
+    { key: 'Alt', label: 'Force place' },
     { key: 'Esc', label: 'Cancel' },
   ],
 

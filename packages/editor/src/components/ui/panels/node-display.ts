@@ -6,7 +6,7 @@ export type NodeDisplay = {
 }
 
 const TYPE_DEFAULTS: Record<string, NodeDisplay> = {
-  item: { icon: '/icons/furniture.webp', label: 'Item' },
+  item: { icon: '/icons/item.webp', label: 'Item' },
   wall: { icon: '/icons/wall.webp', label: 'Wall' },
   door: { icon: '/icons/door.webp', label: 'Door' },
   window: { icon: '/icons/window.webp', label: 'Window' },
@@ -17,10 +17,14 @@ const TYPE_DEFAULTS: Record<string, NodeDisplay> = {
   fence: { icon: '/icons/fence.webp', label: 'Fence' },
   roof: { icon: '/icons/roof.webp', label: 'Roof' },
   'roof-segment': { icon: '/icons/roof.webp', label: 'Roof segment' },
-  stair: { icon: '/icons/stair.webp', label: 'Stair' },
-  'stair-segment': { icon: '/icons/stair.webp', label: 'Stair segment' },
+  stair: { icon: '/icons/stairs.webp', label: 'Stair' },
+  'stair-segment': { icon: '/icons/stairs.webp', label: 'Stair segment' },
   scan: { icon: '/icons/mesh.webp', label: '3D Scan' },
   guide: { icon: '/icons/floorplan.webp', label: 'Guide image' },
+}
+
+export function getTypeDisplay(type: string): NodeDisplay {
+  return TYPE_DEFAULTS[type] ?? { icon: '/icons/select.webp', label: type }
 }
 
 export function getNodeDisplay(node: AnyNode | null | undefined): NodeDisplay {

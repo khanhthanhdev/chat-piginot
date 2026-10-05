@@ -1,13 +1,13 @@
 'use client'
 
 import type { AssetInput } from '@pascal-app/core'
-import { resolveCdnUrl, useViewer } from '@pascal-app/viewer'
+import { resolveCdnUrl } from '@pascal-app/viewer'
 import { useEffect } from 'react'
 import { triggerSFX } from './../../../lib/sfx-bus'
 import { cn } from './../../../lib/utils'
 import useEditor, { type CatalogCategory } from './../../../store/use-editor'
 import { resolveAssetSnapTarget, SnapTargetBadge } from '../snap-target-badge'
-import { CATALOG_ITEMS } from './catalog-items'
+import { activateCatalogItem, filterCatalogItems, isCatalogItemSelected } from '../../../lib/catalog-panel-model'
 
 export function ItemCatalog({
   category,
@@ -32,36 +32,7 @@ export function ItemCatalog({
   emptyState?: React.ReactNode
 }) {
   const selectedItem = useEditor((state) => state.selectedItem)
-  const setSelectedItem = useEditor((state) => state.setSelectedItem)
-  const setMode = useEditor((state) => state.setMode)
-  const setTool = useEditor((state) => state.setTool)
-
-  const sourceItems = itemsOverride ?? CATALOG_ITEMS
-  // Server-provided results bypass all local filtering; otherwise filter by category/search/tags
-  const filteredItems =
-    overrideItems ??
-    (() => {
-      const categoryItems = search
-        ? sourceItems
-        : sourceItems.filter((item) => item.category === category)
-      return categoryItems.filter((item) => {
-        const tags = item.tags ?? []
-        if (activePlacementTag && !tags.includes(activePlacementTag)) return false
-        if (activeFunctionalTag && !tags.includes(activeFunctionalTag)) return false
-        if (search && !item.name.toLowerCase().includes(search.toLowerCase())) return false
-        return true
-      })
-    })()
-
-  const categoryItems = filteredItems
-
-  // Auto-select first item if current selection is not in the filtered list
-  useEffect(() => {
-    const isCurrentItemInCategory = categoryItems.some((item) => item.src === selectedItem?.src)
-    if (!isCurrentItemInCategory && categoryItems.length > 0) {
-      setSelectedItem(categoryItems[0] as AssetInput)
-    }
-  }, [categoryItems, selectedItem?.src, setSelectedItem])
+  const filteredItems = filterCatalogItems({ category, items: itemsOverride, overrideItems, search, activePlacementTag, activeFunctionalTag })
 
   if (filteredItems.length === 0 && emptyState) {
     return <>{emptyState}</>
@@ -74,7 +45,7 @@ export function ItemCatalog({
     >
       {leadingTile}
       {filteredItems.map((item, index) => {
-        const isSelected = selectedItem?.src === item?.src
+        const isSelected = isCatalogItemSelected(item, selectedItem)
         const snapTarget = resolveAssetSnapTarget(item?.attachTo)
         return (
           <button
@@ -85,13 +56,7 @@ export function ItemCatalog({
             key={index}
             onClick={() => {
               triggerSFX('sfx:menu-click')
-              // Drop the current selection before arming placement — keeping
-              // it would route shortcuts (rotate & co) to both the ghost and
-              // the selected node.
-              useViewer.getState().setSelection({ selectedIds: [], zoneId: null })
-              setSelectedItem(item)
-              setTool('item')
-              setMode('build')
+              activateCatalogItem(item)
             }}
             onMouseEnter={() => triggerSFX('sfx:menu-hover')}
             type="button"

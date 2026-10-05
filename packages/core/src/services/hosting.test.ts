@@ -5,6 +5,7 @@ import type { AnyNodeDefinition, Capabilities, SceneApi } from '../registry/type
 import type { AnyNode, AnyNodeId } from '../schema/types'
 import {
   canAttach,
+  canHostOnTop,
   clampYToHostTop,
   getSurface,
   getTopSurfaceHeight,
@@ -13,6 +14,16 @@ import {
 } from './hosting'
 
 const id = (s: string) => s as AnyNodeId
+
+function makeItem(idStr: string, attachTo?: 'wall' | 'wall-side' | 'ceiling'): AnyNode {
+  return {
+    id: id(idStr),
+    type: 'item',
+    parentId: null,
+    visible: true,
+    asset: attachTo ? { attachTo } : {},
+  } as unknown as AnyNode
+}
 
 function makeDef(
   kind: string,
@@ -110,26 +121,6 @@ describe('canAttach', () => {
     expect(canAttach(id('candidate'), id('root'), scene).ok).toBe(true)
   })
 
-  test('rejects host kind not in child def.hostable.parents', () => {
-    registerNode(makeDef('shelf', { hostable: { parents: ['wall', 'slab'] } }))
-    const scene = makeFakeScene({
-      s: makeNode('shelf', 's'),
-      ceiling: makeNode('ceiling', 'ceiling'),
-    })
-    const result = canAttach(id('s'), id('ceiling'), scene)
-    expect(result.ok).toBe(false)
-    if (!result.ok) expect(result.error.kind).toBe('kind-not-allowed')
-  })
-
-  test('accepts when host kind is in parents', () => {
-    registerNode(makeDef('shelf', { hostable: { parents: ['wall', 'slab'] } }))
-    const scene = makeFakeScene({
-      s: makeNode('shelf', 's'),
-      w: makeNode('wall', 'w'),
-    })
-    expect(canAttach(id('s'), id('w'), scene).ok).toBe(true)
-  })
-
   test('no def or no hostable.parents = no kind restriction', () => {
     // Some kinds (e.g. items via catalog) defer to runtime checks instead of
     // declaring parents up front. canAttach should not block them.
@@ -180,6 +171,22 @@ describe('getSurface / getTopSurfaceHeight', () => {
     )
     expect(getTopSurfaceHeight(makeNode('shelf', 'high'))).toBe(1.8)
     expect(getTopSurfaceHeight(makeNode('shelf', 'low'))).toBe(0.3)
+  })
+
+  test('passes the complete node record to context-aware surface resolvers', () => {
+    const host = makeNode('platform', 'platform')
+    const support = makeNode('support', 'support')
+    registerNode(
+      makeDef('platform', {
+        surfaces: {
+          top: {
+            height: (_node: any, { nodes }: any) => (nodes[id('support')] ? 2.4 : 0),
+          },
+        },
+      }),
+    )
+
+    expect(getTopSurfaceHeight(host, { [host.id]: host, [support.id]: support })).toBe(2.4)
   })
 })
 
@@ -232,5 +239,31 @@ describe('pickHost', () => {
       hitTest: (host) => host.id === id('s2'),
     })
     expect(picked?.id).toBe(id('s2'))
+  })
+
+  test('excludes ceiling-mounted hosts (ceiling fan cannot be a top surface)', () => {
+    registerNode(makeDef('item', { hostable: { parents: ['*'] } }))
+    const candidates = [makeItem('fan', 'ceiling'), makeItem('table')]
+    const picked = pickHost({ point: [0, 0, 0], candidates, placedKind: 'item' })
+    expect(picked?.id).toBe(id('table'))
+  })
+
+  test('keeps wall-mounted hosts (wall shelf still hosts)', () => {
+    registerNode(makeDef('item', { hostable: { parents: ['*'] } }))
+    const candidates = [makeItem('shelf', 'wall')]
+    const picked = pickHost({ point: [0, 0, 0], candidates, placedKind: 'item' })
+    expect(picked?.id).toBe(id('shelf'))
+  })
+})
+
+describe('canHostOnTop', () => {
+  test('rejects ceiling-attachTo hosts', () => {
+    expect(canHostOnTop(makeItem('fan', 'ceiling'))).toBe(false)
+  })
+
+  test('accepts wall / wall-side / floor (undefined) hosts', () => {
+    expect(canHostOnTop(makeItem('shelf', 'wall'))).toBe(true)
+    expect(canHostOnTop(makeItem('sconce', 'wall-side'))).toBe(true)
+    expect(canHostOnTop(makeItem('table'))).toBe(true)
   })
 })

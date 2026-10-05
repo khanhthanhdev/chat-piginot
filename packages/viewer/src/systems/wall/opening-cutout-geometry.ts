@@ -10,6 +10,20 @@ export type OpeningCutoutRect = {
   top: number
 }
 
+// The cutout proxy doubles as the invisible raycast hit target for an opening:
+// centered on the wall and extending past both faces so it wins the scene
+// raycast over the recessed door/window body for front AND back selection +
+// paint. Wall CSG rebuilds opening cuts directly from node data, so this proxy
+// only needs to clear the wall thickness plus a small proud margin. A snug depth
+// keeps the hit target useful without blanketing the room floor in a top-down
+// view (the bug a 1m-deep proxy caused in narrow hallways).
+const OPENING_CUTOUT_PROXY_PROUD_MARGIN = 0.08
+const OPENING_CUTOUT_BOTTOM_PADDING = 0.02
+
+export function getOpeningCutoutProxyDepth(wallThickness: number): number {
+  return Math.max(wallThickness, 0) + OPENING_CUTOUT_PROXY_PROUD_MARGIN
+}
+
 type CornerRadii = {
   topLeft: number
   topRight: number
@@ -112,6 +126,14 @@ export function hasFlatOpeningCutoutBottom(opening: OpeningCutoutNode): boolean 
   }
 
   return Math.max(opening.cornerRadius ?? 0.15, 0) <= 1e-6
+}
+
+/**
+ * Extends floor-level flat cutouts below the host wall so CSG never has to
+ * subtract a face exactly coplanar with the wall base.
+ */
+export function getOpeningCutoutBottomPadding(opening: OpeningCutoutNode, bottom: number): number {
+  return bottom < 0.005 && hasFlatOpeningCutoutBottom(opening) ? OPENING_CUTOUT_BOTTOM_PADDING : 0
 }
 
 function getRoundedOpeningRadii(

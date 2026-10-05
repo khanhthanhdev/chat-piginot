@@ -15,6 +15,9 @@ import {
   consumePlacementDragRelease,
   DragBoundingBox,
   EDITOR_LAYER,
+  isAlignmentGuideActive,
+  isGridSnapActive,
+  isMagneticSnapActive,
   markToolCancelConsumed,
   stripPlacementMetadataFlags,
   triggerSFX,
@@ -36,6 +39,7 @@ import {
   planRunTranslationOffsets,
   type RunTranslationOffsetPlan,
 } from '../shared/run-translation-offset'
+import { translateWallRun } from '../shared/wall-run-move'
 import { rectSectionAxes } from './geometry'
 
 type Vec3 = [number, number, number]
@@ -46,7 +50,7 @@ const IN_TO_M = 0.0254
 
 /** Snap a coordinate to the editor's live grid step. */
 function snapToGridStep(value: number): number {
-  const step = useEditor.getState().gridSnapStep
+  const step = isGridSnapActive() ? useEditor.getState().gridSnapStep : 0
   if (step <= 0) return value
   return Math.round(value / step) * step
 }
@@ -120,6 +124,7 @@ export const MoveDuctSegmentTool: React.FC<{ node: AnyNode }> = ({ node }) => {
   const hasMovedRef = useRef(false)
   const activatedAtRef = useRef<number>(Date.now())
   const prevSnapRef = useRef<[number, number] | null>(null)
+  const previewAttachmentRef = useRef(duct.wallAttachment)
 
   useEffect(() => {
     const nodeId = node.id as AnyNodeId
@@ -174,14 +179,28 @@ export const MoveDuctSegmentTool: React.FC<{ node: AnyNode }> = ({ node }) => {
     }
 
     const onMove = (event: GridEvent) => {
-      const bypass = event.nativeEvent?.shiftKey === true
-      const snap = bypass ? (v: number) => v : snapToGridStep
+      const attachedWall = duct.wallAttachment
+        ? (useScene.getState().nodes[duct.wallAttachment.wallId] as AnyNode | undefined)
+        : undefined
+      if (duct.wallAttachment && attachedWall?.type === 'wall') {
+        const wallMove = translateWallRun(originalPath, duct.wallAttachment, attachedWall, event)
+        if (wallMove) {
+          hasMovedRef.current = true
+          previewAttachmentRef.current = wallMove.attachment
+          setPreview(wallMove.path)
+          connectivity?.preview({ path: wallMove.path })
+          setTranslationGhost(null)
+          return
+        }
+      }
+      const snap = isGridSnapActive() ? snapToGridStep : (v: number) => v
       let dx = snap(event.localPosition[0] - centerX)
       let dz = snap(event.localPosition[2] - centerZ)
 
-      // Figma-style alignment: snap the run's footprint box edges onto
-      // nearby geometry and publish the guides (Alt / Shift bypass).
-      if (!bypass) {
+      // Figma-style magnetic alignment: snap the run's footprint box edges onto
+      // nearby geometry and publish the guides. Grid follows the snapping mode;
+      // lines follow magnetic alignment — the two are independent.
+      if (isAlignmentGuideActive()) {
         const proposed: Aabb2D = {
           minX: baseAabb.minX + dx,
           maxX: baseAabb.maxX + dx,
@@ -189,8 +208,10 @@ export const MoveDuctSegmentTool: React.FC<{ node: AnyNode }> = ({ node }) => {
           maxZ: baseAabb.maxZ + dz,
         }
         const { dx: sdx, dz: sdz, guides } = resolveGhostAlignment(nodeId, proposed, candidates)
-        dx += sdx
-        dz += sdz
+        if (isMagneticSnapActive()) {
+          dx += sdx
+          dz += sdz
+        }
         useAlignmentGuides.getState().set(guides)
       } else {
         useAlignmentGuides.getState().clear()
@@ -198,7 +219,7 @@ export const MoveDuctSegmentTool: React.FC<{ node: AnyNode }> = ({ node }) => {
 
       const cur: [number, number] = [centerX + dx, centerZ + dz]
       if (
-        !bypass &&
+        (isGridSnapActive() || isMagneticSnapActive()) &&
         (!prevSnapRef.current ||
           prevSnapRef.current[0] !== cur[0] ||
           prevSnapRef.current[1] !== cur[1])
@@ -247,6 +268,7 @@ export const MoveDuctSegmentTool: React.FC<{ node: AnyNode }> = ({ node }) => {
         const created = DuctSegmentNode.parse({
           ...(node as Record<string, unknown>),
           path: finalPath,
+          wallAttachment: previewAttachmentRef.current,
           metadata: stripPlacementMetadataFlags(node.metadata),
           visible: true,
         })
@@ -270,7 +292,13 @@ export const MoveDuctSegmentTool: React.FC<{ node: AnyNode }> = ({ node }) => {
               parentId: node.parentId as AnyNodeId,
             })),
             update: [
-              { id: nodeId, data: { path: translationPlan.ductPath } as Partial<AnyNode> },
+              {
+                id: nodeId,
+                data: {
+                  path: translationPlan.ductPath,
+                  wallAttachment: previewAttachmentRef.current,
+                } as Partial<AnyNode>,
+              },
               ...translationPlan.updates,
             ],
           })
@@ -278,12 +306,16 @@ export const MoveDuctSegmentTool: React.FC<{ node: AnyNode }> = ({ node }) => {
           // Fold connected-fitting / sibling-run follow-updates into the SAME
           // batch as the moved run so the whole joint is one undo step.
           const followUpdates = connectivity?.commitUpdates({ path: finalPath }) ?? []
-          useScene
-            .getState()
-            .updateNodes([
-              { id: nodeId, data: { path: finalPath } as Partial<AnyNode> },
-              ...followUpdates,
-            ])
+          useScene.getState().updateNodes([
+            {
+              id: nodeId,
+              data: {
+                path: finalPath,
+                wallAttachment: previewAttachmentRef.current,
+              } as Partial<AnyNode>,
+            },
+            ...followUpdates,
+          ])
         }
         useScene.getState().markDirty(nodeId)
       }

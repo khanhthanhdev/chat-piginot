@@ -5,7 +5,9 @@ import {
   DEFAULT_ANGLE_STEP,
   type HandleDescriptor,
   hasRegistry3DMoveTool,
+  isMovable,
   nodeRegistry,
+  resolveSelectionProxyId,
   type SceneApi,
   useScene,
 } from '@pascal-app/core'
@@ -34,11 +36,88 @@ export function canDirectRotateNode(node: AnyNode): boolean {
   )
 }
 
+const BESPOKE_SELECTION_MOVE_KINDS = new Set([
+  'duct-segment',
+  'duct-fitting',
+  'pipe-segment',
+  'pipe-fitting',
+  'lineset',
+  'liquid-line',
+])
+
+export const EDITOR_HANDLE_HIT_AREA_USER_DATA_KEY = 'editorHandleHitArea'
+
+export function pointerEventHitsEditorHandle(event: unknown): boolean {
+  if (!event || typeof event !== 'object') return false
+  const intersections = (
+    event as {
+      intersections?: readonly {
+        object?: { userData?: Record<string, unknown> }
+      }[]
+    }
+  ).intersections
+  return (
+    intersections?.some(
+      (intersection) =>
+        intersection.object?.userData?.[EDITOR_HANDLE_HIT_AREA_USER_DATA_KEY] === true,
+    ) ?? false
+  )
+}
+
 export function canDirectMoveNode(node: AnyNode): boolean {
+  // These MEP kinds own move through bespoke selection rigs (latch cubes,
+  // directional arrows, grid-driven previews). Sending body drags/clicks
+  // through the generic direct-move handoff conflicts with that path and can
+  // leave the editor appearing frozen while their mover waits for the wrong
+  // gesture stream.
+  if (BESPOKE_SELECTION_MOVE_KINDS.has(node.type)) return false
   // 3D direct move (Ctrl/Meta-drag, the move-cross grip) needs a move tool that
   // mounts in 3D — distinct from `isRegistryMovable`, which also accepts
   // floorplan-only movers (zone) for the 2D plan.
-  return hasRegistry3DMoveTool(node.type)
+  if (!hasRegistry3DMoveTool(node.type)) return false
+  // Bespoke movers (`affordanceTools.move`) own their constraints and often
+  // deliberately omit `capabilities.movable` — only gate registry-movable
+  // kinds on `isMovable`, so a per-node `movable.override` (e.g. a cabinet
+  // run locked behind its selection proxy) can opt out of direct move.
+  if (nodeRegistry.get(node.type)?.affordanceTools?.move) return true
+  return isMovable(node)
+}
+
+export function shouldStartDirectMoveDrag({
+  allowPlainDrag,
+  commandModifier,
+  handleOwnsPointer,
+  nodeId,
+  selectedIds,
+}: {
+  allowPlainDrag: boolean
+  commandModifier: boolean
+  handleOwnsPointer: boolean
+  nodeId: string
+  selectedIds: readonly string[]
+}): boolean {
+  if (handleOwnsPointer) return false
+  if (commandModifier) return selectedIds.length === 1 && selectedIds[0] === nodeId
+  return allowPlainDrag && selectedIds.length < 2
+}
+
+export function resolveDirectManipulationNode(
+  node: AnyNode,
+  nodes: Readonly<Record<string, AnyNode | undefined>>,
+): AnyNode {
+  const target = nodes[resolveSelectionProxyId(node, nodes)] ?? node
+  const parentFrame = nodeRegistry.get(target.type)?.capabilities?.movable?.parentFrame
+  const parent = parentFrame?.resolveParent(target, nodes as Readonly<Record<string, AnyNode>>)
+  return parent && canDirectRotateNode(parent) ? parent : target
+}
+
+export function resolveMoveActionNode(
+  node: AnyNode,
+  nodes: Readonly<Record<string, AnyNode | undefined>>,
+): AnyNode {
+  const parentFrame = nodeRegistry.get(node.type)?.capabilities?.movable?.parentFrame
+  const parent = parentFrame?.resolveParent(node, nodes as Readonly<Record<string, AnyNode>>)
+  return parent && (parent.type === node.type || canDirectRotateNode(parent)) ? parent : node
 }
 
 export function snapDirectRotationDelta(delta: number, free: boolean): number {

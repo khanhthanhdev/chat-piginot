@@ -152,8 +152,8 @@ const ridgeVentHandles: HandleDescriptor<RidgeVentNodeType>[] = [
  * geometry builder shared with the placement preview + future tests,
  * no animation or per-frame system.
  *
- * The placement tool snaps to the ridge (segment-local Z=0) wherever
- * the cursor lands on a segment.
+ * The placement tool snaps to the nearest ridge/break line wherever the
+ * cursor lands on a segment.
  */
 export const ridgeVentDefinition: NodeDefinition<typeof RidgeVentNode> = {
   kind: 'ridge-vent',
@@ -187,6 +187,7 @@ export const ridgeVentDefinition: NodeDefinition<typeof RidgeVentNode> = {
   handles: ridgeVentHandles,
   floorplan: buildRidgeVentFloorplan,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),
@@ -205,7 +206,7 @@ export const ridgeVentDefinition: NodeDefinition<typeof RidgeVentNode> = {
   presentation: {
     label: 'Ridge Vent',
     description: 'Ventilation strip running along the ridge of a roof segment.',
-    icon: { kind: 'url', src: '/icons/roof.webp' },
+    icon: { kind: 'url', src: '/icons/ridge-vent.webp' },
     paletteSection: 'structure',
     paletteOrder: 121,
   },

@@ -1,9 +1,11 @@
 import type {
   AnyNode,
+  AnyNodeId,
   AssetInput,
   CeilingNode,
   ItemNode,
   LevelNode,
+  SurfaceRejectReason,
   WallNode,
 } from '@pascal-app/core'
 import type { Vector3 } from 'three'
@@ -16,6 +18,7 @@ export type SurfaceType =
   | 'floor'
   | 'wall'
   | 'roof-wall'
+  | 'block-face'
   | 'ceiling'
   | 'item-surface'
   | 'shelf-surface'
@@ -33,6 +36,8 @@ export interface PlacementState {
    * (base walls + coplanar gable ends).
    */
   roofSegmentId: string | null
+  /** Active planar node face used as a wall-like attachment host. */
+  blockId?: AnyNodeId | null
   ceilingId: string | null
   surfaceItemId: string | null
   /**
@@ -52,6 +57,7 @@ export interface PlacementState {
  * Read-only snapshot passed to every strategy call.
  */
 export interface PlacementContext {
+  onSurfaceReject?: (reason: SurfaceRejectReason) => void
   asset: AssetInput
   levelId: LevelNode['id'] | null
   draftItem: ItemNode | null
@@ -74,6 +80,7 @@ export interface PlacementContext {
  * Returned by strategy move handlers.
  */
 export interface PlacementResult {
+  surfaceId?: string | null
   gridPosition: [number, number, number]
   cursorPosition: [number, number, number]
   cursorRotationY: number
@@ -81,12 +88,14 @@ export interface PlacementResult {
   nodeUpdate: Partial<ItemNode> | null
   stopPropagation: boolean
   dirtyNodeId: AnyNode['id'] | null
+  hostFaceId?: string | null
 }
 
 /**
  * Returned by enter/leave handlers (surface transitions).
  */
 export interface TransitionResult {
+  surfaceId?: string | null
   stateUpdate: Partial<PlacementState>
   nodeUpdate: Partial<ItemNode>
   gridPosition: [number, number, number]
@@ -94,6 +103,7 @@ export interface TransitionResult {
   cursorRotationY: number
   cursorRotation?: [number, number, number]
   stopPropagation: boolean
+  hostFaceId?: string | null
 }
 
 /**

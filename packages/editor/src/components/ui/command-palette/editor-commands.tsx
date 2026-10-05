@@ -1,7 +1,7 @@
 'use client'
 
 import type { AnyNodeId } from '@pascal-app/core'
-import { LevelNode, useScene } from '@pascal-app/core'
+import { DEFAULT_LEVEL_HEIGHT, LevelNode, type UnitNode, useScene } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import {
   AppWindow,
@@ -15,6 +15,7 @@ import {
   EyeOff,
   FileJson,
   Grid3X3,
+  Group,
   Hexagon,
   Layers,
   Map,
@@ -22,6 +23,7 @@ import {
   Minimize2,
   Moon,
   MousePointer2,
+  Mountain,
   Package,
   PaintBucket,
   PencilLine,
@@ -36,8 +38,9 @@ import {
   Video,
 } from 'lucide-react'
 import { useEffect } from 'react'
-import { runRedo, runUndo } from '../../../lib/history'
+import { getHistoryCommandState, runRedo, runUndo } from '../../../lib/history'
 import { deleteLevelWithFallbackSelection } from '../../../lib/level-selection'
+import { createUnitInBuilding, enterUnitFocus, leaveUnitFocus } from '../../../lib/units'
 import { useCommandRegistry } from '../../../store/use-command-registry'
 import type { StructureTool } from '../../../store/use-editor'
 import useEditor from '../../../store/use-editor'
@@ -48,28 +51,39 @@ export function EditorCommands() {
   const { navigateTo, setInputValue, setOpen } = useCommandPalette()
 
   const setPhase = useEditor((s) => s.setPhase)
-  const setMode = useEditor((s) => s.setMode)
-  const setTool = useEditor((s) => s.setTool)
+  const armToolMode = useEditor((s) => s.armToolMode)
+  const armMaterialPaint = useEditor((s) => s.armMaterialPaint)
   const setStructureLayer = useEditor((s) => s.setStructureLayer)
-  const primeMaterialPaintFromSelection = useEditor((s) => s.primeMaterialPaintFromSelection)
   const isPreviewMode = useEditor((s) => s.isPreviewMode)
   const setPreviewMode = useEditor((s) => s.setPreviewMode)
 
   const exportScene = useViewer((s) => s.exportScene)
+  // Focusable units are listed one command each; the key changes only when a
+  // unit is added, removed or renamed.
+  const unitListKey = useScene((s) =>
+    Object.values(s.nodes)
+      .filter((n): n is UnitNode => n.type === 'unit')
+      .map((n) => `${n.id}:${n.name ?? ''}`)
+      .join('|'),
+  )
 
   // Re-register when exportScene availability changes (it's a conditional action)
   useEffect(() => {
+    void unitListKey
     const run = (fn: () => void) => {
       fn()
       setOpen(false)
     }
+    const focusableUnits = Object.values(useScene.getState().nodes).filter(
+      (n): n is UnitNode => n.type === 'unit',
+    )
 
     const activateTool = (tool: StructureTool) => {
       run(() => {
         setPhase('structure')
-        setMode('build')
         if (tool === 'zone') setStructureLayer('zones')
-        setTool(tool)
+        else setStructureLayer('elements')
+        armToolMode({ mode: 'build', tool })
       })
     }
 
@@ -162,11 +176,20 @@ export function EditorCommands() {
         shortcut: ['P'],
         execute: () =>
           run(() => {
-            primeMaterialPaintFromSelection()
             setPhase('structure')
             setStructureLayer('elements')
-            setMode('material-paint')
+            armMaterialPaint()
           }),
+      },
+      {
+        id: 'editor.mode.terrain-sculpt',
+        label: 'Sculpt Terrain',
+        group: 'Scene',
+        icon: <Mountain className="h-4 w-4" />,
+        keywords: ['terrain', 'ground', 'elevation', 'sculpt', 'hill', 'slope', 'grade', 'dig'],
+        shortcut: ['G'],
+        // The ToolMode transition moves to the site phase itself.
+        execute: () => run(() => armToolMode({ mode: 'terrain-sculpt' })),
       },
 
       // ── Levels ───────────────────────────────────────────────────────────
@@ -196,6 +219,7 @@ export function EditorCommands() {
             ).length
             const newLevel = LevelNode.parse({
               level: levelCount,
+              height: DEFAULT_LEVEL_HEIGHT,
               children: [],
               parentId: building.id,
             })
@@ -237,6 +261,44 @@ export function EditorCommands() {
             if (!activeLevelId) return
             deleteLevelWithFallbackSelection(activeLevelId as AnyNodeId)
           }),
+      },
+
+      // ── Units ────────────────────────────────────────────────────────────
+      {
+        id: 'editor.unit.new',
+        label: 'New unit',
+        group: 'Units',
+        icon: <Group className="h-4 w-4" />,
+        keywords: ['unit', 'apartment', 'hotel', 'room', 'add', 'create', 'new'],
+        when: () => Object.values(useScene.getState().nodes).some((n) => n.type === 'building'),
+        execute: () =>
+          run(() => {
+            const { nodes } = useScene.getState()
+            const selectedBuildingId = useViewer.getState().selection.buildingId
+            const building =
+              (selectedBuildingId ? nodes[selectedBuildingId] : undefined) ??
+              Object.values(nodes).find((n) => n.type === 'building')
+            if (building?.type !== 'building') return
+            createUnitInBuilding(building.id)
+          }),
+      },
+      ...focusableUnits.map((unit) => ({
+        id: `editor.unit.focus.${unit.id}`,
+        label: `Focus unit: ${unit.name || 'Unit'}`,
+        group: 'Units',
+        icon: <Group className="h-4 w-4" />,
+        keywords: ['unit', 'focus', 'apartment', unit.name || 'Unit'],
+        when: () => useViewer.getState().focusedUnitId !== unit.id,
+        execute: () => run(() => enterUnitFocus(unit.id)),
+      })),
+      {
+        id: 'editor.unit.exit-focus',
+        label: 'Exit unit focus',
+        group: 'Units',
+        icon: <Group className="h-4 w-4" />,
+        keywords: ['unit', 'focus', 'exit', 'leave', 'apartment'],
+        when: () => !!useViewer.getState().focusedUnitId,
+        execute: () => run(() => leaveUnitFocus()),
       },
 
       // ── Viewer Controls ──────────────────────────────────────────────────
@@ -338,6 +400,7 @@ export function EditorCommands() {
         group: 'History',
         icon: <Undo2 className="h-4 w-4" />,
         keywords: ['undo', 'revert', 'back'],
+        when: () => getHistoryCommandState().canUndo,
         execute: () => run(() => runUndo()),
       },
       {
@@ -346,6 +409,7 @@ export function EditorCommands() {
         group: 'History',
         icon: <Redo2 className="h-4 w-4" />,
         keywords: ['redo', 'forward', 'repeat'],
+        when: () => getHistoryCommandState().canRedo,
         execute: () => run(() => runRedo()),
       },
 
@@ -413,12 +477,13 @@ export function EditorCommands() {
     setInputValue,
     setOpen,
     setPhase,
-    setMode,
-    setTool,
+    armToolMode,
+    armMaterialPaint,
     setStructureLayer,
     isPreviewMode,
     setPreviewMode,
     exportScene,
+    unitListKey,
   ])
 
   return null

@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { type Brush, Evaluator } from 'three-bvh-csg'
+import { type Brush, Evaluator, SUBTRACTION } from 'three-bvh-csg'
 import { computeBoundsTree } from 'three-mesh-bvh'
 
 /**
@@ -111,6 +111,12 @@ export function prepareBrushForCSG(brush: Brush) {
   brush.updateMatrixWorld()
 }
 
-// Re-export Brush + SUBTRACTION + ADDITION so kinds don't need a direct
-// `three-bvh-csg` dependency.
-export { ADDITION, Brush, SUBTRACTION } from 'three-bvh-csg'
+export function subtractCsgBrush(left: Brush, right: Brush, evaluator: Evaluator): Brush {
+  const result = evaluator.evaluate(left, right, SUBTRACTION) as Brush
+  prepareBrushForCSG(result)
+  return result
+}
+
+// Re-export Brush + SUBTRACTION + ADDITION + INTERSECTION so kinds don't need a
+// direct `three-bvh-csg` dependency.
+export { ADDITION, Brush, Evaluator, INTERSECTION, SUBTRACTION } from 'three-bvh-csg'

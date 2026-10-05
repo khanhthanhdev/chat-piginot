@@ -10,10 +10,12 @@
  */
 import {
   type AlignmentAnchor,
+  type AlignmentGuide,
   type AnyNodeId,
   type BuildingPose,
   type ResolveAlignmentInBuildingResult,
   resolveAlignmentInBuildingWorld,
+  resolveBuildingForLevel,
   snapWorldXZToBuildingLocal,
   useLiveTransforms,
   useScene,
@@ -38,7 +40,7 @@ import { useViewer } from '@pascal-app/viewer'
  * guides drift off the visible grid mid-drag (and through any post-drag
  * frame where the live override is still set).
  */
-export function getActiveBuildingPose(): BuildingPose | null {
+export function getActiveBuildingId(): AnyNodeId | null {
   const sel = useViewer.getState().selection
   const nodes = useScene.getState().nodes
   // Match `use-floorplan-scene-data.ts`: prefer the active level's
@@ -47,12 +49,15 @@ export function getActiveBuildingPose(): BuildingPose | null {
   // different level, the level path is the authoritative one.
   let buildingId: AnyNodeId | null = null
   if (sel.levelId) {
-    const level = nodes[sel.levelId]
-    if (level && level.type === 'level' && level.parentId) {
-      buildingId = level.parentId as AnyNodeId
-    }
+    buildingId = resolveBuildingForLevel(sel.levelId as AnyNodeId, nodes)
   }
   if (!buildingId) buildingId = sel.buildingId ?? null
+  return buildingId
+}
+
+export function getActiveBuildingPose(): BuildingPose | null {
+  const buildingId = getActiveBuildingId()
+  const nodes = useScene.getState().nodes
   const building = buildingId ? nodes[buildingId] : null
   if (building?.type !== 'building') return null
   const live = useLiveTransforms.getState().transforms.get(buildingId as string)
@@ -80,12 +85,43 @@ export function resolveAlignmentForActiveBuilding(args: {
   return resolveAlignmentInBuildingWorld({ ...args, pose: getActiveBuildingPose() })
 }
 
+function worldXZToPoseLocal(x: number, z: number, pose: BuildingPose | null): [number, number] {
+  if (!pose) return [x, z]
+  const cos = Math.cos(pose.rotationY)
+  const sin = Math.sin(pose.rotationY)
+  const dx = x - pose.position[0]
+  const dz = z - pose.position[2]
+  return [dx * cos - dz * sin, dx * sin + dz * cos]
+}
+
+/**
+ * Project WORLD-frame alignment guides into the active building's LOCAL frame.
+ *
+ * The 3D alignment layer is still mounted inside the building-local tool group,
+ * so tools that resolve alignment on the world axes (item placement, slab move)
+ * need their guides converted before publishing to `useAlignmentGuides`.
+ */
+export function projectAlignmentGuidesWorldToActiveBuildingLocal(
+  guides: readonly AlignmentGuide[],
+): AlignmentGuide[] {
+  const pose = getActiveBuildingPose()
+  return guides.map((guide) => {
+    const [fromX, fromZ] = worldXZToPoseLocal(guide.from.x, guide.from.z, pose)
+    const [toX, toZ] = worldXZToPoseLocal(guide.to.x, guide.to.z, pose)
+    return {
+      ...guide,
+      from: { x: fromX, z: fromZ },
+      to: { x: toX, z: toZ },
+    }
+  })
+}
+
 /**
  * Baseline rotation the floor-plan view applies on top of the building
- * rotation. Mirrors `FLOORPLAN_VIEW_ROTATION_DEG = 90` in floorplan-panel.tsx —
+ * rotation. Mirrors `FLOORPLAN_VIEW_ROTATION_DEG = 0` in lib/floorplan/geometry.ts —
  * the scene group reads it via `floorplanSceneRotationDeg = FVR - buildingRot`.
  */
-const FLOORPLAN_VIEW_ROTATION_RAD = Math.PI / 2
+const FLOORPLAN_VIEW_ROTATION_RAD = 0
 
 function rotateAnchorsBy(
   anchors: readonly AlignmentAnchor[],

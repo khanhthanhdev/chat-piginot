@@ -4,8 +4,7 @@ import type {
   CeilingEvent,
   CeilingNode,
   GridEvent,
-  ItemEvent,
-  ItemNode,
+  NodeEvent,
   RoofEvent,
   RoofNode,
   RoofSegmentNode,
@@ -17,19 +16,23 @@ import type {
 } from '@pascal-app/core'
 import {
   clampRectToRoofWallFace,
+  clearFaceHostItemFields,
+  createSceneApi,
   getRoofSegmentWallFace,
   getScaledDimensions,
-  isLowProfileItemSurface,
   nodeRegistry,
+  resolveSurfacePlacement,
   roofFacePointToSegment,
   sceneRegistry,
+  snapLocalXZInWorld,
   useScene,
+  wouldCreateHostingCycle,
 } from '@pascal-app/core'
-import { Euler, Matrix3, Quaternion, Vector3 } from 'three'
+import { Euler, Quaternion, Vector3 } from 'three'
 import { hasRoofFaceChildOverlap, resolveRoofWallHit } from '../../../lib/roof-wall-hit'
-import { snapWorldXZForActiveBuilding } from '../../../lib/world-grid-snap'
+import { getActiveBuildingPose } from '../../../lib/world-grid-snap'
+import { itemEventToSurfaceHit, surfaceWorldNormalY } from '../shared/surface-hit'
 import {
-  calculateCursorRotation,
   calculateItemRotation,
   getGridAlignedDimensions,
   getSideFromNormal,
@@ -48,47 +51,6 @@ import type {
 } from './placement-types'
 
 const DEFAULT_DIMENSIONS: [number, number, number] = [1, 1, 1]
-const UPWARD_SURFACE_NORMAL_MIN_Y = 0.75
-
-function getWorldNormalY(event: ItemEvent): number | null {
-  if (!event.normal) return null
-
-  const normal = new Vector3(event.normal[0], event.normal[1], event.normal[2])
-  normal.applyNormalMatrix(new Matrix3().getNormalMatrix(event.object.matrixWorld)).normalize()
-  return normal.y
-}
-
-function isUpwardItemSurfaceHit(event: ItemEvent): boolean {
-  const normalY = getWorldNormalY(event)
-  return normalY !== null && normalY >= UPWARD_SURFACE_NORMAL_MIN_Y
-}
-
-function getSurfacePlacementHeight(surfaceItem: ItemNode, event: ItemEvent, localPos: Vector3) {
-  if (isLowProfileItemSurface(surfaceItem)) return null
-  if (!isUpwardItemSurfaceHit(event)) return null
-
-  if (surfaceItem.asset.surface) {
-    return surfaceItem.asset.surface.height * surfaceItem.scale[1]
-  }
-
-  if (!Number.isFinite(localPos.y)) return null
-  return localPos.y
-}
-
-function isDescendantOfItem(
-  candidate: ItemNode,
-  ancestor: ItemNode,
-  nodes: Record<string, AnyNode>,
-): boolean {
-  let parentId = candidate.parentId
-  while (parentId) {
-    if (parentId === ancestor.id) return true
-    const parent = nodes[parentId as AnyNodeId]
-    parentId = parent?.parentId ?? null
-  }
-  return false
-}
-
 // ============================================================================
 // FLOOR STRATEGY
 // ============================================================================
@@ -113,14 +75,14 @@ export const floorStrategy = {
     // is rotated; then project the world point back into building-local
     // for storage. Without this, a rotated building drags placement off
     // the world grid.
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const [x, z] = bypassSnap
-      ? [event.localPosition[0], event.localPosition[2]]
-      : snapWorldXZForActiveBuilding(
-          snapToGrid(event.position[0], swapDims ? dimZ : dimX),
-          snapToGrid(event.position[2], swapDims ? dimX : dimZ),
-          0,
-        ).local
+    // Snapping is governed by the active mode (snapToGrid returns raw in Off /
+    // non-grid modes); Alt is force-place only and never bypasses snapping here.
+    const dimensions = [swapDims ? dimZ : dimX, swapDims ? dimX : dimZ] as const
+    const [x, z] = snapLocalXZInWorld(
+      [event.localPosition[0], event.localPosition[2]],
+      getActiveBuildingPose(),
+      (value, axis) => snapToGrid(value, dimensions[axis]),
+    )
     const y = ctx.gridPosition.y
 
     return {
@@ -177,6 +139,51 @@ export const floorStrategy = {
 // WALL STRATEGY
 // ============================================================================
 
+/**
+ * Resolve the wall-local node position AND the world pose of the placement
+ * wireframe from ONE wall-local point, so the box can't drift from the item it
+ * previews.
+ *
+ * `event.object` is the wall's collision mesh — the frame `event.localPosition`
+ * was measured in — so `localToWorld` is the exact inverse of the hit. Snapping
+ * the raw world hit per axis instead (the old path) put the box on a different
+ * lattice than the node: wall-local X runs from `wall.start`, and wall-local Y
+ * is measured from the supporting slab's elevation, not from world zero.
+ *
+ * `z` follows the hosting convention rather than the hit depth: `wall` items
+ * center in the thickness, `wall-side` items mount on the hit face — mirroring
+ * `ItemSystem`'s per-frame push, so the wireframe's `z = 0` face lands flush
+ * with the wall instead of extending through it.
+ */
+function resolveWallPlacementPose(
+  event: WallEvent,
+  localX: number,
+  localY: number,
+  attachTo: 'wall' | 'wall-side',
+  side: 'front' | 'back',
+  itemRotation: number,
+): {
+  position: [number, number, number]
+  cursorPosition: [number, number, number]
+  cursorRotationY: number
+} {
+  const localZ =
+    attachTo === 'wall-side' ? ((event.node.thickness ?? 0.1) / 2) * (side === 'front' ? 1 : -1) : 0
+  event.object.updateWorldMatrix(true, false)
+  const world = event.object.localToWorld(new Vector3(localX, localY, localZ))
+  const wallYaw = -Math.atan2(
+    event.node.end[1] - event.node.start[1],
+    event.node.end[0] - event.node.start[0],
+  )
+  return {
+    position: [localX, localY, localZ],
+    cursorPosition: [world.x, world.y, world.z],
+    // Same composition the 2D floorplan resolves a wall child with
+    // (`resolveItemTransform`): the cursor frame IS the item frame.
+    cursorRotationY: wallYaw + itemRotation,
+  }
+}
+
 export const wallStrategy = {
   /**
    * Handle wall:enter — transition from floor to wall surface.
@@ -194,18 +201,21 @@ export const wallStrategy = {
     if (attachTo !== 'wall' && attachTo !== 'wall-side') return null
     if (!isValidWallSideFace(event.normal)) return null
 
+    if (
+      ctx.draftItem &&
+      wouldCreateHostingCycle(ctx.draftItem.id, event.node, createSceneApi(useScene))
+    )
+      return null
+
     // Level guard
     const wallLevelId = resolveLevelId(event.node, nodes)
     if (ctx.levelId !== wallLevelId) return null
 
     const side = getSideFromNormal(event.normal)
     const itemRotation = calculateItemRotation(event.normal)
-    const cursorRotation = calculateCursorRotation(event.normal, event.node.start, event.node.end)
 
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const x = bypassSnap ? event.localPosition[0] : snapToHalf(event.localPosition[0])
-    const y = bypassSnap ? event.localPosition[1] : snapToHalf(event.localPosition[1])
-    const z = bypassSnap ? event.localPosition[2] : snapToHalf(event.localPosition[2])
+    const x = snapToHalf(event.localPosition[0])
+    const y = snapToHalf(event.localPosition[1])
 
     // Get auto-adjusted Y position from validator
     const rawDims = ctx.draftItem
@@ -223,27 +233,27 @@ export const wallStrategy = {
     )
 
     const adjustedY = validation.adjustedY ?? y
+    const pose = resolveWallPlacementPose(event, x, adjustedY, attachTo, side, itemRotation)
 
     return {
-      stateUpdate: { surface: 'wall', wallId: event.node.id, roofSegmentId: null },
+      stateUpdate: {
+        surface: 'wall',
+        wallId: event.node.id,
+        roofSegmentId: null,
+      },
       nodeUpdate: {
-        position: [x, adjustedY, z],
+        position: pose.position,
         parentId: event.node.id,
         // The draft may arrive from a roof-segment wall face.
         roofSegmentId: undefined,
         roofFace: undefined,
+        blockFaceId: undefined,
         side,
         rotation: [0, itemRotation, 0],
       },
-      cursorRotationY: cursorRotation,
-      gridPosition: [x, adjustedY, z],
-      cursorPosition: bypassSnap
-        ? [event.position[0], event.position[1], event.position[2]]
-        : [
-            snapToHalf(event.position[0]),
-            snapToHalf(event.position[1]),
-            snapToHalf(event.position[2]),
-          ],
+      cursorRotationY: pose.cursorRotationY,
+      gridPosition: pose.position,
+      cursorPosition: pose.cursorPosition,
       stopPropagation: true,
     }
   },
@@ -264,12 +274,10 @@ export const wallStrategy = {
 
     const side = getSideFromNormal(event.normal)
     const itemRotation = calculateItemRotation(event.normal)
-    const cursorRotation = calculateCursorRotation(event.normal, event.node.start, event.node.end)
+    const attachTo = ctx.draftItem.asset.attachTo as 'wall' | 'wall-side'
 
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const snappedX = bypassSnap ? event.localPosition[0] : snapToHalf(event.localPosition[0])
-    const snappedY = bypassSnap ? event.localPosition[1] : snapToHalf(event.localPosition[1])
-    const snappedZ = bypassSnap ? event.localPosition[2] : snapToHalf(event.localPosition[2])
+    const snappedX = snapToHalf(event.localPosition[0])
+    const snappedY = snapToHalf(event.localPosition[1])
 
     // Get auto-adjusted Y position from validator
     const validation = validators.canPlaceOnWall(
@@ -278,25 +286,20 @@ export const wallStrategy = {
       snappedX,
       snappedY,
       getGridAlignedDimensions(getScaledDimensions(ctx.draftItem), ctx.draftItem.asset.attachTo),
-      ctx.draftItem.asset.attachTo as 'wall' | 'wall-side',
+      attachTo,
       side,
       [ctx.draftItem.id],
     )
 
     const adjustedY = validation.adjustedY ?? snappedY
+    const pose = resolveWallPlacementPose(event, snappedX, adjustedY, attachTo, side, itemRotation)
 
     return {
-      gridPosition: [snappedX, adjustedY, snappedZ],
-      cursorPosition: bypassSnap
-        ? [event.position[0], event.position[1], event.position[2]]
-        : [
-            snapToHalf(event.position[0]),
-            snapToHalf(event.position[1]),
-            snapToHalf(event.position[2]),
-          ],
-      cursorRotationY: cursorRotation,
+      gridPosition: pose.position,
+      cursorPosition: pose.cursorPosition,
+      cursorRotationY: pose.cursorRotationY,
       nodeUpdate: {
-        position: [snappedX, adjustedY, snappedZ],
+        position: pose.position,
         side,
         rotation: [0, itemRotation, 0],
       },
@@ -337,6 +340,7 @@ export const wallStrategy = {
         parentId: event.node.id,
         roofSegmentId: undefined,
         roofFace: undefined,
+        blockFaceId: undefined,
         side: ctx.draftItem.side,
         rotation: ctx.draftItem.rotation,
         metadata: stripTransient(ctx.draftItem.metadata),
@@ -393,20 +397,25 @@ type RoofWallTarget = {
  * `wall-side` items mount on the outer surface, `wall` items center in
  * the wall thickness.
  *
- * `shiftFree` mirrors the wall flow's Shift override (stubbed
+ * `freePlace` mirrors the wall flow's Alt override (stubbed
  * validators): the profile clamp is skipped, so the rect may overhang
  * the face edges — placement follows the snapped cursor as-is.
  */
 function resolveRoofWallTarget(
   ctx: PlacementContext,
   event: RoofEvent,
-  shiftFree = false,
+  freePlace = false,
 ): RoofWallTarget | null {
   const attachTo = ctx.asset.attachTo
   if (attachTo !== 'wall' && attachTo !== 'wall-side') return null
 
   const hit = resolveRoofWallHit(event.node as RoofNode, event.position, event.normal, event.object)
   if (!hit) return null
+  if (
+    ctx.draftItem &&
+    wouldCreateHostingCycle(ctx.draftItem.id, hit.segment, createSceneApi(useScene))
+  )
+    return null
 
   const rawDims = ctx.draftItem
     ? getScaledDimensions(ctx.draftItem)
@@ -414,10 +423,12 @@ function resolveRoofWallTarget(
   const dims = getGridAlignedDimensions(rawDims, attachTo)
   const [width, height] = dims
 
-  const u = shiftFree ? hit.u : snapToHalf(hit.u)
-  const centerV = (shiftFree ? hit.v : snapToHalf(hit.v)) + height / 2
-  const fitted = shiftFree ? null : clampRectToRoofWallFace(hit.face, u, centerV, width, height)
-  if (!fitted && !shiftFree) return null
+  // Snap follows the active mode (snapToHalf returns raw in Off/non-grid);
+  // `freePlace` (Alt) is force-place — it only skips the face-fit validity gate.
+  const u = snapToHalf(hit.u)
+  const centerV = snapToHalf(hit.v) + height / 2
+  const fitted = freePlace ? null : clampRectToRoofWallFace(hit.face, u, centerV, width, height)
+  if (!fitted && !freePlace) return null
   const finalU = fitted?.u ?? u
   const finalV = fitted?.v ?? centerV
 
@@ -483,17 +494,22 @@ export const roofWallStrategy = {
    * face. Returns null when the item doesn't wall-attach or the pointer
    * isn't over a placeable face.
    */
-  enter(ctx: PlacementContext, event: RoofEvent, shiftFree = false): TransitionResult | null {
-    const target = resolveRoofWallTarget(ctx, event, shiftFree)
+  enter(ctx: PlacementContext, event: RoofEvent, freePlace = false): TransitionResult | null {
+    const target = resolveRoofWallTarget(ctx, event, freePlace)
     if (!target) return null
 
     return {
-      stateUpdate: { surface: 'roof-wall', roofSegmentId: target.segment.id, wallId: null },
+      stateUpdate: {
+        surface: 'roof-wall',
+        roofSegmentId: target.segment.id,
+        wallId: null,
+      },
       nodeUpdate: {
         position: target.position,
         parentId: target.segment.id,
         roofSegmentId: target.segment.id,
         roofFace: target.faceId,
+        blockFaceId: undefined,
         wallId: undefined,
         side: 'front',
         rotation: [0, 0, 0],
@@ -511,11 +527,11 @@ export const roofWallStrategy = {
    * segment transitions inside one roof never re-fire roof:enter) or to
    * no placeable face.
    */
-  move(ctx: PlacementContext, event: RoofEvent, shiftFree = false): PlacementResult | null {
+  move(ctx: PlacementContext, event: RoofEvent, freePlace = false): PlacementResult | null {
     if (ctx.state.surface !== 'roof-wall') return null
     if (!ctx.draftItem) return null
 
-    const target = resolveRoofWallTarget(ctx, event, shiftFree)
+    const target = resolveRoofWallTarget(ctx, event, freePlace)
     if (!target) return null
     if (target.segment.id !== ctx.state.roofSegmentId) return null
 
@@ -538,12 +554,12 @@ export const roofWallStrategy = {
   /**
    * Handle roof:click — commit placement on the segment wall face.
    */
-  click(ctx: PlacementContext, _event: RoofEvent, shiftFree = false): CommitResult | null {
+  click(ctx: PlacementContext, _event: RoofEvent, freePlace = false): CommitResult | null {
     if (ctx.state.surface !== 'roof-wall') return null
     if (!(ctx.draftItem && ctx.state.roofSegmentId)) return null
-    // Shift mirrors the wall flow's stubbed validators: skip profile-fit
+    // Alt mirrors the wall flow's stubbed validators: skip profile-fit
     // and overlap checks entirely.
-    if (!shiftFree && !canPlaceOnRoofWall(ctx)) return null
+    if (!freePlace && !canPlaceOnRoofWall(ctx)) return null
 
     return {
       nodeUpdate: {
@@ -551,6 +567,7 @@ export const roofWallStrategy = {
         parentId: ctx.state.roofSegmentId,
         roofSegmentId: ctx.state.roofSegmentId,
         roofFace: ctx.draftItem.roofFace,
+        blockFaceId: undefined,
         wallId: undefined,
         side: 'front',
         rotation: [0, 0, 0],
@@ -584,6 +601,109 @@ export const roofWallStrategy = {
 }
 
 // ============================================================================
+// FACE HOST STRATEGY
+// ============================================================================
+
+function resolveFaceHostTarget(ctx: PlacementContext, event: NodeEvent) {
+  if (
+    ctx.draftItem &&
+    wouldCreateHostingCycle(ctx.draftItem.id, event.node, createSceneApi(useScene))
+  )
+    return null
+  const faceHost = nodeRegistry.get(event.node.type)?.capabilities.faceHost
+  if (!faceHost) return null
+  const rawDimensions = ctx.draftItem
+    ? getScaledDimensions(ctx.draftItem)
+    : (ctx.asset.dimensions ?? DEFAULT_DIMENSIONS)
+  return faceHost.resolvePlacement({
+    host: event.node,
+    asset: ctx.asset,
+    draftItem: ctx.draftItem,
+    localPosition: event.localPosition,
+    faceIndex: event.faceIndex,
+    object: event.object,
+    currentFaceId: faceHost.currentFaceId(ctx.draftItem),
+    rawDimensions,
+    dimensions: getGridAlignedDimensions(rawDimensions, ctx.asset.attachTo),
+    snapScalar: snapToHalf,
+  })
+}
+
+export const faceHostStrategy = {
+  enter(ctx: PlacementContext, event: NodeEvent): TransitionResult | null {
+    const target = resolveFaceHostTarget(ctx, event)
+    if (!target) return null
+    return {
+      stateUpdate: {
+        surface: 'block-face',
+        blockId: event.node.id,
+        wallId: null,
+        roofSegmentId: null,
+      },
+      nodeUpdate: {
+        ...target.nodeUpdate,
+      },
+      gridPosition: target.position,
+      cursorPosition: target.cursorPosition,
+      cursorRotationY: target.cursorRotation[1],
+      cursorRotation: target.cursorRotation,
+      stopPropagation: true,
+      hostFaceId: target.faceId,
+    }
+  },
+
+  move(ctx: PlacementContext, event: NodeEvent): PlacementResult | null {
+    if (ctx.state.surface !== 'block-face' || !ctx.draftItem) return null
+    const target = resolveFaceHostTarget(ctx, event)
+    if (!target || event.node.id !== ctx.state.blockId) return null
+    return {
+      gridPosition: target.position,
+      cursorPosition: target.cursorPosition,
+      cursorRotationY: target.cursorRotation[1],
+      cursorRotation: target.cursorRotation,
+      nodeUpdate: target.nodeUpdate,
+      stopPropagation: true,
+      dirtyNodeId: null,
+      hostFaceId: target.faceId,
+    }
+  },
+
+  click(ctx: PlacementContext, event: NodeEvent): CommitResult | null {
+    if (ctx.state.surface !== 'block-face' || !ctx.draftItem) return null
+    const target = resolveFaceHostTarget(ctx, event)
+    if (!target || event.node.id !== ctx.state.blockId) return null
+    return {
+      nodeUpdate: {
+        ...target.nodeUpdate,
+        metadata: stripTransient(ctx.draftItem.metadata),
+      },
+      stopPropagation: true,
+      dirtyNodeId: null,
+    }
+  },
+
+  leave(ctx: PlacementContext): TransitionResult | null {
+    if (ctx.state.surface !== 'block-face') return null
+    const floorPosition: [number, number, number] = [ctx.gridPosition.x, 0, ctx.gridPosition.z]
+    return {
+      stateUpdate: { surface: 'floor', blockId: null },
+      nodeUpdate: {
+        ...clearFaceHostItemFields(
+          ctx.state.blockId ? useScene.getState().nodes[ctx.state.blockId] : undefined,
+        ),
+        position: floorPosition,
+        parentId: ctx.levelId,
+        rotation: [0, ctx.currentCursorRotationY, 0],
+      },
+      cursorRotationY: ctx.currentCursorRotationY,
+      gridPosition: floorPosition,
+      cursorPosition: floorPosition,
+      stopPropagation: true,
+    }
+  },
+}
+
+// ============================================================================
 // CEILING STRATEGY
 // ============================================================================
 
@@ -600,6 +720,12 @@ export const ceilingStrategy = {
   ): TransitionResult | null {
     if (ctx.asset.attachTo !== 'ceiling') return null
 
+    if (
+      ctx.draftItem &&
+      wouldCreateHostingCycle(ctx.draftItem.id, event.node, createSceneApi(useScene))
+    )
+      return null
+
     // Level guard
     const ceilingLevelId = resolveLevelId(event.node, nodes)
     if (ctx.levelId !== ceilingLevelId) return null
@@ -615,13 +741,8 @@ export const ceilingStrategy = {
 
     // Ceiling items are stored in ceiling-local coordinates, so snapping must
     // use the ceiling hit's local position rather than world position.
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const x = bypassSnap
-      ? event.localPosition[0]
-      : snapToGrid(event.localPosition[0], swapDims ? dimZ : dimX)
-    const z = bypassSnap
-      ? event.localPosition[2]
-      : snapToGrid(event.localPosition[2], swapDims ? dimX : dimZ)
+    const x = snapToGrid(event.localPosition[0], swapDims ? dimZ : dimX)
+    const z = snapToGrid(event.localPosition[2], swapDims ? dimX : dimZ)
     // Recessed fixtures seat flush with the ceiling plane (body rising into the
     // void above); everything else hangs its full height below the ceiling.
     const seatY = ctx.asset.recessed ? 0 : -itemHeight
@@ -654,13 +775,8 @@ export const ceilingStrategy = {
     const rotY = ctx.draftItem.rotation?.[1] ?? 0
     const swapDims = Math.abs(Math.sin(rotY)) > 0.9
 
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const x = bypassSnap
-      ? event.localPosition[0]
-      : snapToGrid(event.localPosition[0], swapDims ? dimZ : dimX)
-    const z = bypassSnap
-      ? event.localPosition[2]
-      : snapToGrid(event.localPosition[2], swapDims ? dimX : dimZ)
+    const x = snapToGrid(event.localPosition[0], swapDims ? dimZ : dimX)
+    const z = snapToGrid(event.localPosition[2], swapDims ? dimX : dimZ)
     // Recessed fixtures seat flush with the ceiling plane (body rising into the
     // void above); everything else hangs its full height below the ceiling.
     const seatY = ctx.draftItem.asset.recessed ? 0 : -itemHeight
@@ -738,66 +854,119 @@ export const ceilingStrategy = {
 // ITEM SURFACE STRATEGY
 // ============================================================================
 
+function resolveCatalogItemSurfacePlacement(
+  host: AnyNode,
+  event: NodeEvent<AnyNode>,
+  dimensions: [number, number, number],
+  worldYaw: number,
+  onReject?: PlacementContext['onSurfaceReject'],
+  rawEvent = event,
+  childId?: string,
+  childRotation?: [number, number, number],
+) {
+  const mesh = sceneRegistry.nodes.get(host.id)
+  if (!mesh) return null
+  const hit = itemEventToSurfaceHit(host, event)
+  if (!hit) return null
+  const quaternion = mesh.getWorldQuaternion(new Quaternion())
+  const hostYaw = new Euler().setFromQuaternion(quaternion, 'YXZ').y
+  const placement = resolveSurfacePlacement({
+    host,
+    childKind: 'item',
+    childId,
+    childFootprint: {
+      size: dimensions,
+      rotationY: worldYaw - hostYaw,
+      rotation: [childRotation?.[0] ?? 0, worldYaw - hostYaw, childRotation?.[2] ?? 0],
+    },
+    hit: host.type === 'procedural-item' ? (itemEventToSurfaceHit(host, rawEvent) ?? hit) : hit,
+    origin: host.type === 'procedural-item' ? hit.point : undefined,
+    scene: createSceneApi(useScene),
+    snapScalar: snapToGrid,
+    checkFootprint: true,
+    onReject,
+  })
+  if (!placement) return null
+  return {
+    position: [...placement.position] as [number, number, number],
+    rotationY: placement.rotationY,
+    surfaceId: placement.surfaceId,
+    worldPosition: mesh.localToWorld(new Vector3(...placement.position)).toArray(),
+  }
+}
+
+export function validCatalogCounterPose(ctx: PlacementContext): boolean {
+  const hostId = ctx.state.surface === 'shelf-surface' ? ctx.state.shelfId : ctx.state.surfaceItemId
+  const host = hostId ? useScene.getState().nodes[hostId as AnyNodeId] : undefined
+  if (!host) return true
+  if (!ctx.draftItem) return false
+  const placement = resolveSurfacePlacement({
+    host,
+    childKind: 'item',
+    childId: ctx.draftItem.id,
+    childFootprint: {
+      size: getScaledDimensions(ctx.draftItem),
+      rotationY: ctx.draftItem.rotation[1],
+      rotation: ctx.draftItem.rotation,
+    },
+    hit: { point: ctx.gridPosition.toArray(), normalWorldY: 1 },
+    scene: createSceneApi(useScene),
+    onReject: ctx.onSurfaceReject,
+  })
+  return (
+    !!placement &&
+    (host.type !== 'cabinet' || Math.abs(placement.position[1] - ctx.gridPosition.y) < 1e-5)
+  )
+}
+
 export const itemSurfaceStrategy = {
   /**
    * Handle item:enter — transition from floor to an item surface.
    * Returns null if: item has no surface, our item doesn't fit, or it's the draft itself.
    */
-  enter(ctx: PlacementContext, event: ItemEvent): TransitionResult | null {
+  enter(ctx: PlacementContext, event: NodeEvent<AnyNode>): TransitionResult | null {
     // Only floor items can be placed on surfaces
     if (ctx.asset.attachTo) return null
 
-    const surfaceItem = event.node as ItemNode
+    const surfaceItem = event.node
     // Don't surface-place on the draft itself
     if (surfaceItem.id === ctx.draftItem?.id) return null
     if (ctx.state.surface === 'item-surface' && ctx.state.surfaceItemId === surfaceItem.id) {
       return null
     }
-    const nodes = useScene.getState().nodes
-    if (ctx.draftItem && isDescendantOfItem(surfaceItem, ctx.draftItem, nodes)) return null
-
-    // Size check: our footprint must fit on surface item's footprint
     const ourDims = ctx.draftItem
       ? getScaledDimensions(ctx.draftItem)
       : (ctx.asset.dimensions ?? DEFAULT_DIMENSIONS)
-    const surfDims = getScaledDimensions(surfaceItem)
-    if (ourDims[0] > surfDims[0] || ourDims[2] > surfDims[2]) return null
-
-    const surfaceMesh = sceneRegistry.nodes.get(surfaceItem.id)
-    if (!surfaceMesh) return null
-
-    const worldPos = new Vector3(event.position[0], event.position[1], event.position[2])
-    const localPos = surfaceMesh.worldToLocal(worldPos)
-    const surfaceHeight = getSurfacePlacementHeight(surfaceItem, event, localPos)
-    if (surfaceHeight === null) return null
-
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const x = bypassSnap ? localPos.x : snapToGrid(localPos.x, ourDims[0])
-    const z = bypassSnap ? localPos.z : snapToGrid(localPos.z, ourDims[2])
-    const y = surfaceHeight
-
-    const worldSnapped = surfaceMesh.localToWorld(new Vector3(x, y, z))
-
-    // Counter-rotate so the draft's world Y rotation stays continuous when
-    // the user drags onto a rotated surface item. The cursor wireframe
-    // already shows the user's intended world rotation; we just need to
-    // store the right local value relative to the new parent.
-    const surfaceQuat = new Quaternion()
-    surfaceMesh.getWorldQuaternion(surfaceQuat)
-    const surfaceWorldY = new Euler().setFromQuaternion(surfaceQuat, 'YXZ').y
-    const localRotationY = ctx.currentCursorRotationY - surfaceWorldY
+    if (
+      ctx.draftItem &&
+      wouldCreateHostingCycle(ctx.draftItem.id, surfaceItem, createSceneApi(useScene))
+    )
+      return null
+    const pose = resolveCatalogItemSurfacePlacement(
+      surfaceItem,
+      event,
+      ourDims,
+      ctx.currentCursorRotationY,
+      ctx.onSurfaceReject,
+      event,
+      ctx.draftItem?.id,
+      ctx.draftItem?.rotation,
+    )
+    if (!pose) return null
     const draftRotation = ctx.draftItem?.rotation ?? [0, 0, 0]
 
     return {
+      surfaceId: pose.surfaceId,
       stateUpdate: { surface: 'item-surface', surfaceItemId: surfaceItem.id },
       nodeUpdate: {
-        position: [x, y, z],
+        position: pose.position,
         parentId: surfaceItem.id,
-        rotation: [draftRotation[0], localRotationY, draftRotation[2]],
+        supportSlabId: undefined,
+        rotation: [draftRotation[0], pose.rotationY, draftRotation[2]],
       },
       cursorRotationY: ctx.currentCursorRotationY,
-      gridPosition: [x, y, z],
-      cursorPosition: [worldSnapped.x, worldSnapped.y, worldSnapped.z],
+      gridPosition: pose.position,
+      cursorPosition: pose.worldPosition,
       stopPropagation: true,
     }
   },
@@ -805,36 +974,33 @@ export const itemSurfaceStrategy = {
   /**
    * Handle item:move — update position while on an item surface.
    */
-  move(ctx: PlacementContext, event: ItemEvent): PlacementResult | null {
+  move(ctx: PlacementContext, event: NodeEvent<AnyNode>, rawEvent = event): PlacementResult | null {
     if (ctx.state.surface !== 'item-surface') return null
     if (!(ctx.state.surfaceItemId && ctx.draftItem)) return null
     if (event.node.id !== ctx.state.surfaceItemId) return null
 
     const nodes = useScene.getState().nodes
-    const surfaceItem = nodes[ctx.state.surfaceItemId as AnyNodeId] as ItemNode | undefined
+    const surfaceItem = nodes[ctx.state.surfaceItemId as AnyNodeId]
     if (!surfaceItem) return null
 
-    const surfaceMesh = sceneRegistry.nodes.get(ctx.state.surfaceItemId)
-    if (!surfaceMesh) return null
-
-    const ourDims = getScaledDimensions(ctx.draftItem)
-    const worldPos = new Vector3(event.position[0], event.position[1], event.position[2])
-    const localPos = surfaceMesh.worldToLocal(worldPos)
-    const surfaceHeight = getSurfacePlacementHeight(surfaceItem, event, localPos)
-    if (surfaceHeight === null) return null
-
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const x = bypassSnap ? localPos.x : snapToGrid(localPos.x, ourDims[0])
-    const z = bypassSnap ? localPos.z : snapToGrid(localPos.z, ourDims[2])
-    const y = surfaceHeight
-
-    const worldSnapped = surfaceMesh.localToWorld(new Vector3(x, y, z))
+    const pose = resolveCatalogItemSurfacePlacement(
+      surfaceItem,
+      event,
+      getScaledDimensions(ctx.draftItem),
+      ctx.currentCursorRotationY,
+      ctx.onSurfaceReject,
+      rawEvent,
+      ctx.draftItem.id,
+      ctx.draftItem.rotation,
+    )
+    if (!pose) return null
 
     return {
-      gridPosition: [x, y, z],
-      cursorPosition: [worldSnapped.x, worldSnapped.y, worldSnapped.z],
+      surfaceId: pose.surfaceId,
+      gridPosition: pose.position,
+      cursorPosition: pose.worldPosition,
       cursorRotationY: ctx.currentCursorRotationY,
-      nodeUpdate: { position: [x, y, z] },
+      nodeUpdate: { position: pose.position },
       stopPropagation: true,
       dirtyNodeId: null,
     }
@@ -843,10 +1009,11 @@ export const itemSurfaceStrategy = {
   /**
    * Handle item:click — commit placement on item surface.
    */
-  click(ctx: PlacementContext, _event: ItemEvent): CommitResult | null {
+  click(ctx: PlacementContext, _event: NodeEvent<AnyNode>): CommitResult | null {
     if (ctx.state.surface !== 'item-surface') return null
     if (!(ctx.draftItem && ctx.state.surfaceItemId)) return null
     if (_event.node.id !== ctx.state.surfaceItemId) return null
+    if (!validCatalogCounterPose(ctx)) return null
 
     return {
       nodeUpdate: {
@@ -864,32 +1031,42 @@ export const itemSurfaceStrategy = {
 // SHELF SURFACE STRATEGY
 // ============================================================================
 
-/**
- * Resolve the row Y closest to the cursor's local Y. Reads candidate row
- * positions from the kind's `capabilities.surfaces.custom` — the shelf
- * declaration emits one `SurfacePoint` per board's top surface. The
- * strategy stays kind-agnostic at this level: any future "multi-board"
- * kind that declares `surfaces.custom` with upward normals gets the
- * same hit behaviour for free.
- */
-function getShelfRowSurfaceY(shelfNode: ShelfNode, localY: number): number | null {
-  const def = nodeRegistry.get('shelf')
-  const custom = def?.capabilities?.surfaces?.custom
-  if (!custom) return null
-  const candidates = custom(shelfNode as AnyNode)
-  if (candidates.length === 0) return null
-  let best = candidates[0]
-  let bestDist = Math.abs(best!.position[1] - localY)
-  for (let i = 1; i < candidates.length; i++) {
-    const c = candidates[i]
-    if (!c) continue
-    const dist = Math.abs(c.position[1] - localY)
-    if (dist < bestDist) {
-      best = c
-      bestDist = dist
-    }
+function resolveShelfSurfacePlacement(
+  host: ShelfNode,
+  event: ShelfEvent,
+  dimensions: [number, number, number],
+  worldYaw: number,
+  entering: boolean,
+  onReject?: PlacementContext['onSurfaceReject'],
+  childId?: string,
+) {
+  const mesh = sceneRegistry.nodes.get(host.id)
+  if (!mesh) return null
+  const local = mesh.worldToLocal(new Vector3(...event.position))
+  const quaternion = mesh.getWorldQuaternion(new Quaternion())
+  const hostYaw = new Euler().setFromQuaternion(quaternion, 'YXZ').y
+  const placement = resolveSurfacePlacement({
+    host,
+    childKind: 'item',
+    childId,
+    childFootprint: { size: dimensions, rotationY: worldYaw - hostYaw },
+    hit: {
+      point: local.toArray(),
+      // Existing shelf movement elects rows even over side faces or board gaps;
+      // only entering requires an upward hit.
+      normalWorldY: entering ? surfaceWorldNormalY(event.normal, event.object.matrixWorld) : 1,
+    },
+    scene: createSceneApi(useScene),
+    snapScalar: snapToGrid,
+    onReject,
+    checkFootprint: true,
+  })
+  if (!placement) return null
+  return {
+    position: [...placement.position] as [number, number, number],
+    rotationY: placement.rotationY,
+    worldPosition: mesh.localToWorld(new Vector3(...placement.position)).toArray(),
   }
-  return best?.position[1] ?? null
 }
 
 export const shelfSurfaceStrategy = {
@@ -908,44 +1085,31 @@ export const shelfSurfaceStrategy = {
     if (ctx.state.surface === 'shelf-surface' && ctx.state.shelfId === shelfNode.id) {
       return null
     }
-    if (!isUpwardShelfSurfaceHit(event)) return null
-
-    // Size check: draft footprint must fit on the shelf board (width × depth).
     const ourDims = ctx.draftItem
       ? getScaledDimensions(ctx.draftItem)
       : (ctx.asset.dimensions ?? DEFAULT_DIMENSIONS)
-    if (ourDims[0] > shelfNode.width || ourDims[2] > shelfNode.depth) return null
-
-    const shelfMesh = sceneRegistry.nodes.get(shelfNode.id)
-    if (!shelfMesh) return null
-
-    const worldPos = new Vector3(event.position[0], event.position[1], event.position[2])
-    const localPos = shelfMesh.worldToLocal(worldPos)
-    const rowY = getShelfRowSurfaceY(shelfNode, localPos.y)
-    if (rowY === null) return null
-
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const x = bypassSnap ? localPos.x : snapToGrid(localPos.x, ourDims[0])
-    const z = bypassSnap ? localPos.z : snapToGrid(localPos.z, ourDims[2])
-
-    const worldSnapped = shelfMesh.localToWorld(new Vector3(x, rowY, z))
-
-    const surfaceQuat = new Quaternion()
-    shelfMesh.getWorldQuaternion(surfaceQuat)
-    const surfaceWorldY = new Euler().setFromQuaternion(surfaceQuat, 'YXZ').y
-    const localRotationY = ctx.currentCursorRotationY - surfaceWorldY
+    const pose = resolveShelfSurfacePlacement(
+      shelfNode,
+      event,
+      ourDims,
+      ctx.currentCursorRotationY,
+      true,
+      ctx.onSurfaceReject,
+      ctx.draftItem?.id,
+    )
+    if (!pose) return null
     const draftRotation = ctx.draftItem?.rotation ?? [0, 0, 0]
 
     return {
       stateUpdate: { surface: 'shelf-surface', shelfId: shelfNode.id },
       nodeUpdate: {
-        position: [x, rowY, z],
+        position: pose.position,
         parentId: shelfNode.id,
-        rotation: [draftRotation[0], localRotationY, draftRotation[2]],
+        rotation: [draftRotation[0], pose.rotationY, draftRotation[2]],
       },
       cursorRotationY: ctx.currentCursorRotationY,
-      gridPosition: [x, rowY, z],
-      cursorPosition: [worldSnapped.x, worldSnapped.y, worldSnapped.z],
+      gridPosition: pose.position,
+      cursorPosition: pose.worldPosition,
       stopPropagation: true,
     }
   },
@@ -959,26 +1123,22 @@ export const shelfSurfaceStrategy = {
     if (!(ctx.state.shelfId && ctx.draftItem)) return null
     if (event.node.id !== ctx.state.shelfId) return null
 
-    const shelfNode = event.node as ShelfNode
-    const shelfMesh = sceneRegistry.nodes.get(shelfNode.id)
-    if (!shelfMesh) return null
-
-    const ourDims = getScaledDimensions(ctx.draftItem)
-    const worldPos = new Vector3(event.position[0], event.position[1], event.position[2])
-    const localPos = shelfMesh.worldToLocal(worldPos)
-    const rowY = getShelfRowSurfaceY(shelfNode, localPos.y)
-    if (rowY === null) return null
-
-    const bypassSnap = event.nativeEvent?.shiftKey === true
-    const x = bypassSnap ? localPos.x : snapToGrid(localPos.x, ourDims[0])
-    const z = bypassSnap ? localPos.z : snapToGrid(localPos.z, ourDims[2])
-    const worldSnapped = shelfMesh.localToWorld(new Vector3(x, rowY, z))
+    const pose = resolveShelfSurfacePlacement(
+      event.node as ShelfNode,
+      event,
+      getScaledDimensions(ctx.draftItem),
+      ctx.currentCursorRotationY,
+      false,
+      ctx.onSurfaceReject,
+      ctx.draftItem.id,
+    )
+    if (!pose) return null
 
     return {
-      gridPosition: [x, rowY, z],
-      cursorPosition: [worldSnapped.x, worldSnapped.y, worldSnapped.z],
+      gridPosition: pose.position,
+      cursorPosition: pose.worldPosition,
       cursorRotationY: ctx.currentCursorRotationY,
-      nodeUpdate: { position: [x, rowY, z] },
+      nodeUpdate: { position: pose.position },
       stopPropagation: true,
       dirtyNodeId: null,
     }
@@ -991,6 +1151,7 @@ export const shelfSurfaceStrategy = {
     if (ctx.state.surface !== 'shelf-surface') return null
     if (!(ctx.draftItem && ctx.state.shelfId)) return null
     if (event.node.id !== ctx.state.shelfId) return null
+    if (!validCatalogCounterPose(ctx)) return null
 
     return {
       nodeUpdate: {
@@ -1004,14 +1165,6 @@ export const shelfSurfaceStrategy = {
   },
 }
 
-/** Same upward-normal heuristic as `isUpwardItemSurfaceHit`, but typed
- *  for `ShelfEvent`. Re-uses the matrix-driven world normal calculation
- *  via a tiny `ItemEvent`-shaped adapter — the function only reads
- *  `event.normal` + `event.object`. */
-function isUpwardShelfSurfaceHit(event: ShelfEvent): boolean {
-  return isUpwardItemSurfaceHit(event as unknown as ItemEvent)
-}
-
 // ============================================================================
 // VALIDATION
 // ============================================================================
@@ -1023,19 +1176,29 @@ function isUpwardShelfSurfaceHit(event: ShelfEvent): boolean {
 export function checkCanPlace(ctx: PlacementContext, validators: SpatialValidators): boolean {
   if (!(ctx.levelId && ctx.draftItem)) return false
 
-  // Item surface: valid if we entered (size check was in enter)
   if (ctx.state.surface === 'item-surface') {
-    return ctx.state.surfaceItemId !== null
+    return ctx.state.surfaceItemId !== null && validCatalogCounterPose(ctx)
   }
 
-  // Shelf surface: same — size check already happened on enter
   if (ctx.state.surface === 'shelf-surface') {
-    return ctx.state.shelfId !== null
+    return ctx.state.shelfId !== null && validCatalogCounterPose(ctx)
   }
 
   const attachTo = ctx.draftItem.asset.attachTo
 
   const alignedDims = getGridAlignedDimensions(getScaledDimensions(ctx.draftItem), attachTo)
+
+  if (ctx.state.surface === 'block-face') {
+    const hostId = ctx.state.blockId
+    const host = hostId ? useScene.getState().nodes[hostId as AnyNodeId] : undefined
+    const faceHost = host ? nodeRegistry.get(host.type)?.capabilities.faceHost : undefined
+    if (!(host && faceHost)) return false
+    return faceHost.isStoredPlacementValid({
+      host,
+      item: ctx.draftItem,
+      asset: ctx.draftItem.asset,
+    })
+  }
 
   if (attachTo === 'ceiling') {
     if (ctx.state.surface !== 'ceiling' || !ctx.state.ceilingId) return false

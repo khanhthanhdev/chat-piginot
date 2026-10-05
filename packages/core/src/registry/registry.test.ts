@@ -2,15 +2,20 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 import { z } from 'zod'
 import {
   getHostRefFields,
+  getInspectorExtensions,
+  getNodePluginId,
   isDrawnViaTool,
   isDrawnViaToolKind,
+  isNodeKindEnabled,
   isPresettable,
   isPresettableKind,
+  isSelectionHighlightEnabled,
+  kindsWithFloorplanScope,
   loadPlugin,
   nodeRegistry,
   registerNode,
 } from './registry'
-import type { AnyNodeDefinition, Plugin } from './types'
+import type { AnyNodeDefinition, InspectorExtension, Plugin } from './types'
 
 // Re-registering a kind warns + replaces in dev (HMR) but throws in
 // production — see `registry._register`. `bun test` runs with
@@ -61,6 +66,16 @@ describe('nodeRegistry', () => {
     expect(nodeRegistry.get('column')).toBe(def)
   })
 
+  test('discovers explicit site-scoped kinds without changing the level default', () => {
+    registerNode(makeDefinition('level-default'))
+    registerNode(makeDefinition('building-owned', { floorplanScope: 'building' }))
+    registerNode(makeDefinition('site-owned', { floorplanScope: 'site' }))
+
+    expect(kindsWithFloorplanScope('level')).toEqual(['level-default'])
+    expect(kindsWithFloorplanScope('building')).toEqual(['building-owned'])
+    expect(kindsWithFloorplanScope('site')).toEqual(['site-owned'])
+  })
+
   test('registerNode throws on duplicate kind in production', async () => {
     await inProduction(() => {
       registerNode(makeDefinition('column'))
@@ -102,6 +117,35 @@ describe('nodeRegistry', () => {
     registerNode(b)
     expect(nodeRegistry.schemas()).toEqual([a.schema, b.schema])
   })
+
+  test('_snapshot() restores definitions and plugin bookkeeping', async () => {
+    const kept = makeDefinition('kept')
+    registerNode(kept)
+    await loadPlugin({
+      id: 'test:kept-plugin',
+      apiVersion: 1,
+      nodes: [makeDefinition('kept-plugin-kind')],
+    } as Plugin)
+
+    const restore = nodeRegistry._snapshot()
+
+    // Mutate every kind of registry state a test can leak: a throwaway
+    // definition, a full reset, and a plugin load with its kind bookkeeping.
+    registerNode(makeDefinition('leaked'))
+    nodeRegistry._reset()
+    await loadPlugin({
+      id: 'test:leaked-plugin',
+      apiVersion: 1,
+      nodes: [makeDefinition('leaked-plugin-kind')],
+    } as Plugin)
+
+    restore()
+
+    expect(Array.from(nodeRegistry.entries(), ([k]) => k)).toEqual(['kept', 'kept-plugin-kind'])
+    expect(nodeRegistry.get('kept')).toBe(kept)
+    expect(getNodePluginId('kept-plugin-kind')).toBe('test:kept-plugin')
+    expect(getNodePluginId('leaked-plugin-kind')).toBeUndefined()
+  })
 })
 
 describe('isPresettable', () => {
@@ -136,6 +180,23 @@ describe('isPresettable', () => {
     registerNode(makeDefinition('shelfy', { parametrics: { groups: [] } as any }))
     expect(isPresettableKind('shelfy')).toBe(true)
     expect(isPresettableKind('unknown')).toBe(false)
+  })
+})
+
+describe('isSelectionHighlightEnabled', () => {
+  beforeEach(() => {
+    nodeRegistry._reset()
+  })
+
+  test('defaults to true when the capability or definition is omitted', () => {
+    registerNode(makeDefinition('default-highlight'))
+    expect(isSelectionHighlightEnabled('default-highlight')).toBe(true)
+    expect(isSelectionHighlightEnabled('unregistered')).toBe(true)
+  })
+
+  test('returns false when the definition explicitly opts out', () => {
+    registerNode(makeDefinition('paint-layer', { capabilities: { selectionHighlight: false } }))
+    expect(isSelectionHighlightEnabled('paint-layer')).toBe(false)
   })
 })
 
@@ -188,6 +249,23 @@ describe('loadPlugin', () => {
     expect(nodeRegistry.size).toBe(2)
     expect(nodeRegistry.has('a')).toBe(true)
     expect(nodeRegistry.has('b')).toBe(true)
+    expect(getNodePluginId('a')).toBe('test:plugin')
+    expect(getNodePluginId('b')).toBe('test:plugin')
+  })
+
+  test('enables plugin kinds only when the project has the plugin installed', async () => {
+    await loadPlugin({ id: 'test:plugin', apiVersion: 1, nodes: [makeDefinition('plugin:node')] })
+
+    expect(isNodeKindEnabled('plugin:node', [])).toBe(false)
+    expect(isNodeKindEnabled('plugin:node', ['test:plugin'])).toBe(true)
+    expect(isNodeKindEnabled('plugin:node')).toBe(true)
+    expect(isNodeKindEnabled('host:node', [])).toBe(true)
+  })
+
+  test('keeps built-in plugin kinds enabled independently of project installs', async () => {
+    await loadPlugin({ id: 'pascal:core', apiVersion: 1, nodes: [makeDefinition('wall')] })
+
+    expect(isNodeKindEnabled('wall', [])).toBe(true)
   })
 
   test('handles plugin with no nodes', async () => {
@@ -225,5 +303,124 @@ describe('loadPlugin', () => {
         loadPlugin({ id: 'b', apiVersion: 1, nodes: [makeDefinition('shared')] }),
       ).rejects.toThrow(/duplicate node kind/)
     })
+  })
+
+  // GATE (late-plugin subscriptions): plugins register via async dynamic
+  // imports AFTER consumers mount. The selection managers rebuild their
+  // `getSelectableKinds()` emitter subscriptions off this change signal —
+  // without it, a plugin kind selects but never hovers in prod (the outline
+  // subscription list froze pre-registration).
+  test('registerNode bumps the registry version and notifies subscribers', async () => {
+    const { getRegistryVersion, onRegistryChange } = await import('./registry')
+    const before = getRegistryVersion()
+    let notified = 0
+    const unsubscribe = onRegistryChange(() => {
+      notified += 1
+    })
+
+    registerNode(makeDefinition('late:kind', { capabilities: { selectable: {} } }))
+    expect(getRegistryVersion()).toBe(before + 1)
+    expect(notified).toBe(1)
+
+    // A consumer re-deriving on the notification now sees the new kind.
+    const { getSelectableKinds } = await import('./registry')
+    expect(getSelectableKinds()).toContain('late:kind')
+
+    unsubscribe()
+    registerNode(makeDefinition('late:kind-2'))
+    expect(getRegistryVersion()).toBe(before + 2)
+    expect(notified).toBe(1) // unsubscribed — no further calls
+  })
+
+  test('loadPlugin notifies once per registered kind', async () => {
+    const { getRegistryVersion } = await import('./registry')
+    const before = getRegistryVersion()
+    await loadPlugin({
+      id: 'pack',
+      apiVersion: 1,
+      nodes: [makeDefinition('pack:a'), makeDefinition('pack:b')],
+    })
+    expect(getRegistryVersion()).toBe(before + 2)
+  })
+})
+
+describe('inspector extensions', () => {
+  beforeEach(() => {
+    nodeRegistry._reset()
+  })
+
+  function makeExtension(
+    id: string,
+    kinds: string[],
+    overrides: Partial<InspectorExtension> = {},
+  ): InspectorExtension {
+    return {
+      id,
+      pluginId: 'test:plugin',
+      kinds,
+      icon: { kind: 'url', src: '/icons/test.png' },
+      title: 'Engineering',
+      component: async () => ({ default: () => null }),
+      ...overrides,
+    }
+  }
+
+  test('starts empty for any kind', () => {
+    expect(getInspectorExtensions('wall')).toEqual([])
+  })
+
+  test('loadPlugin registers extensions under each declared kind', async () => {
+    const extension = makeExtension('test:plugin:eng', ['wall', 'slab'])
+    await loadPlugin({ id: 'test:plugin', apiVersion: 1, inspectorExtensions: [extension] })
+
+    expect(getInspectorExtensions('wall')).toEqual([extension])
+    expect(getInspectorExtensions('slab')).toEqual([extension])
+    expect(getInspectorExtensions('roof')).toEqual([])
+  })
+
+  test('extensions from separate plugins accumulate in load order', async () => {
+    const a = makeExtension('a:eng', ['wall'], { pluginId: 'a' })
+    const b = makeExtension('b:eng', ['wall'], { pluginId: 'b' })
+    await loadPlugin({ id: 'a', apiVersion: 1, inspectorExtensions: [a] })
+    await loadPlugin({ id: 'b', apiVersion: 1, inspectorExtensions: [b] })
+
+    expect(getInspectorExtensions('wall')).toEqual([a, b])
+  })
+
+  test('re-registering the same extension id replaces in place (HMR)', async () => {
+    const first = makeExtension('test:plugin:eng', ['wall'])
+    const second = makeExtension('test:plugin:eng', ['wall'], { title: 'Engineering v2' })
+    await loadPlugin({ id: 'test:plugin', apiVersion: 1, inspectorExtensions: [first] })
+    await loadPlugin({ id: 'test:plugin', apiVersion: 1, inspectorExtensions: [second] })
+
+    const registered = getInspectorExtensions('wall')
+    expect(registered).toHaveLength(1)
+    expect(registered[0]?.title).toBe('Engineering v2')
+  })
+
+  // GATE (late-plugin inspector sections): the inspector card derives its
+  // extension list at render time — without a version bump for a plugin
+  // that ships ONLY extensions (no node kinds), a late load would never
+  // re-render the open card and the section would silently not appear.
+  test('registering extensions bumps the registry version', async () => {
+    const { getRegistryVersion } = await import('./registry')
+    const before = getRegistryVersion()
+    await loadPlugin({
+      id: 'test:plugin',
+      apiVersion: 1,
+      inspectorExtensions: [makeExtension('test:plugin:eng', ['wall'])],
+    })
+    expect(getRegistryVersion()).toBeGreaterThan(before)
+  })
+
+  test('_reset clears registered extensions', async () => {
+    await loadPlugin({
+      id: 'test:plugin',
+      apiVersion: 1,
+      inspectorExtensions: [makeExtension('test:plugin:eng', ['wall'])],
+    })
+    expect(getInspectorExtensions('wall')).toHaveLength(1)
+    nodeRegistry._reset()
+    expect(getInspectorExtensions('wall')).toEqual([])
   })
 })

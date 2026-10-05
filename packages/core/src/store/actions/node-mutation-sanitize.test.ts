@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import type { AnyNode, AnyNodeId } from '../../schema/types'
 import useScene from '../use-scene'
+import { numericSanitizeIssuesToMessage } from './node-actions'
 
 type RafFn = (cb: (t: number) => void) => number
 ;(globalThis as unknown as { requestAnimationFrame?: RafFn }).requestAnimationFrame ??= ((
@@ -14,6 +15,22 @@ type RafFn = (cb: (t: number) => void) => number
 
 const SHELF_ID = 'shelf_sanitize' as AnyNodeId
 const SOLAR_PANEL_ID = 'sp_x' as AnyNodeId
+const WALL_ID = 'wall_keyremoval' as AnyNodeId
+
+function makeWall(): AnyNode {
+  return {
+    id: WALL_ID,
+    type: 'wall',
+    parentId: null,
+    object: 'node',
+    visible: true,
+    metadata: {},
+    children: [],
+    start: [0, 0],
+    end: [4, 0],
+    height: 2.5,
+  } as unknown as AnyNode
+}
 
 function makeShelf(overrides: Partial<AnyNode> = {}): AnyNode {
   return {
@@ -70,6 +87,21 @@ function makeSolarPanel(): AnyNode {
 function shelf() {
   return useScene.getState().nodes[SHELF_ID] as Extract<AnyNode, { type: 'shelf' }>
 }
+
+describe('numeric sanitization diagnostics', () => {
+  test('formats missing and non-array issue paths defensively', () => {
+    const issues = [
+      { from: Infinity, action: 'dropped' },
+      { path: 'width', from: Number.NaN, action: 'dropped' },
+    ] as never
+
+    expect(numericSanitizeIssuesToMessage(issues)).toBe(
+      '<unknown>: Infinity dropped; <unknown>: NaN dropped',
+    )
+    expect(numericSanitizeIssuesToMessage(null)).toBe('')
+    expect(numericSanitizeIssuesToMessage(undefined)).toBe('')
+  })
+})
 
 describe('node mutation numeric sanitization', () => {
   beforeEach(() => {
@@ -155,6 +187,29 @@ describe('node mutation numeric sanitization', () => {
     expect(panel.name).toBe('Updated panel')
   })
 
+  test('updateNodes continues through schema-invalid numeric updates when reporting throws', () => {
+    const originalConsoleWarn = console.warn
+    console.warn = () => {
+      throw new Error('diagnostic sink failed')
+    }
+
+    try {
+      useScene.getState().updateNodes([
+        { id: SHELF_ID, data: { width: Infinity } as Partial<AnyNode> },
+        {
+          id: SOLAR_PANEL_ID,
+          data: { name: 'Updated after invalid numeric value' } as Partial<AnyNode>,
+        },
+      ])
+    } finally {
+      console.warn = originalConsoleWarn
+    }
+
+    expect(shelf().width).toBe(1.2)
+    const panel = useScene.getState().nodes[SOLAR_PANEL_ID] as { name?: string }
+    expect(panel.name).toBe('Updated after invalid numeric value')
+  })
+
   test('sanitizes non-finite numeric values during create', () => {
     const createdId = 'shelf_created' as AnyNodeId
 
@@ -171,5 +226,47 @@ describe('node mutation numeric sanitization', () => {
     expect(created.thickness).toBe(0.04)
     expect(Number.isFinite(created.width)).toBe(true)
     expect(Number.isFinite(created.thickness)).toBe(true)
+  })
+})
+
+describe('node update explicit-undefined key removal', () => {
+  beforeEach(() => {
+    useScene.setState({
+      nodes: { [WALL_ID]: makeWall() },
+      rootNodeIds: [WALL_ID],
+      dirtyNodes: new Set(),
+      collections: {},
+      readOnly: false,
+    } as never)
+    useScene.temporal.getState().clear()
+  })
+
+  test('an undefined value in update data removes the key from the stored node', () => {
+    useScene.getState().updateNode(WALL_ID, { height: undefined } as Partial<AnyNode>)
+
+    const wall = useScene.getState().nodes[WALL_ID] as Record<string, unknown>
+    expect('height' in wall).toBe(false)
+  })
+
+  test('undo restores a key removed via an undefined update value', () => {
+    useScene.getState().updateNode(WALL_ID, { height: undefined } as Partial<AnyNode>)
+    expect('height' in (useScene.getState().nodes[WALL_ID] as Record<string, unknown>)).toBe(false)
+
+    useScene.temporal.getState().undo()
+
+    const wall = useScene.getState().nodes[WALL_ID] as { height?: number }
+    expect('height' in wall).toBe(true)
+    expect(wall.height).toBe(2.5)
+  })
+
+  test('other keys in the same patch still apply when one is removed', () => {
+    useScene.getState().updateNode(WALL_ID, {
+      height: undefined,
+      name: 'Plane-bound wall',
+    } as Partial<AnyNode>)
+
+    const wall = useScene.getState().nodes[WALL_ID] as Record<string, unknown>
+    expect('height' in wall).toBe(false)
+    expect(wall.name).toBe('Plane-bound wall')
   })
 })

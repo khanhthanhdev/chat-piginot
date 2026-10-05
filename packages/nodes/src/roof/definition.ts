@@ -7,8 +7,19 @@ import {
   type RoofSegmentNode,
   type SceneApi,
 } from '@pascal-app/core'
+import {
+  DRAFTING_SURFACE_EXTENSION_KEY,
+  type DraftingSurfaceExtension,
+  PANEL_MODEL_EXTENSION,
+} from '@pascal-app/editor'
 import { buildRoofFloorplan } from './floorplan'
+import { roofPanelModel } from './panel-model'
 import { roofParametrics } from './parametrics'
+import useRoofFootprintSource from './roof-footprint-source'
+import useRoofPlacementMode, {
+  conicalRoofToolHintVisibility,
+  standardRoofToolHintVisibility,
+} from './roof-placement-mode'
 import { RoofNode } from './schema'
 
 const MOVE_FRONT_OFFSET = 0.35
@@ -66,7 +77,12 @@ function roofMoveHandle(): HandleDescriptor<RoofNodeType> {
         return [(bounds.minX + bounds.maxX) / 2, 0.02, bounds.maxZ + MOVE_FRONT_OFFSET]
       },
     },
-    apply: (_node, position) => ({ position: [position[0], position[1], position[2]] }),
+    apply: (node, position) => ({
+      position: [position[0], position[1], position[2]],
+      ...(node.support?.kind === 'walls' && Math.abs(position[1] - node.position[1]) > 1e-4
+        ? { support: { kind: 'level' as const } }
+        : {}),
+    }),
     snapExtents: (node, sceneApi) => {
       const bounds = getRoofFootprintBounds(node, sceneApi)
       const width = Math.max(bounds.maxX - bounds.minX, MIN_ROOF_FOOTPRINT)
@@ -79,24 +95,38 @@ function roofMoveHandle(): HandleDescriptor<RoofNodeType> {
 
 const roofHandles: HandleDescriptor<RoofNodeType>[] = [roofMoveHandle()]
 
+function isManagedLeanToRoof(node: RoofNodeType): boolean {
+  const metadata = node.metadata
+  if (!(metadata && typeof metadata === 'object' && !Array.isArray(metadata))) return false
+  const record = metadata as Record<string, unknown>
+  return record.managedByLeanTo !== undefined && record.leanToRole === 'roof'
+}
+
+function resolveRoofHandles(node: RoofNodeType): HandleDescriptor<RoofNodeType>[] {
+  return isManagedLeanToRoof(node) ? [] : roofHandles
+}
+
 /**
- * Roof — Stage A registration. Wrap-exports the legacy `RoofRenderer`
- * + `RoofSystem` (geometry generation via `getRoofSegmentBrushes` +
- * CSG). Inspector / move stay legacy until Stage B-E. `floorplan` draws
- * the merged silhouette (union of the child segments' footprints), so a
- * multi-segment roof reads as one combined shape rather than stacked
- * rectangles.
- *
- * Roof is a "composite" node — it has `roof-segment` children that
- * own per-segment geometry. The parent roof handles overall framing;
- * each segment is its own registered kind (see `roof-segment`).
+ * Roof is a composite node with `roof-segment` children that own the
+ * per-segment geometry. Its floor-plan contribution merges those child
+ * footprints so a multi-segment roof reads as one shape.
  */
 export const roofDefinition: NodeDefinition<typeof RoofNode> = {
   kind: 'roof',
-  schemaVersion: 1,
+  snapProfile: 'structural',
+  // Drafted as a 2-corner footprint (axis-aligned bbox), not a directional
+  // edge → no angle-lock mode (grid / lines / off only).
+  snapDraftDirectional: false,
+  schemaVersion: 3,
   schema: RoofNode,
   category: 'structure',
   surfaceRole: 'roof',
+  extensions: {
+    [PANEL_MODEL_EXTENSION]: roofPanelModel,
+    [DRAFTING_SURFACE_EXTENSION_KEY]: {
+      kind: 'roof',
+    } satisfies DraftingSurfaceExtension,
+  },
 
   defaults: () => {
     const stub = RoofNodeSchema.parse({ id: 'roof_default' as never, type: 'roof' })
@@ -162,11 +192,67 @@ export const roofDefinition: NodeDefinition<typeof RoofNode> = {
   affordanceTools: {
     move: () => import('../shared/move-roof-tool'),
   },
+  tool: () => import('./tool'),
+  toolHints: [
+    { key: 'Left click', label: 'Set roof footprint' },
+    {
+      key: 'P',
+      label: 'Placement',
+      visible: conicalRoofToolHintVisibility,
+      chip: {
+        subscribe: (onChange) => useRoofPlacementMode.subscribe(onChange),
+        value: () => useRoofPlacementMode.getState().mode,
+        cycle: () => useRoofPlacementMode.getState().cycleMode(),
+        labels: {
+          auto: 'Placement: Auto',
+          ground: 'Placement: Ground',
+          roof: 'Placement: Roof',
+        },
+        icons: {
+          auto: 'lucide:scan-search',
+          ground: 'lucide:land-plot',
+          roof: 'lucide:house',
+        },
+        tooltip: 'Placement surface - click or press P to cycle',
+      },
+    },
+    {
+      key: 'R',
+      label: 'Rotate roof direction 90°',
+      visible: standardRoofToolHintVisibility,
+    },
+    { key: 'Esc', label: 'Cancel' },
+  ],
+  toolOptions: [
+    {
+      id: 'footprintSource',
+      label: 'Create from',
+      choices: [
+        {
+          value: 'draw',
+          label: 'Draw',
+          description: 'Draw the roof footprint with two corner clicks.',
+        },
+        {
+          value: 'room',
+          label: 'Room',
+          description: 'Hover a room to preview its boundary, then click to place.',
+        },
+      ],
+      subscribe: (onChange) => useRoofFootprintSource.subscribe(onChange),
+      value: () => useRoofFootprintSource.getState().source,
+      set: (value) =>
+        useRoofFootprintSource.getState().setSource(value === 'room' ? 'room' : 'draw'),
+      // Conical roofs always build from a curved wall pick; the row would lie.
+      visible: standardRoofToolHintVisibility,
+    },
+  ],
 
   parametrics: roofParametrics,
-  handles: roofHandles,
+  handles: resolveRoofHandles,
   floorplan: buildRoofFloorplan,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),

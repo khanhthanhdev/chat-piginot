@@ -250,10 +250,12 @@ export const skylightDefinition: NodeDefinition<typeof SkylightNode> = {
   handles: skylightHandles,
   floorplan: buildSkylightFloorplan,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),
   },
+  preview: () => import('./preview'),
   system: {
     module: () => import('./system'),
     priority: 3,
@@ -271,7 +273,7 @@ export const skylightDefinition: NodeDefinition<typeof SkylightNode> = {
   presentation: {
     label: 'Skylight',
     description: 'Framed glass opening on a roof segment.',
-    icon: { kind: 'url', src: '/icons/roof.webp' },
+    icon: { kind: 'url', src: '/icons/skylight.webp' },
     paletteSection: 'structure',
     paletteOrder: 124,
   },

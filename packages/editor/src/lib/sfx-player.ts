@@ -1,4 +1,4 @@
-import { Howl } from 'howler'
+import { Howl, Howler } from 'howler'
 import useAudio from '../store/use-audio'
 
 // Per-sound variation config. Playback rate also shifts pitch (one semitone ≈ 1.0595×),
@@ -14,13 +14,18 @@ type SFXConfig = {
   // Minimum gap between two plays of this SFX. Triggers within this window
   // are silently dropped so bursty sequences don't phase-stack into noise.
   minIntervalMs?: number
-  // Random stereo pan per play — max absolute offset (0 = center, 1 = hard
-  // right). A small value like 0.15 keeps things centred but adds just enough
-  // spread to stop repeats from stacking on the same point in the field.
-  panJitter?: number
+}
+
+type LoopSFXConfig = {
+  src: string
+  volumeMultiplier: number
+  fadeInMs?: number
+  fadeOutMs?: number
 }
 
 const DEFAULT_MIN_INTERVAL_MS = 30
+const SFX_FAILURE_BACKOFF_MS = 5_000
+const DEFAULT_LOOP_FADE_MS = 90
 
 // SFX sound definitions
 export const SFX: Record<string, SFXConfig> = {
@@ -32,41 +37,35 @@ export const SFX: Record<string, SFXConfig> = {
     ],
     rateRange: [0.98, 1.02],
     volumeRange: [0.5, 0.6],
-    panJitter: 0.15,
     minIntervalMs: 50,
   },
   itemDelete: {
     src: '/audios/sfx/item_delete.mp3',
     rateRange: [0.9, 1.1],
     volumeRange: [0.9, 1.0],
-    panJitter: 0.05,
   },
   itemPick: {
     src: '/audios/sfx/item_pick.mp3',
     rateRange: [0.95, 1.05],
     volumeRange: [0.92, 1.0],
-    panJitter: 0.15,
   },
   itemPlace: {
     src: '/audios/sfx/item_place.mp3',
     rateRange: [0.98, 1.02],
     volumeRange: [0.9, 1.0],
-    panJitter: 0.15,
   },
   itemRotate: {
     src: '/audios/sfx/item_rotate.mp3',
     rateRange: [0.94, 1.06],
     volumeRange: [0.92, 1.0],
-    panJitter: 0.15,
   },
   // Ticks as a resize handle is dragged across snap steps. Fires in rapid
   // succession, so it mirrors gridSnap: three variations cycled round-robin
-  // with pitch/pan jitter and a gap so the run reads as texture, not a tone.
+  // with pitch jitter and a gap so the run reads as texture, not a tone.
   resize: {
     src: ['/audios/sfx/resize_0.mp3', '/audios/sfx/resize_1.mp3', '/audios/sfx/resize_2.mp3'],
     rateRange: [0.98, 1.02],
     volumeRange: [0.26, 0.34],
-    panJitter: 0.15,
     minIntervalMs: 80,
   },
   // Fired when a structure draft begins (first click of a wall/slab/etc).
@@ -74,20 +73,17 @@ export const SFX: Record<string, SFXConfig> = {
     src: '/audios/sfx/structure_build_start.mp3',
     rateRange: [0.95, 1.05],
     volumeRange: [0.88, 1.0],
-    panJitter: 0.15,
   },
   // Fired when a structure is committed (segment placed / polygon closed).
   structureBuildEnd: {
     src: '/audios/sfx/structure_build_end.mp3',
     rateRange: [0.95, 1.05],
     volumeRange: [0.88, 1.0],
-    panJitter: 0.15,
   },
   structureDelete: {
     src: '/audios/sfx/structure_delete.mp3',
     rateRange: [0.9, 1.1],
     volumeRange: [0.9, 1.0],
-    panJitter: 0.08,
   },
   snapshotCapture: {
     // Shutter should sound consistent — no variation.
@@ -100,7 +96,6 @@ export const SFX: Record<string, SFXConfig> = {
     src: '/audios/sfx/menu_hover.mp3',
     rateRange: [0.98, 1.02],
     volumeRange: [0.2, 0.3],
-    panJitter: 0.1,
     minIntervalMs: 0,
   },
   // Fired when a main category in the Build / Items panels is clicked.
@@ -108,7 +103,6 @@ export const SFX: Record<string, SFXConfig> = {
     src: '/audios/sfx/menu_click.mp3',
     rateRange: [0.98, 1.02],
     volumeRange: [0.5, 0.6],
-    panJitter: 0.1,
   },
   // Fired when a material is applied to a surface in paint mode. Painting can
   // fire in quick succession across faces, so keep variation + a small gap.
@@ -116,82 +110,255 @@ export const SFX: Record<string, SFXConfig> = {
     src: '/audios/sfx/paint_apply.mp3',
     rateRange: [0.95, 1.05],
     volumeRange: [0.85, 1.0],
-    panJitter: 0.12,
     minIntervalMs: 60,
+  },
+  // A three-second jingle for finishing something, not a click cue. No pitch or
+  // volume jitter — a fanfare that lands a semitone off reads as broken rather
+  // than as varied — and a gap longer than the sound itself, so two milestones
+  // that land together play once instead of phasing over each other.
+  success: {
+    src: '/audios/sfx/success.mp3',
+    minIntervalMs: 3_000,
   },
 } as const
 
 export type SFXName = keyof typeof SFX
 
+export const LOOP_SFX = {
+  terrainRaise: {
+    src: '/audios/sfx/terrain_raise.mp3',
+    volumeMultiplier: 0.2,
+  },
+  terrainLower: {
+    src: '/audios/sfx/terrain_lower.mp3',
+    volumeMultiplier: 0.2,
+  },
+  terrainFlatten: {
+    src: '/audios/sfx/terrain_flatten.mp3',
+    volumeMultiplier: 0.2,
+  },
+  terrainSmooth: {
+    src: '/audios/sfx/terrain_smooth.mp3',
+    volumeMultiplier: 0.2,
+  },
+} as const satisfies Record<string, LoopSFXConfig>
+
+export type LoopSFXName = keyof typeof LOOP_SFX
+type CachedSFXName = SFXName | LoopSFXName
+
+function loopConfig(name: LoopSFXName): LoopSFXConfig {
+  return LOOP_SFX[name]
+}
+
+export type SFXPlaybackOptions = {
+  source?: 'local' | 'remote'
+  stereo?: number
+  volumeMultiplier?: number
+}
+
 function randomInRange([min, max]: [number, number]): number {
   return min + Math.random() * (max - min)
 }
 
-// Preload all SFX sounds. Each variation gets its own Howl so they can overlap
-// and be cycled round-robin.
-const sfxCache = new Map<SFXName, Howl[]>()
+let sfxCache = new Map<CachedSFXName, Howl[]>()
+let sfxAudioContext: AudioContext | null = null
+let sfxRetryAfter = 0
 const lastPlayedAt = new Map<SFXName, number>()
 const lastVariation = new Map<SFXName, number>()
+let activeLoop: {
+  id: number
+  name: LoopSFXName
+  sound: Howl
+  volume: number
+} | null = null
+let pendingLoop: { name: LoopSFXName; sound: Howl } | null = null
+let requestedLoop: LoopSFXName | null = null
 
-// Initialize all sounds
-Object.entries(SFX).forEach(([name, config]) => {
-  const sources = Array.isArray(config.src) ? config.src : [config.src]
-  const sounds = sources.map(
-    (src) =>
-      new Howl({
-        src: [src],
-        preload: true,
-        volume: 0.5, // Will be adjusted by the bus
-      }),
-  )
-  sfxCache.set(name as SFXName, sounds)
-})
+function loopVolume(name: LoopSFXName): number {
+  const { masterVolume, sfxVolume } = useAudio.getState()
+  return (masterVolume / 100) * (sfxVolume / 100) * LOOP_SFX[name].volumeMultiplier
+}
+
+function stopActiveLoop(fadeMs: number) {
+  const active = activeLoop
+  if (!active) return
+  activeLoop = null
+
+  if (fadeMs <= 0) {
+    active.sound.stop(active.id)
+    return
+  }
+
+  active.sound.once('fade', () => active.sound.stop(active.id), active.id)
+  active.sound.fade(active.volume, 0, fadeMs, active.id)
+}
+
+function unloadCachedSounds(resetPlaybackState: boolean) {
+  requestedLoop = null
+  pendingLoop = null
+  stopActiveLoop(0)
+  for (const sounds of sfxCache.values()) {
+    for (const sound of sounds) {
+      try {
+        sound.unload()
+      } catch {}
+    }
+  }
+  sfxCache.clear()
+  sfxAudioContext = null
+  if (resetPlaybackState) {
+    sfxRetryAfter = 0
+    lastPlayedAt.clear()
+    lastVariation.clear()
+  }
+}
+
+function cacheNeedsRebuild(): boolean {
+  if (sfxCache.size === 0) return true
+  if (sfxAudioContext !== Howler.ctx) return true
+  for (const sounds of sfxCache.values()) {
+    if (sounds.some((sound) => sound.state() === 'unloaded')) return true
+  }
+  return false
+}
+
+export function preloadSFX() {
+  if (!cacheNeedsRebuild()) return
+  unloadCachedSounds(false)
+
+  const definitions = { ...SFX, ...LOOP_SFX }
+  for (const [name, config] of Object.entries(definitions)) {
+    const sources = Array.isArray(config.src) ? config.src : [config.src]
+    sfxCache.set(
+      name as CachedSFXName,
+      sources.map(
+        (src) =>
+          new Howl({
+            loop: name in LOOP_SFX,
+            src: [src],
+            preload: true,
+            volume: 0.5,
+          }),
+      ),
+    )
+  }
+  sfxAudioContext = Howler.ctx ?? null
+}
+
+export function disposeSFX() {
+  unloadCachedSounds(true)
+}
+
+export function startLoopSFX(name: LoopSFXName) {
+  const { muted } = useAudio.getState()
+  if (muted) {
+    stopLoopSFX()
+    return
+  }
+
+  requestedLoop = name
+  const current = activeLoop
+  if (current?.name === name && current.sound.playing(current.id)) return
+  if (current) stopActiveLoop(loopConfig(current.name).fadeOutMs ?? DEFAULT_LOOP_FADE_MS)
+
+  const now = performance.now()
+  if (now < sfxRetryAfter) return
+
+  try {
+    preloadSFX()
+    // A fresh Howler context rebuilds the cache and clears stale playback
+    // state. Restore this current press after that cleanup so a first-use loop
+    // can still begin when its asset finishes loading.
+    requestedLoop = name
+    const sound = sfxCache.get(name)?.[0]
+    if (!sound) return
+    if (sound.state() !== 'loaded') {
+      if (pendingLoop?.name === name && pendingLoop.sound === sound) return
+      pendingLoop = { name, sound }
+      sound.once('load', () => {
+        if (pendingLoop?.sound === sound) pendingLoop = null
+        if (requestedLoop === name) startLoopSFX(name)
+      })
+      return
+    }
+
+    const config = loopConfig(name)
+    const volume = loopVolume(name)
+    const id = sound.play()
+    sound.volume(0, id)
+    activeLoop = { id, name, sound, volume }
+    sound.fade(0, volume, config.fadeInMs ?? DEFAULT_LOOP_FADE_MS, id)
+  } catch {
+    unloadCachedSounds(false)
+    sfxRetryAfter = now + SFX_FAILURE_BACKOFF_MS
+  }
+}
+
+export function stopLoopSFX() {
+  requestedLoop = null
+  pendingLoop = null
+  const fadeMs = activeLoop ? (loopConfig(activeLoop.name).fadeOutMs ?? DEFAULT_LOOP_FADE_MS) : 0
+  stopActiveLoop(fadeMs)
+}
 
 /**
  * Play a sound effect with volume based on audio settings
  */
-export function playSFX(name: SFXName) {
-  const sounds = sfxCache.get(name)
-  if (!sounds || sounds.length === 0) {
-    console.warn(`SFX not found: ${name}`)
-    return
-  }
+export function playSFX(name: SFXName, options: SFXPlaybackOptions = {}) {
   const config = SFX[name]!
-
-  // Drop rapid repeats — two plays of the same SFX within minIntervalMs just
-  // smear into noise, they don't add useful information.
-  const now = performance.now()
-  const minInterval = config.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS
-  const last = lastPlayedAt.get(name)
-  if (last !== undefined && now - last < minInterval) return
-  lastPlayedAt.set(name, now)
-
-  // Pick a random variation, avoiding an immediate repeat of the last one so
-  // consecutive plays don't land on the same file.
-  let index = Math.floor(Math.random() * sounds.length)
-  if (sounds.length > 1 && index === lastVariation.get(name)) {
-    index = (index + 1) % sounds.length
-  }
-  lastVariation.set(name, index)
-  const sound = sounds[index]!
-
   const { masterVolume, sfxVolume, muted } = useAudio.getState()
 
   if (muted) return
 
-  // Calculate final volume (masterVolume and sfxVolume are 0-100)
-  const baseVolume = (masterVolume / 100) * (sfxVolume / 100)
-  const volumeJitter = config.volumeRange ? randomInRange(config.volumeRange) : 1
-  const rate = config.rateRange ? randomInRange(config.rateRange) : 1
+  // Drop rapid repeats — two plays of the same SFX within minIntervalMs just
+  // smear into noise, they don't add useful information.
+  const now = performance.now()
+  if (now < sfxRetryAfter) return
+  const minInterval = config.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS
+  const source = options.source ?? 'local'
+  const playbackKey = `${source}:${name}`
+  const last = lastPlayedAt.get(playbackKey)
+  if (last !== undefined && now - last < minInterval) return
+  // Local feedback stays legible when a collaborator makes the same kind of
+  // change at nearly the same time; the quieter remote cue yields instead.
+  const lastLocal = lastPlayedAt.get(`local:${name}`)
+  if (source === 'remote' && lastLocal !== undefined && now - lastLocal < 120) return
+  lastPlayedAt.set(playbackKey, now)
 
-  // Apply per-play variation using the returned sound id so overlapping plays
-  // don't fight over shared properties on the Howl.
-  const id = sound.play()
-  sound.volume(baseVolume * volumeJitter, id)
-  if (rate !== 1) sound.rate(rate, id)
-  if (config.panJitter) {
-    const pan = (Math.random() * 2 - 1) * config.panJitter
-    sound.stereo(pan, id)
+  try {
+    preloadSFX()
+    const sounds = sfxCache.get(name)
+    if (!sounds || sounds.length === 0) return
+
+    // Pick a random variation, avoiding an immediate repeat of the last one so
+    // consecutive plays don't land on the same file.
+    let index = Math.floor(Math.random() * sounds.length)
+    if (sounds.length > 1 && index === lastVariation.get(name)) {
+      index = (index + 1) % sounds.length
+    }
+    lastVariation.set(name, index)
+    const sound = sounds[index]!
+    // Howler queues per-play mutations while a sound is loading. If its global
+    // AudioContext is replaced before that queue drains, stereo setup can try
+    // to connect nodes from different contexts and throw asynchronously.
+    if (sound.state() !== 'loaded') return
+    const baseVolume = (masterVolume / 100) * (sfxVolume / 100)
+    const volumeJitter = config.volumeRange ? randomInRange(config.volumeRange) : 1
+    const volumeMultiplier = Number.isFinite(options.volumeMultiplier)
+      ? Math.max(0, Math.min(2, options.volumeMultiplier!))
+      : 1
+    const rate = config.rateRange ? randomInRange(config.rateRange) : 1
+    const id = sound.play()
+    sound.volume(baseVolume * volumeJitter * volumeMultiplier, id)
+    if (Number.isFinite(options.stereo)) {
+      sound.stereo(Math.max(-1, Math.min(1, options.stereo!)), id)
+    }
+    if (rate !== 1) sound.rate(rate, id)
+  } catch {
+    // Optional audio must never abort an editor input callback. Rebuild from
+    // the current Howler context after a backoff instead of retrying every pointer cue.
+    unloadCachedSounds(false)
+    sfxRetryAfter = now + SFX_FAILURE_BACKOFF_MS
   }
 }
 
@@ -199,12 +366,27 @@ export function playSFX(name: SFXName) {
  * Update all cached SFX volumes (useful when settings change)
  */
 export function updateSFXVolumes() {
-  const { masterVolume, sfxVolume } = useAudio.getState()
+  const { masterVolume, muted, sfxVolume } = useAudio.getState()
+  if (muted) {
+    stopLoopSFX()
+    return
+  }
   const finalVolume = (masterVolume / 100) * (sfxVolume / 100)
 
-  sfxCache.forEach((sounds) => {
-    sounds.forEach((sound) => {
-      sound.volume(finalVolume)
+  try {
+    if (performance.now() < sfxRetryAfter) return
+    preloadSFX()
+    sfxCache.forEach((sounds) => {
+      sounds.forEach((sound) => {
+        sound.volume(finalVolume)
+      })
     })
-  })
+    if (activeLoop) {
+      activeLoop.volume = loopVolume(activeLoop.name)
+      activeLoop.sound.volume(activeLoop.volume, activeLoop.id)
+    }
+  } catch {
+    unloadCachedSounds(false)
+    sfxRetryAfter = performance.now() + SFX_FAILURE_BACKOFF_MS
+  }
 }

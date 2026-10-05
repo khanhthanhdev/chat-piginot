@@ -1,8 +1,15 @@
 'use client'
 
-import { type AnyNodeId, DormerNode, useScene } from '@pascal-app/core'
+import {
+  type AnyNodeId,
+  createDormerDefaultWindow,
+  DormerNode,
+  getDormerDefaultWindowFace,
+  useScene,
+} from '@pascal-app/core'
+import { usePlacementPreview } from '@pascal-app/editor'
 import { useViewer } from '@pascal-app/viewer'
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import { RoofAttachmentFallbackPreview } from '../shared/roof-attachment-fallback-preview'
 import { dormerDefinition } from './definition'
 import { DormerPlacementGuides } from './placement-guides'
@@ -65,10 +72,43 @@ const DormerTool = () => {
           rotation,
         })
         state.createNode(dormer, hit.segment.id as AnyNodeId)
+        const defaultWindow = createDormerDefaultWindow(
+          dormer,
+          `window_${dormer.id.replace(/^dormer_/, '')}_default`,
+          getDormerDefaultWindowFace(dormer, hit.segment),
+        )
+        state.createNode(defaultWindow, dormer.id as AnyNodeId)
         state.dirtyNodes.add(hit.segment.id as AnyNodeId)
         setSelection({ selectedIds: [dormer.id] })
+        usePlacementPreview.getState().clear()
       },
     })
+
+  useEffect(() => {
+    const placementPreview = usePlacementPreview.getState()
+    if (!(hitSegment && hitLocal)) {
+      if (placementPreview.node?.id === previewNode.id) placementPreview.clear()
+      return
+    }
+    placementPreview.set(
+      DormerNode.parse({
+        ...previewNode,
+        parentId: hitSegment.id,
+        position: hitLocal,
+        roofSegmentId: hitSegment.id,
+        rotation: ghostRotation,
+      }),
+      hitSegment,
+    )
+  }, [ghostRotation, hitLocal, hitSegment, previewNode])
+
+  useEffect(
+    () => () => {
+      const placementPreview = usePlacementPreview.getState()
+      if (placementPreview.node?.id === previewNode.id) placementPreview.clear()
+    },
+    [previewNode.id],
+  )
 
   return (
     <>

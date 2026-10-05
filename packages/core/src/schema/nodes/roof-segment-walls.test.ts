@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { RoofSegmentNode } from './roof-segment'
 import {
   getRoofSegmentWallFace,
+  getRoofSegmentWallFaces,
   getRoofWallFaceFrame,
   roofFacePointToSegment,
   segmentPointToRoofWallFace,
@@ -22,6 +23,15 @@ function segment(overrides: Partial<RoofSegmentNode> = {}): RoofSegmentNode {
 }
 
 describe('roof wall face frames', () => {
+  test('zero-height gable profiles keep their base at zero and raise the eave to five centimeters', () => {
+    const face = getRoofSegmentWallFace(segment({ wallHeight: 0 }), 'right')
+
+    expect(Math.min(...face.profile.map(([, v]) => v))).toBe(0)
+    expect(face.profile[2]?.[1]).toBe(0.05)
+    expect(face.profile[4]?.[1]).toBe(0.05)
+    expect(face.profile[3]?.[1]).toBeCloseTo(0.05 + 3.05 * Math.tan((40 * Math.PI) / 180))
+  })
+
   test('frame z = 0 lands on the nominal footprint (wall mid-plane)', () => {
     const seg = segment()
     // front face, u at the face middle, v = 1, mid-plane.
@@ -74,5 +84,40 @@ describe('roof wall face frames', () => {
     for (const faceId of ['front', 'back', 'right', 'left'] as const) {
       expect(getRoofWallFaceFrame(seg, faceId).yaw).toBe(getRoofSegmentWallFace(seg, faceId).yaw)
     }
+  })
+
+  test('dutch width-axis roofs expose hostable gable-end wall profiles on the short ends', () => {
+    const faces = getRoofSegmentWallFaces(
+      segment({
+        roofType: 'dutch',
+        width: 8,
+        depth: 6,
+        dutchHipWidthRatio: 0.25,
+        dutchWaistLengthRatio: 1,
+      }),
+    )
+
+    const left = faces.find((face) => face.id === 'left')
+    const right = faces.find((face) => face.id === 'right')
+
+    expect(left?.profile.length).toBeGreaterThan(5)
+    expect(right?.profile.length).toBeGreaterThan(5)
+    expect(left?.profile[3]?.[1]).toBeCloseTo(left?.profile[2]?.[1] ?? 0)
+  })
+
+  test('dutch long-side faces stay rectangular while only the gable ends rise above the eave', () => {
+    const faces = getRoofSegmentWallFaces(
+      segment({
+        roofType: 'dutch',
+        width: 8,
+        depth: 6,
+      }),
+    )
+
+    const front = faces.find((face) => face.id === 'front')
+    const back = faces.find((face) => face.id === 'back')
+
+    expect(front?.profile).toHaveLength(4)
+    expect(back?.profile).toHaveLength(4)
   })
 })

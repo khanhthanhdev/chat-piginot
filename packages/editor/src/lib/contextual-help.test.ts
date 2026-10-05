@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'bun:test'
-import { resolveSelectModeHelpHints } from './contextual-help'
+import { resolveRotateHandleHelpHints, resolveSelectModeHelpHints } from './contextual-help'
+
+test('rotation advertises Alt as the temporary free-rotation override', () => {
+  expect(resolveRotateHandleHelpHints(false)).toEqual([
+    { keys: ['Alt'], label: 'Hold to rotate freely', active: false },
+  ])
+  expect(resolveRotateHandleHelpHints(true)).toEqual([
+    { keys: ['Alt'], label: 'Rotating freely (no angle step)', active: true },
+  ])
+})
 
 describe('resolveSelectModeHelpHints', () => {
   test('stays hidden in idle select mode with no selection', () => {
@@ -25,7 +34,7 @@ describe('resolveSelectModeHelpHints', () => {
       }),
     ).toEqual([
       {
-        keys: ['Cmd/Ctrl', 'Left click'],
+        keys: [['Cmd/Ctrl', 'Shift'], 'Left click'],
         label: 'Add or remove objects from the selection',
         active: true,
       },
@@ -42,21 +51,57 @@ describe('resolveSelectModeHelpHints', () => {
     })
 
     expect(hints).toContainEqual({
-      keys: ['Cmd/Ctrl', 'Left click'],
+      keys: ['Left click'],
       label: 'Drag selected movable object',
     })
     expect(hints).toContainEqual({
       keys: ['Cmd/Ctrl', 'Right click'],
       label: 'Drag left or right to rotate selected object',
     })
+    // Cmd/Ctrl and Shift click both toggle selection membership (3D selection
+    // manager and 2D floorplan alike) — advertised as a single or-group row.
     expect(hints).toContainEqual({
-      keys: ['Shift'],
-      label: 'Hold to bypass snaps and angle steps',
+      keys: [['Cmd/Ctrl', 'Shift'], 'Left click'],
+      label: 'Add or remove objects from the selection',
       active: false,
     })
   })
 
-  test('switches direct manipulation labels while constraints are bypassed', () => {
+  test('multi-selection advertises the group move + rotate gestures', () => {
+    const hints = resolveSelectModeHelpHints({
+      selectedCount: 3,
+      hasMovableSelection: true,
+      hasRotatableSelection: true,
+      commandPressed: false,
+      shiftPressed: false,
+    })
+
+    expect(hints).toEqual([
+      {
+        keys: ['Left click'],
+        label: 'Click or drag the selection to move it as one',
+      },
+      { keys: ['R / T'], label: 'Rotate the selection ±45°' },
+      {
+        keys: ['Cmd/Ctrl', 'G'],
+        label: 'Group selection (session only)',
+      },
+      {
+        keys: ['Cmd/Ctrl', 'Shift', 'G'],
+        label: 'Ungroup session selection',
+      },
+      {
+        keys: [['Cmd/Ctrl', 'Shift'], 'Left click'],
+        label: 'Add or remove objects from the selection',
+        active: false,
+      },
+      { keys: ['Esc'], label: 'Clear the selection (or click outside)' },
+    ])
+  })
+
+  test('holding a modifier keeps the same rows and only lights the selection one', () => {
+    // Guides/snapping are governed by the snapping mode (Shift toggles it),
+    // so no modifier-specific "freely / with guides / bypass" variants exist.
     const hints = resolveSelectModeHelpHints({
       selectedCount: 1,
       hasMovableSelection: true,
@@ -65,20 +110,37 @@ describe('resolveSelectModeHelpHints', () => {
       shiftPressed: true,
     })
 
-    expect(hints).toContainEqual({
-      keys: ['Cmd/Ctrl', 'Left click'],
-      label: 'Drag selected movable object freely',
-      active: true,
-    })
-    expect(hints).toContainEqual({
-      keys: ['Cmd/Ctrl', 'Right click'],
-      label: 'Drag left or right to rotate freely',
-      active: true,
-    })
-    expect(hints).toContainEqual({
+    expect(hints).toEqual([
+      {
+        keys: ['Left click'],
+        label: 'Drag selected movable object',
+      },
+      {
+        keys: ['Cmd/Ctrl', 'Right click'],
+        label: 'Drag left or right to rotate selected object',
+      },
+      {
+        keys: [['Cmd/Ctrl', 'Shift'], 'Left click'],
+        label: 'Add or remove objects from the selection',
+        active: true,
+      },
+    ])
+  })
+
+  test('shows the single-side radius hint for rounded openings', () => {
+    expect(
+      resolveSelectModeHelpHints({
+        selectedCount: 1,
+        hasMovableSelection: true,
+        hasRotatableSelection: false,
+        hasOpeningRadiusSelection: true,
+        commandPressed: false,
+        shiftPressed: false,
+      }),
+    ).toContainEqual({
       keys: ['Shift'],
-      label: 'Guided constraints bypassed',
-      active: true,
+      label: 'Adjust one side’s corner radius',
+      active: false,
     })
   })
 })

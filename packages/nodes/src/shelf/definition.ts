@@ -1,4 +1,5 @@
 import type { HandleDescriptor, NodeDefinition, ShelfNode as ShelfNodeType } from '@pascal-app/core'
+import { restingFloorplanAffectedIds } from '../shared/resting-surface-plan'
 import { sanitizeShelfDimensions } from './dimensions'
 import { buildShelfFloorplan } from './floorplan'
 import { shelfResizeAffordance, shelfRotateAffordance } from './floorplan-affordances'
@@ -132,6 +133,8 @@ function shelfHandles(_node: ShelfNodeType): HandleDescriptor<ShelfNodeType>[] {
 
 export const shelfDefinition: NodeDefinition<typeof ShelfNode> = {
   kind: 'shelf',
+  snapProfile: 'item',
+  facingIndicator: true,
   schemaVersion: 2,
   schema: ShelfNode,
   category: 'furnish',
@@ -183,7 +186,7 @@ export const shelfDefinition: NodeDefinition<typeof ShelfNode> = {
         })),
     },
     selectable: { hitVolume: 'bbox' },
-    duplicable: true,
+    duplicable: { subtree: 'with-children' },
     deletable: true,
     paint: shelfPaint,
     slots: (n) => shelfSlots(n as ShelfNode),
@@ -197,6 +200,7 @@ export const shelfDefinition: NodeDefinition<typeof ShelfNode> = {
           rotation: shelf.rotation,
         }
       },
+      collides: true,
     },
   },
 
@@ -204,7 +208,7 @@ export const shelfDefinition: NodeDefinition<typeof ShelfNode> = {
   // declared here so the placement coordinator's shelf strategy can
   // confirm parent-kind compatibility before reparenting.
   relations: {
-    hosts: ['item'],
+    hosts: ['item', 'procedural-item'],
     cascadeDelete: 'descendants',
   },
 
@@ -221,6 +225,7 @@ export const shelfDefinition: NodeDefinition<typeof ShelfNode> = {
   // Boards/posts/back depend only on these fields — never on hosted
   // `children`. Lets <GeometrySystem> skip the dispose+rebuild (and the
   // pointer enter/leave churn it causes) when an item reparents onto a row.
+  geometryChildTypes: [],
   geometryKey: (n) => {
     const s = sanitizeShelfDimensions(n as ShelfNode)
     return JSON.stringify([
@@ -241,6 +246,7 @@ export const shelfDefinition: NodeDefinition<typeof ShelfNode> = {
     ])
   },
   floorplan: buildShelfFloorplan,
+  floorplanAffectedIds: restingFloorplanAffectedIds,
   // 2D move handler — Path 1 in `FloorplanRegistryMoveOverlay`. Without
   // this the overlay falls through to Path 2 which stomps the SVG
   // entry's `transform` attribute (set by the floor-plan layer to
@@ -263,7 +269,6 @@ export const shelfDefinition: NodeDefinition<typeof ShelfNode> = {
   tool: () => import('./tool'),
   toolHints: [
     { key: 'Left click', label: 'Place shelf' },
-    { key: 'Shift', label: 'Free place' },
     { key: 'Esc', label: 'Cancel' },
   ],
 

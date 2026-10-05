@@ -2,6 +2,7 @@ import {
   type AnyNode,
   type AnyNodeId,
   type BuildingNode,
+  DEFAULT_LEVEL_HEIGHT,
   emitter,
   type GuideNode,
   LevelNode,
@@ -10,11 +11,15 @@ import {
   useScene,
   type ZoneNode,
 } from '@pascal-app/core'
-import { useViewer } from '@pascal-app/viewer'
+import { markPerfAction, useViewer } from '@pascal-app/viewer'
 import {
   Camera,
   ChevronDown,
+  ChevronRight,
   Copy,
+  Eye,
+  EyeOff,
+  Group,
   Loader2,
   MoreHorizontal,
   Pencil,
@@ -24,7 +29,7 @@ import {
   X,
 } from 'lucide-react'
 import { AnimatePresence, LayoutGroup, motion } from 'motion/react'
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import { ColorDot } from './../../../../../components/ui/primitives/color-dot'
 import {
@@ -38,13 +43,25 @@ import {
 } from './../../../../../lib/level-duplication'
 import { getDefaultLevelName } from '@pascal-app/core'
 import { deleteLevelWithFallbackSelection } from './../../../../../lib/level-selection'
-import { createLocalGuideImage } from './../../../../../lib/local-guide-image'
+import {
+  formatAreaLabel,
+  getAreaUnitLabel,
+  getLinearUnitLabel,
+  linearUnitToMeters,
+  metersToLinearUnit,
+  squareMetersToAreaUnit,
+} from './../../../../../lib/measurements'
+import { createLocalGuideImage, createLocalScan } from './../../../../../lib/local-guide-image'
+import { editorHostTreeChildrenRegistry } from './../../../../../lib/host-tree-children'
+import { createUnitInBuilding, toggleZoneMembership } from './../../../../../lib/units'
 import { cn } from './../../../../../lib/utils'
 import useEditor from './../../../../../store/use-editor'
 import { useUploadStore } from '../../../../../store/use-upload'
+import { MetricControl } from '../../../controls/metric-control'
 import { LevelDuplicateDialog } from '../../../level-duplicate-dialog'
 import { InlineRenameInput } from './inline-rename-input'
-import { focusTreeNode, TreeNode } from './tree-node'
+import { ZoneMembershipCheckbox } from './zone-membership-checkbox'
+import { focusTreeNode, TreeNode, TreeNodeWrapper } from './tree-node'
 import { TreeNodeDragProvider } from './tree-node-drag'
 
 // ============================================================================
@@ -93,6 +110,7 @@ const PropertyLineSection = memo(function PropertyLineSection() {
   const updateNode = useScene((state) => state.updateNode)
   const mode = useEditor((state) => state.mode)
   const setMode = useEditor((state) => state.setMode)
+  const viewerUnit = useViewer((state) => state.unit)
 
   if (!siteNode) return null
 
@@ -100,6 +118,14 @@ const PropertyLineSection = memo(function PropertyLineSection() {
   const area = calculatePolygonArea(points)
   const perimeter = calculatePerimeter(points)
   const isEditing = mode === 'edit'
+
+  // Property-line coordinates and readouts follow the metric/imperial toggle.
+  const isImperial = viewerUnit === 'imperial'
+  const linearLabel = getLinearUnitLabel(viewerUnit)
+  const toDisplayLinear = (meters: number) => metersToLinearUnit(meters, viewerUnit)
+  const toStoredLinear = (display: number) => linearUnitToMeters(display, viewerUnit)
+  const displayArea = squareMetersToAreaUnit(area, viewerUnit)
+  const displayPerimeter = toDisplayLinear(perimeter)
 
   const handleToggleEdit = () => {
     setMode(isEditing ? 'select' : 'edit')
@@ -166,10 +192,16 @@ const PropertyLineSection = memo(function PropertyLineSection() {
       {/* Measurements */}
       <div className="relative flex gap-3 pr-3 pb-2 pl-10">
         <div className="text-muted-foreground text-xs">
-          Area: <span className="text-foreground">{area.toFixed(1)} m²</span>
+          Area:{' '}
+          <span className="text-foreground">
+            {displayArea.toFixed(1)} {getAreaUnitLabel(viewerUnit)}
+          </span>
         </div>
         <div className="text-muted-foreground text-xs">
-          Perimeter: <span className="text-foreground">{perimeter.toFixed(1)} m</span>
+          Perimeter:{' '}
+          <span className="text-foreground">
+            {displayPerimeter.toFixed(1)} {linearLabel}
+          </span>
         </div>
       </div>
 
@@ -184,21 +216,21 @@ const PropertyLineSection = memo(function PropertyLineSection() {
                 <input
                   className="w-16 rounded border border-border/50 bg-accent/50 px-1.5 py-0.5 text-foreground text-xs focus:border-primary focus:outline-none"
                   onChange={(e) =>
-                    handlePointChange(index, 0, Number.parseFloat(e.target.value) || 0)
+                    handlePointChange(index, 0, toStoredLinear(Number.parseFloat(e.target.value) || 0))
                   }
                   step={0.5}
                   type="number"
-                  value={point[0]}
+                  value={Number(toDisplayLinear(point[0]).toFixed(2))}
                 />
                 <label className="shrink-0 text-muted-foreground">Z</label>
                 <input
                   className="w-16 rounded border border-border/50 bg-accent/50 px-1.5 py-0.5 text-foreground text-xs focus:border-primary focus:outline-none"
                   onChange={(e) =>
-                    handlePointChange(index, 1, Number.parseFloat(e.target.value) || 0)
+                    handlePointChange(index, 1, toStoredLinear(Number.parseFloat(e.target.value) || 0))
                   }
                   step={0.5}
                   type="number"
-                  value={point[1]}
+                  value={Number(toDisplayLinear(point[1]).toFixed(2))}
                 />
                 <button
                   className={cn(
@@ -325,8 +357,25 @@ const ReferenceItem = memo(function ReferenceItem({
   handleDelete: (id: string, e: React.MouseEvent) => void
 }) {
   const [isEditing, setIsEditing] = useState(false)
+  const [isExpanded, setIsExpanded] = useState(true)
+  const updateNode = useScene((state) => state.updateNode)
+  const selectedReferenceId = useEditor((state) => state.selectedReferenceId)
+  const isCapture = refNode.type === 'scan'
+  const isVisible = refNode.visible !== false
+  useSyncExternalStore(
+    editorHostTreeChildrenRegistry.subscribe,
+    editorHostTreeChildrenRegistry.getSnapshot,
+    editorHostTreeChildrenRegistry.getSnapshot,
+  )
+  const hostChildren = isCapture
+    ? editorHostTreeChildrenRegistry.childrenForKind(refNode.type)
+    : undefined
+  const hasHostChildren = Boolean(hostChildren?.hasChildren(refNode))
+  const HostChildren = hasHostChildren ? hostChildren?.component : undefined
+
   const handleSelect = () => {
     setSelectedReferenceId(refNode.id)
+    useViewer.getState().setSelection({ selectedIds: [], zoneId: null })
   }
 
   const handleDoubleClick = () => {
@@ -334,53 +383,98 @@ const ReferenceItem = memo(function ReferenceItem({
   }
 
   return (
-    <div
-      className="group/ref relative flex h-8 cursor-pointer select-none items-center border-border/50 border-b pr-2 text-xs transition-colors hover:bg-accent/30"
-      onClick={handleSelect}
-      onDoubleClick={handleDoubleClick}
-    >
+    <div className="relative flex flex-col">
       <div
         className={cn(
-          'pointer-events-none absolute z-10 w-px bg-border/50',
-          isLastRow ? 'top-0 bottom-1/2' : 'top-0 bottom-0',
+          'group/ref relative flex h-8 cursor-pointer select-none items-center border-border/50 border-b pr-2 text-xs transition-colors hover:bg-accent/30',
+          selectedReferenceId === refNode.id && 'bg-accent/50 text-foreground',
+          !isVisible && 'opacity-50',
         )}
-        style={{ left: 45 }}
-      />
-      <div
-        className="pointer-events-none absolute top-1/2 z-10 h-px bg-border/50"
-        style={{ left: 45, width: 8 }}
-      />
-
-      <div className="flex h-8 min-w-0 flex-1 cursor-pointer items-center gap-2 py-0 pl-[60px] text-muted-foreground group-hover/ref:text-foreground">
-        {refNode.type === 'scan' ? (
-          <img
-            alt="Scan"
-            className="h-3.5 w-3.5 shrink-0 object-contain opacity-70 transition-opacity group-hover/ref:opacity-100"
-            src="/icons/mesh.webp"
-          />
-        ) : (
-          <img
-            alt="Guide"
-            className="h-3.5 w-3.5 shrink-0 object-contain opacity-70 transition-opacity group-hover/ref:opacity-100"
-            src="/icons/floorplan.webp"
-          />
-        )}
-        <InlineRenameInput
-          defaultName={refNode.type === 'scan' ? '3D Scan' : 'Guide Image'}
-          isEditing={isEditing}
-          nodeId={refNode.id}
-          onStartEditing={() => setIsEditing(true)}
-          onStopEditing={() => setIsEditing(false)}
-        />
-      </div>
-
-      <button
-        className="z-20 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-0 transition-colors hover:bg-black/5 hover:text-foreground group-hover/ref:opacity-100 dark:hover:bg-white/10"
-        onClick={(e) => handleDelete(refNode.id, e)}
-        title="Delete"
+        onClick={handleSelect}
+        onDoubleClick={handleDoubleClick}
       >
-        <Trash2 className="h-3 w-3" />
-      </button>
+        <div
+          className={cn(
+            'pointer-events-none absolute z-10 w-px bg-border/50',
+            isLastRow && !(hasHostChildren && isExpanded) ? 'top-0 bottom-1/2' : 'top-0 bottom-0',
+          )}
+          style={{ left: 45 }}
+        />
+        <div
+          className="pointer-events-none absolute top-1/2 z-10 h-px bg-border/50"
+          style={{ left: 45, width: 8 }}
+        />
+
+        {isCapture ? (
+          <button
+            className="z-20 ml-[52px] flex h-4 w-4 shrink-0 items-center justify-center"
+            onClick={(event) => {
+              event.stopPropagation()
+              if (hasHostChildren) setIsExpanded((expanded) => !expanded)
+            }}
+            type="button"
+          >
+            {hasHostChildren ? (
+              <ChevronRight
+                className={cn('h-3 w-3 transition-transform', isExpanded && 'rotate-90')}
+              />
+            ) : null}
+          </button>
+        ) : null}
+
+        <div
+          className={cn(
+            'flex h-8 min-w-0 flex-1 cursor-pointer items-center gap-2 py-0 text-muted-foreground group-hover/ref:text-foreground',
+            !isCapture && 'pl-[60px]',
+          )}
+        >
+          {isCapture ? (
+            <img
+              alt="Capture"
+              className="h-3.5 w-3.5 shrink-0 object-contain opacity-70 transition-opacity group-hover/ref:opacity-100"
+              src="/icons/mesh.webp"
+            />
+          ) : (
+            <img
+              alt="Guide"
+              className="h-3.5 w-3.5 shrink-0 object-contain opacity-70 transition-opacity group-hover/ref:opacity-100"
+              src="/icons/floorplan.webp"
+            />
+          )}
+          <InlineRenameInput
+            defaultName={isCapture ? 'Capture' : 'Guide Image'}
+            isEditing={isEditing}
+            nodeId={refNode.id}
+            onStartEditing={() => setIsEditing(true)}
+            onStopEditing={() => setIsEditing(false)}
+          />
+        </div>
+
+        {isCapture ? (
+          <button
+            className="z-20 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-0 transition-colors hover:bg-black/5 hover:text-foreground group-hover/ref:opacity-100 dark:hover:bg-white/10"
+            onClick={(event) => {
+              event.stopPropagation()
+              updateNode(refNode.id, { visible: !isVisible })
+            }}
+            title={isVisible ? 'Hide' : 'Show'}
+            type="button"
+          >
+            {isVisible ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
+          </button>
+        ) : null}
+        <button
+          className="z-20 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground opacity-0 transition-colors hover:bg-black/5 hover:text-foreground group-hover/ref:opacity-100 dark:hover:bg-white/10"
+          onClick={(e) => handleDelete(refNode.id, e)}
+          title="Delete"
+          type="button"
+        >
+          <Trash2 className="h-3 w-3" />
+        </button>
+      </div>
+      {isExpanded && HostChildren ? (
+        <HostChildren depth={3} nodeId={refNode.id} parentVisible={isVisible} />
+      ) : null}
     </div>
   )
 })
@@ -406,6 +500,7 @@ const LevelReferences = memo(function LevelReferences({
   const deleteNode = useScene((s) => s.deleteNode)
   const setSelection = useViewer((s) => s.setSelection)
   const setShowGuides = useViewer((s) => s.setShowGuides)
+  const setShowScans = useViewer((s) => s.setShowScans)
   const references = useScene(
     useShallow((s) =>
       Object.values(s.nodes).filter(
@@ -475,6 +570,23 @@ const LevelReferences = memo(function LevelReferences({
       return
     }
 
+    if (!onUploadAsset) {
+      useUploadStore.getState().startUpload(levelId, 'scan', file.name)
+      useUploadStore.getState().setStatus(levelId, 'uploading')
+
+      try {
+        const { scan, url } = await createLocalScan({ createNode, file, levelId })
+        setShowScans(true)
+        setSelectedReferenceId(scan.id)
+        setSelection({ selectedIds: [], zoneId: null })
+        useUploadStore.getState().setResult(levelId, url)
+        window.setTimeout(() => useUploadStore.getState().clearUpload(levelId), 600)
+      } catch {
+        useUploadStore.getState().setError(levelId, 'Could not add that scan.')
+      }
+      return
+    }
+
     if (!projectId) {
       useUploadStore.getState().startUpload(levelId, 'scan', file.name)
       useUploadStore.getState().setError(levelId, 'No active project. Please open a project first.')
@@ -482,7 +594,7 @@ const LevelReferences = memo(function LevelReferences({
     }
 
     clearUpload(levelId)
-    onUploadAsset?.(projectId, levelId, file, type)
+    onUploadAsset(projectId, levelId, file, type)
   }
 
   const handleDelete = async (nodeId: string, e: React.MouseEvent) => {
@@ -618,7 +730,8 @@ const LevelItem = memo(function LevelItem({
       ? (level.parentId as BuildingNode['id'])
       : undefined
 
-  const selectLevel = (levelId: LevelNode['id']) => {
+  const selectLevel = (levelId: LevelNode['id'], measure = true) => {
+    if (measure && selectedLevelId !== levelId) markPerfAction('level-switch', levelId)
     setSelection(buildingId ? { buildingId, levelId } : { levelId })
   }
 
@@ -657,7 +770,7 @@ const LevelItem = memo(function LevelItem({
       )
     }
     createNodes(createOps)
-    selectLevel(newLevelId as LevelNode['id'])
+    selectLevel(newLevelId as LevelNode['id'], false)
     setDuplicateDialogOpen(false)
   }
 
@@ -849,6 +962,17 @@ const LevelItem = memo(function LevelItem({
             initial={{ height: 0, opacity: 0 }}
             transition={{ type: 'spring', bounce: 0, duration: 0.3 }}
           >
+            <div className="relative border-border/50 border-b py-2 pr-3 pl-[60px]">
+              <div className="pointer-events-none absolute top-0 bottom-0 left-[45px] z-10 w-px bg-border/50" />
+              <MetricControl
+                label="Base elevation"
+                onChange={(value) => updateNode(level.id, { baseElevation: value })}
+                precision={2}
+                step={0.05}
+                unit="m"
+                value={(level.baseElevation ?? 0)}
+              />
+            </div>
             <LevelReferences
               isLastLevel={isLast}
               levelId={level.id}
@@ -903,6 +1027,7 @@ const LevelsSection = memo(function LevelsSection({
   const handleAddLevel = () => {
     const newLevel = LevelNode.parse({
       level: levels.length,
+      height: DEFAULT_LEVEL_HEIGHT,
       children: [],
       parentId: building.id,
     })
@@ -952,6 +1077,74 @@ const LevelsSection = memo(function LevelsSection({
           />
         ))}
       </div>
+    </div>
+  )
+})
+
+const UnitsSection = memo(function UnitsSection({
+  buildingId,
+}: {
+  buildingId: BuildingNode['id']
+}) {
+  const unitIds = useScene(
+    useShallow((s) => {
+      const building = s.nodes[buildingId] as BuildingNode | undefined
+      return (building?.children ?? []).filter((id) => s.nodes[id]?.type === 'unit')
+    }),
+  )
+  const hasUnits = unitIds.length > 0
+  const [expanded, setExpanded] = useState(hasUnits)
+
+  useEffect(() => {
+    if (hasUnits) setExpanded(true)
+  }, [hasUnits])
+
+  const handleNewUnit = (event: React.MouseEvent) => {
+    event.stopPropagation()
+    createUnitInBuilding(buildingId)
+    setExpanded(true)
+  }
+
+  return (
+    <div className="subtle-scrollbar max-h-72 shrink-0 overflow-y-auto overflow-x-hidden">
+      <TreeNodeWrapper
+        actions={
+          <button
+            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground dark:hover:bg-white/10"
+            onClick={handleNewUnit}
+            title="New unit"
+            type="button"
+          >
+            <Plus className="h-3 w-3" />
+          </button>
+        }
+        depth={1}
+        expanded={expanded}
+        hasChildren
+        icon={<Group className="h-3.5 w-3.5" />}
+        label={
+          <span className="flex items-center gap-1.5">
+            Units
+            {hasUnits && <span className="text-muted-foreground text-xs">{unitIds.length}</span>}
+          </span>
+        }
+        onClick={() => setExpanded((value) => !value)}
+        onToggle={() => setExpanded((value) => !value)}
+      >
+        {unitIds.map((unitId) => (
+          <TreeNode depth={2} key={unitId} nodeId={unitId} />
+        ))}
+        <TreeNodeWrapper
+          depth={2}
+          expanded={false}
+          hasChildren={false}
+          icon={<Plus className="h-3.5 w-3.5" />}
+          isLast
+          label="New unit"
+          onClick={handleNewUnit}
+          onToggle={() => {}}
+        />
+      </TreeNodeWrapper>
     </div>
   )
 })
@@ -1091,12 +1284,18 @@ const ZoneItem = memo(function ZoneItem({ zone, isLast }: { zone: ZoneNode; isLa
   const [cameraPopoverOpen, setCameraPopoverOpen] = useState(false)
   const deleteNode = useScene((state) => state.deleteNode)
   const updateNode = useScene((state) => state.updateNode)
+  const focusedUnitId = useViewer((state) => state.focusedUnitId)
+  const focusedUnit = useScene((s) => {
+    const unit = focusedUnitId ? s.nodes[focusedUnitId] : undefined
+    return unit?.type === 'unit' ? unit : null
+  })
   const selectedZoneId = useViewer((state) => state.selection.zoneId)
   const hoveredId = useViewer((state) => state.hoveredId)
   const setSelection = useViewer((state) => state.setSelection)
   const setHoveredId = useViewer((state) => state.setHoveredId)
   const setPhase = useEditor((state) => state.setPhase)
   const setMode = useEditor((state) => state.setMode)
+  const unit = useViewer((state) => state.unit)
 
   const isSelected = selectedZoneId === zone.id
   const isHovered = hoveredId === zone.id
@@ -1109,8 +1308,7 @@ const ZoneItem = memo(function ZoneItem({ zone, isLast }: { zone: ZoneNode; isLa
     }
   }, [isSelected])
 
-  const area = calculatePolygonArea(zone.polygon).toFixed(1)
-  const defaultName = `Zone (${area}m²)`
+  const defaultName = `Zone (${formatAreaLabel(calculatePolygonArea(zone.polygon), unit)})`
 
   const handleClick = () => {
     setSelection({ zoneId: zone.id })
@@ -1164,6 +1362,13 @@ const ZoneItem = memo(function ZoneItem({ zone, isLast }: { zone: ZoneNode; isLa
         style={{ left: 8, width: 4 }}
       />
 
+      {focusedUnit && (
+        <ZoneMembershipCheckbox
+          checked={focusedUnit.members.includes(zone.id)}
+          onToggle={() => toggleZoneMembership(focusedUnit.id, zone.id)}
+          unitName={focusedUnit.name || 'Unit'}
+        />
+      )}
       <span className={cn('mr-2', !isSelected && 'opacity-40')}>
         <ColorDot color={zone.color} onChange={handleColorChange} />
       </span>
@@ -1295,7 +1500,10 @@ const ContentSection = memo(function ContentSection() {
       if (!selectedLevelId) return []
       const lvl = s.nodes[selectedLevelId] as LevelNode | undefined
       if (!lvl) return []
-      return lvl.children.filter((childId) => s.nodes[childId]?.type !== 'zone')
+      return lvl.children.filter((childId) => {
+        const type = s.nodes[childId]?.type
+        return type !== 'zone' && type !== 'scan'
+      })
     }),
   )
 
@@ -1504,6 +1712,7 @@ const BuildingItem = memo(function BuildingItem({
                   onUploadAsset={onUploadAsset}
                   projectId={projectId}
                 />
+                <UnitsSection buildingId={building.id} />
                 <LayerToggle />
               </div>
               <div className="subtle-scrollbar relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden">

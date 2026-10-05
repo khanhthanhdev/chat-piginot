@@ -13,6 +13,7 @@ import {
   createMaterial,
   createMaterialFromPresetRef,
   createSurfaceRoleMaterial,
+  resolveMaterialRef,
   useNodeEvents,
   useViewer,
 } from '@pascal-app/viewer'
@@ -20,6 +21,7 @@ import { useFrame } from '@react-three/fiber'
 import { useEffect, useMemo, useRef } from 'react'
 import * as THREE from 'three'
 import { getAnalyticalNormal, surfaceQuatFromNormal } from '../shared/roof-surface'
+import { useSegmentTrimClippedGeometry } from '../shared/use-segment-trim-clip'
 import { buildTurbineVentBase, buildTurbineVentHead } from './geometry'
 
 const defaultMaterial = new THREE.MeshStandardMaterial({
@@ -49,6 +51,7 @@ const TurbineVentRenderer = ({ node: storeNode }: { node: TurbineVentNode }) => 
   const textures = useViewer((s) => s.textures)
   const colorPreset: ColorPreset = useViewer((s) => s.colorPreset)
   const sceneTheme = useViewer((s) => s.sceneTheme)
+  const sceneMaterials = useScene((s) => s.materials)
 
   // Merge live overrides (panel slider drags) on top of the store node so
   // the mesh updates frame-by-frame without polluting undo history.
@@ -98,13 +101,31 @@ const TurbineVentRenderer = ({ node: storeNode }: { node: TurbineVentNode }) => 
   }, [segment, node.position[0], node.position[2]])
 
   const material = useMemo(() => {
-    if (!textures || (!node.material && !node.materialPreset)) {
-      return createSurfaceRoleMaterial('roof', colorPreset, THREE.FrontSide, sceneTheme)
+    const roleDefault = createSurfaceRoleMaterial('roof', colorPreset, THREE.FrontSide, sceneTheme)
+    const resolve = (role: 'base' | 'head') => {
+      if (!textures) return roleDefault
+      const slotMaterial = resolveMaterialRef(node.slots?.[role], sceneMaterials, shading)
+      if (slotMaterial) return slotMaterial
+      if (node.material) return createMaterial(node.material, shading)
+      if (node.materialPreset) {
+        return createMaterialFromPresetRef(node.materialPreset, shading) ?? defaultMaterial
+      }
+      return roleDefault
     }
-    return node.material
-      ? createMaterial(node.material, shading)
-      : (createMaterialFromPresetRef(node.materialPreset, shading) ?? defaultMaterial)
-  }, [textures, colorPreset, sceneTheme, shading, node.material, node.materialPreset])
+    return {
+      base: resolve('base'),
+      head: resolve('head'),
+    }
+  }, [
+    textures,
+    colorPreset,
+    sceneTheme,
+    shading,
+    node.slots,
+    node.material,
+    node.materialPreset,
+    sceneMaterials,
+  ])
 
   // Compose slope tilt + yaw onto a single quaternion so the registered
   // ref's local frame is vent-mesh-local (handles read this frame).
@@ -113,6 +134,34 @@ const TurbineVentRenderer = ({ node: storeNode }: { node: TurbineVentNode }) => 
     const yawQuat = new THREE.Quaternion().setFromAxisAngle(yAxis, node.rotation ?? 0)
     return new THREE.Quaternion().copy(surfaceQuat).multiply(yawQuat)
   }, [surfaceQuat, node.rotation, yAxis])
+
+  const neckHForClip = Math.max(
+    0.02,
+    Math.min(node.neckHeight ?? 0.09, Math.max(0.12, node.height) * 0.5),
+  )
+  // Map vent-local geometry into the host segment's local frame (where the trim
+  // cut prisms live). The base sits at the inner group's pose; the head is
+  // nested one level deeper at [0, neckH, 0], so its clip matrix composes that
+  // offset. (When the head is spinning — opt-in, default paused — the cut edge
+  // rotates with it, which is acceptable for the animation.)
+  const baseLocalToSegment = useMemo(
+    () =>
+      new THREE.Matrix4().compose(
+        new THREE.Vector3(node.position[0] ?? 0, node.position[1] ?? 0, node.position[2] ?? 0),
+        composedQuat,
+        new THREE.Vector3(1, 1, 1),
+      ),
+    [node.position[0], node.position[1], node.position[2], composedQuat],
+  )
+  const headLocalToSegment = useMemo(
+    () =>
+      new THREE.Matrix4()
+        .copy(baseLocalToSegment)
+        .multiply(new THREE.Matrix4().makeTranslation(0, neckHForClip, 0)),
+    [baseLocalToSegment, neckHForClip],
+  )
+  const clippedBase = useSegmentTrimClippedGeometry(baseGeometry, segment, baseLocalToSegment)
+  const clippedHead = useSegmentTrimClippedGeometry(headGeometry, segment, headLocalToSegment)
 
   if (!segment) return null
 
@@ -133,8 +182,8 @@ const TurbineVentRenderer = ({ node: storeNode }: { node: TurbineVentNode }) => 
       >
         <mesh
           castShadow
-          geometry={baseGeometry}
-          material={material}
+          geometry={clippedBase ?? baseGeometry}
+          material={material.base}
           name="turbine-vent-base"
           receiveShadow
           {...handlers}
@@ -142,8 +191,8 @@ const TurbineVentRenderer = ({ node: storeNode }: { node: TurbineVentNode }) => 
         <group position={[0, neckH, 0]} ref={headRef}>
           <mesh
             castShadow
-            geometry={headGeometry}
-            material={material}
+            geometry={clippedHead ?? headGeometry}
+            material={material.head}
             name="turbine-vent-head"
             receiveShadow
             {...handlers}

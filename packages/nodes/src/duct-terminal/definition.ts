@@ -20,6 +20,7 @@ export const ductTerminalDefinition: NodeDefinition<typeof DuctTerminalNode> = {
   schema: DuctTerminalNode,
   category: 'utility',
   distributionRole: 'terminal',
+  snapProfile: 'item',
 
   defaults: () => ({
     object: 'node',
@@ -29,7 +30,6 @@ export const ductTerminalDefinition: NodeDefinition<typeof DuctTerminalNode> = {
     position: [0, 0, 0],
     rotation: 0,
     terminalType: 'supply-register',
-    airSpeed: 1,
     mount: 'floor',
     width: 0.3,
     depth: 0.15,
@@ -64,7 +64,6 @@ export const ductTerminalDefinition: NodeDefinition<typeof DuctTerminalNode> = {
   geometryKey: (n) =>
     JSON.stringify([
       n.terminalType,
-      n.airSpeed,
       n.mount,
       n.width,
       n.depth,
@@ -83,7 +82,6 @@ export const ductTerminalDefinition: NodeDefinition<typeof DuctTerminalNode> = {
     { key: 'Click', label: 'Place register' },
     { key: 'M', label: 'Mount: floor / ceiling / wall' },
     { key: 'R / T', label: 'Rotate ±45° (floor / ceiling)' },
-    { key: 'Shift', label: 'Smooth (no grid snap)' },
     { key: 'Esc', label: 'Exit' },
   ],
 

@@ -222,9 +222,6 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
         </Link>
       </div>
       <Editor
-        cfdAnalysis={{
-          apiBaseUrl: process.env.NEXT_PUBLIC_PASCAL_AGENT_SERVER_URL ?? 'http://localhost:4111',
-        }}
         layoutVersion="v2"
         onLoad={handleLoad}
         onSave={handleSave}

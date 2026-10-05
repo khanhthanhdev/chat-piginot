@@ -22,11 +22,21 @@ import {
   type AnyNode,
   type AnyNodeId,
   type BuildingNode,
+  DEFAULT_LEVEL_HEIGHT,
+  getStoredLevelHeight,
   LevelNode,
   useScene,
 } from '@pascal-app/core'
-import { useViewer } from '@pascal-app/viewer'
-import { ClipboardPaste, Copy, GripVertical, MoreVertical, Plus, Trash2 } from 'lucide-react'
+import { markPerfAction, useViewer } from '@pascal-app/viewer'
+import {
+  ClipboardPaste,
+  Copy,
+  GripVertical,
+  MoreVertical,
+  Plus,
+  Trash2,
+  X,
+} from 'lucide-react'
 import {
   type ButtonHTMLAttributes,
   type CSSProperties,
@@ -34,22 +44,20 @@ import {
   useEffect,
   useRef,
   useState,
-  useSyncExternalStore,
 } from 'react'
 import { useShallow } from 'zustand/react/shallow'
+import { pasteSelectionAndPickUp } from '../editor/group-actions'
 import {
   buildLevelDuplicateCreateOps,
   type LevelDuplicatePreset,
 } from '../../lib/level-duplication'
 import { getDefaultLevelName, getLevelDisplayName } from '@pascal-app/core'
 import { deleteLevelWithFallbackSelection } from '../../lib/level-selection'
-import {
-  getEditorClipboardSnapshot,
-  pasteEditorClipboardToLevel,
-  subscribeEditorClipboard,
-} from '../../lib/scene-clipboard'
-import { sfxEmitter } from '../../lib/sfx-bus'
+import { unitMemberLevels, leaveUnitFocus } from '../../lib/units'
+import { useLinearDisplay } from '../../lib/use-linear-display'
 import { cn } from '../../lib/utils'
+import { ActionButton } from './controls/action-button'
+import { SliderControl } from './controls/slider-control'
 import { LevelDuplicateDialog } from './level-duplicate-dialog'
 import {
   Dialog,
@@ -132,12 +140,15 @@ function LevelRow({
   onDuplicate,
   onPaste,
   onRequestDelete,
+  unitDotColor,
 }: {
   level: LevelNode
   isSelected: boolean
   isDragging?: boolean
   dragHandleProps?: ButtonHTMLAttributes<HTMLButtonElement>
   dragHandleRef?: (element: HTMLButtonElement | null) => void
+  /** Focused-unit color when the unit has zones on this level. */
+  unitDotColor?: string
   onSelect: () => void
   onDuplicate: (preset?: LevelDuplicatePreset) => void
   onPaste?: () => void
@@ -145,6 +156,32 @@ function LevelRow({
 }) {
   const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
+  const updateNode = useScene((s) => s.updateNode)
+  const { isImperial, toDisplay, displayUnit, precision: displayPrecision } = useLinearDisplay('m', 2)
+
+  const storeyHeight = getStoredLevelHeight(level)
+  // Decimal units keep the compact readout; integer millimeters must retain trailing zeroes.
+  const formattedStoreyHeight = toDisplay(storeyHeight).toFixed(displayPrecision)
+  const storeyHeightLabel = `${
+    displayPrecision > 0 ? formattedStoreyHeight.replace(/0$/, '') : formattedStoreyHeight
+  } ${displayUnit}`
+  // Same rule as the site panel and command palette: the ordinal-0 ground
+  // floor is the vertical model's zero anchor and must never be deletable.
+  const canDeleteLevel = level.level !== 0
+
+  // Clean preset values per display system; imperial stores exact meters
+  // for whole-foot storey heights.
+  const heightPresets = isImperial
+    ? [
+        { label: '8 ft', height: 2.4384 },
+        { label: '9 ft', height: 2.7432 },
+        { label: '10 ft', height: 3.048 },
+      ]
+    : [
+        { label: '2.5 m', height: 2.5 },
+        { label: '3.0 m', height: 3.0 },
+        { label: '3.5 m', height: 3.5 },
+      ]
 
   return (
     <div className="group/level">
@@ -193,7 +230,56 @@ function LevelRow({
             type="button"
           >
             <span className="truncate">{getLevelDisplayName(level)}</span>
+            {unitDotColor && (
+              <span
+                className="ml-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ backgroundColor: unitDotColor }}
+                title="Focused unit has zones here"
+              />
+            )}
           </button>
+
+          {/* Storey height badge — opens the height popover */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <button
+                className="mr-0.5 shrink-0 whitespace-nowrap rounded px-1 py-0.5 font-mono text-[10px] text-muted-foreground/50 tabular-nums transition-colors hover:bg-white/5 hover:text-foreground"
+                onClick={(e) => e.stopPropagation()}
+                title="Level height"
+                type="button"
+              >
+                {storeyHeightLabel}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent
+              align="start"
+              className="w-56 p-2"
+              onClick={(e) => e.stopPropagation()}
+              side="right"
+              sideOffset={8}
+            >
+              <SliderControl
+                label="Level height"
+                max={20}
+                min={1}
+                onChange={(v) => updateNode(level.id, { height: v })}
+                precision={3}
+                step={0.1}
+                unit="m"
+                value={storeyHeight}
+              />
+              <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+                {heightPresets.map((preset) => (
+                  <ActionButton
+                    className="h-7 px-2"
+                    key={preset.label}
+                    label={preset.label}
+                    onClick={() => updateNode(level.id, { height: preset.height })}
+                  />
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
 
           {/* Vertical three-dot menu — inside the pill */}
           <Popover>
@@ -243,11 +329,13 @@ function LevelRow({
                 </button>
               )}
               <button
-                className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-muted-foreground text-xs transition-colors hover:bg-white/10 hover:text-red-400"
+                className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-muted-foreground text-xs transition-colors enabled:hover:bg-white/10 enabled:hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!canDeleteLevel}
                 onClick={(e) => {
                   e.stopPropagation()
                   onRequestDelete()
                 }}
+                title={canDeleteLevel ? 'Delete level' : 'The ground level cannot be deleted'}
                 type="button"
               >
                 <Trash2 className="h-3 w-3" />
@@ -277,9 +365,11 @@ function SortableLevelRow({
   onDuplicate,
   onPaste,
   onRequestDelete,
+  unitDotColor,
 }: {
   level: LevelNode
   isSelected: boolean
+  unitDotColor?: string
   onSelect: () => void
   onDuplicate: (preset?: LevelDuplicatePreset) => void
   onPaste?: () => void
@@ -315,7 +405,42 @@ function SortableLevelRow({
         onPaste={onPaste}
         onRequestDelete={onRequestDelete}
         onSelect={onSelect}
+        unitDotColor={unitDotColor}
       />
+    </div>
+  )
+}
+
+// ── Unit focus chip: name + × to end focus, only while a unit is focused ────
+
+function UnitFocusChip() {
+  const focusedUnitId = useViewer((s) => s.focusedUnitId)
+  const focusedUnit = useScene((s) => {
+    const unit = focusedUnitId ? s.nodes[focusedUnitId] : undefined
+    return unit?.type === 'unit' ? unit : null
+  })
+
+  if (!focusedUnit) return null
+
+  return (
+    <div
+      className="mt-4 flex h-7 max-w-48 items-center gap-1.5 rounded-full border border-border bg-background/90 pr-1 pl-2.5 font-medium text-xs shadow-2xl backdrop-blur-md"
+      data-testid="unit-focus-chip"
+    >
+      <span
+        className="h-2 w-2 shrink-0 rounded-full"
+        style={{ backgroundColor: focusedUnit.color }}
+      />
+      <span className="truncate">{focusedUnit.name || 'Unit'}</span>
+      <button
+        aria-label="Exit unit focus"
+        className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground"
+        onClick={() => leaveUnitFocus()}
+        title="Exit unit focus"
+        type="button"
+      >
+        <X className="h-3 w-3" />
+      </button>
     </div>
   )
 }
@@ -332,10 +457,16 @@ export function FloatingLevelSelector() {
 
   const [deletingLevel, setDeletingLevel] = useState<LevelNode | null>(null)
   const [draggingLevelId, setDraggingLevelId] = useState<string | null>(null)
-  const clipboardSnapshot = useSyncExternalStore(
-    subscribeEditorClipboard,
-    getEditorClipboardSnapshot,
-    getEditorClipboardSnapshot,
+  const focusedUnitId = useViewer((s) => s.focusedUnitId)
+  const focusedUnitColor = useScene((s) => {
+    const unit = focusedUnitId ? s.nodes[focusedUnitId] : undefined
+    return unit?.type === 'unit' ? unit.color : null
+  })
+  const focusedUnitLevelIds = useScene(
+    useShallow((s) => {
+      const unit = focusedUnitId ? s.nodes[focusedUnitId] : undefined
+      return unit?.type === 'unit' ? unitMemberLevels(unit, s.nodes).map((level) => level.id) : []
+    }),
   )
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -371,6 +502,7 @@ export function FloatingLevelSelector() {
     const maxLevel = levels.length > 0 ? Math.max(...levels.map((l) => l.level)) : -1
     const newLevel = LevelNode.parse({
       level: maxLevel + 1,
+      height: DEFAULT_LEVEL_HEIGHT,
       children: [],
       parentId: resolvedBuildingId,
     })
@@ -383,6 +515,7 @@ export function FloatingLevelSelector() {
     const minLevel = levels.length > 0 ? Math.min(...levels.map((l) => l.level)) : 1
     const newLevel = LevelNode.parse({
       level: minLevel - 1,
+      height: DEFAULT_LEVEL_HEIGHT,
       children: [],
       parentId: resolvedBuildingId,
     })
@@ -409,6 +542,7 @@ export function FloatingLevelSelector() {
 
       const newLevel = LevelNode.parse({
         level: newLevelNumber,
+        height: DEFAULT_LEVEL_HEIGHT,
         children: [],
         parentId: resolvedBuildingId,
       })
@@ -452,10 +586,7 @@ export function FloatingLevelSelector() {
   )
 
   const handlePasteToLevel = useCallback((level: LevelNode) => {
-    const result = pasteEditorClipboardToLevel(level.id)
-    if (result?.pastedIds.length) {
-      sfxEmitter.emit('sfx:item-place')
-    }
+    void pasteSelectionAndPickUp(level.id)
   }, [])
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
@@ -516,6 +647,9 @@ export function FloatingLevelSelector() {
           {!draggingLevelId && (
             <button
               className={cn(addButtonClass, 'top-0 -translate-y-1/2')}
+              // A stable hook for host-app onboarding to point at. Static, and
+              // read only from outside: nothing here depends on it.
+              data-guide-target="level-add"
               onClick={handleAddAbove}
               title="Add level above"
               type="button"
@@ -552,22 +686,34 @@ export function FloatingLevelSelector() {
                   const showGapBelow = i < reversedLevels.length - 1
 
                   return (
-                    <div className="relative" key={level.id}>
+                    <div
+                      className="relative"
+                      // A stable hook for host-app onboarding to point at, on
+                      // the ground floor only — the one level a guide can name
+                      // without knowing the building. Static, and read only
+                      // from outside: nothing here depends on it.
+                      data-guide-target={level.level === 0 ? 'level-ground' : undefined}
+                      key={level.id}
+                    >
                       <SortableLevelRow
                         isSelected={isSelected}
                         level={level}
-                        onDuplicate={(preset) => handleDuplicateLevel(level, preset)}
-                        onPaste={
-                          clipboardSnapshot ? () => handlePasteToLevel(level) : undefined
+                        unitDotColor={
+                          focusedUnitColor && focusedUnitLevelIds.includes(level.id)
+                            ? focusedUnitColor
+                            : undefined
                         }
+                        onDuplicate={(preset) => handleDuplicateLevel(level, preset)}
+                        onPaste={() => handlePasteToLevel(level)}
                         onRequestDelete={() => setDeletingLevel(level)}
-                        onSelect={() =>
+                        onSelect={() => {
+                          if (!isSelected) markPerfAction('level-switch', level.id)
                           setSelection(
                             resolvedBuildingId
                               ? { buildingId: resolvedBuildingId, levelId: level.id }
                               : { levelId: level.id },
                           )
-                        }
+                        }}
                       />
 
                       {showGapBelow && !draggingLevelId && (
@@ -587,6 +733,7 @@ export function FloatingLevelSelector() {
             </SortableContext>
           </DndContext>
         </div>
+        <UnitFocusChip />
       </div>
 
       {/* Delete confirmation dialog */}

@@ -26,7 +26,7 @@ const mcp = new MCPClient({
   servers: {
     pascal: {
       command: 'bunx',
-      args: ['--package', '@pascal-app/mcp', 'pascal-mcp', '--stdio'],
+      args: ['--bun', '--package','@pascal-app/mcp', 'pascal-mcp', '--stdio'],
       env: {
         PASCAL_DATA_DIR:
           process.env.PASCAL_DATA_DIR ?? path.join(process.env.HOME ?? '.', '.pascal', 'data'),

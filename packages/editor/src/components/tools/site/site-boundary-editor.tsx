@@ -17,6 +17,7 @@ import { EDITOR_LAYER } from '../../../lib/constants'
 import { sfxEmitter } from '../../../lib/sfx-bus'
 import { SITE_BOUNDARY_DRAG_LABEL } from '../../../lib/site-boundary'
 import useEditor, { selectSiteFloorplanContext } from '../../../store/use-editor'
+import useInteractionScope from '../../../store/use-interaction-scope'
 import {
   ARROW_COLOR,
   ARROW_HOVER_COLOR,
@@ -376,14 +377,20 @@ export const SiteBoundaryEditor: React.FC = () => {
 
       if (!siteId) return
 
-      const editor = useEditor.getState()
       if (isDragging) {
-        editor.setActiveHandleDrag({ nodeId: siteId, label: SITE_BOUNDARY_DRAG_LABEL })
-      } else if (
-        editor.activeHandleDrag?.nodeId === siteId &&
-        editor.activeHandleDrag.label === SITE_BOUNDARY_DRAG_LABEL
-      ) {
-        editor.setActiveHandleDrag(null)
+        useInteractionScope
+          .getState()
+          .begin({ kind: 'handle-drag', nodeId: siteId, handle: SITE_BOUNDARY_DRAG_LABEL })
+      } else {
+        const scope = useInteractionScope.getState().scope
+        const activeHandleDrag =
+          scope.kind === 'handle-drag' ? { nodeId: scope.nodeId, label: scope.handle } : null
+        if (
+          activeHandleDrag?.nodeId === siteId &&
+          activeHandleDrag.label === SITE_BOUNDARY_DRAG_LABEL
+        ) {
+          useInteractionScope.getState().endIf((sc) => sc.kind === 'handle-drag')
+        }
       }
 
       if (!isDragging) {
@@ -396,12 +403,14 @@ export const SiteBoundaryEditor: React.FC = () => {
   useEffect(
     () => () => {
       if (!siteId) return
-      const editor = useEditor.getState()
+      const scope = useInteractionScope.getState().scope
+      const activeHandleDrag =
+        scope.kind === 'handle-drag' ? { nodeId: scope.nodeId, label: scope.handle } : null
       if (
-        editor.activeHandleDrag?.nodeId === siteId &&
-        editor.activeHandleDrag.label === SITE_BOUNDARY_DRAG_LABEL
+        activeHandleDrag?.nodeId === siteId &&
+        activeHandleDrag.label === SITE_BOUNDARY_DRAG_LABEL
       ) {
-        editor.setActiveHandleDrag(null)
+        useInteractionScope.getState().endIf((sc) => sc.kind === 'handle-drag')
       }
       useLiveNodeOverrides.getState().clearFields(siteId, ['polygon'])
       isDraggingSiteBoundaryRef.current = false
@@ -438,9 +447,12 @@ export const SiteBoundaryEditor: React.FC = () => {
   const activateSiteEditing = useCallback(() => {
     isDraggingSiteBoundaryRef.current = true
     setIsDraggingSiteBoundary(true)
-    if (useEditor.getState().phase !== 'site') {
-      useEditor.setState({ catalogCategory: null, mode: 'select', phase: 'site', tool: null })
-    }
+    const editor = useEditor.getState()
+    // A boundary drag takes ownership away from the terrain brush. Going
+    // through setMode releases the sustained sculpting scope before the
+    // PolygonEditor begins its handle-drag scope.
+    if (editor.mode !== 'select') editor.setMode('select')
+    if (editor.phase !== 'site') editor.setPhase('site')
     selectSiteFloorplanContext()
   }, [])
 
@@ -452,10 +464,14 @@ export const SiteBoundaryEditor: React.FC = () => {
   }, [])
 
   useEffect(() => {
-    if (!isSiteEditing) return
+    // Terrain sculpting also lives in the site phase so the 3D flags stay
+    // available, but its ordinary terrain clicks belong to the brush. Only
+    // select mode treats an empty site-grid click as "leave site editing".
+    if (!isSiteEditing || mode !== 'select') return
 
     const onGridClick = () => {
-      if (useEditor.getState().phase !== 'site') return
+      const editor = useEditor.getState()
+      if (editor.phase !== 'site' || editor.mode !== 'select') return
       exitSiteEditing()
     }
 
@@ -463,7 +479,7 @@ export const SiteBoundaryEditor: React.FC = () => {
     return () => {
       emitter.off('grid:click', onGridClick)
     }
-  }, [exitSiteEditing, isSiteEditing])
+  }, [exitSiteEditing, isSiteEditing, mode])
 
   const renderSiteFlagVertex = useCallback(
     ({

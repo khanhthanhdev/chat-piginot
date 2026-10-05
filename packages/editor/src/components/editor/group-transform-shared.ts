@@ -1,11 +1,15 @@
 import {
   type AnyNode,
   type AnyNodeId,
+  calculateLevelMiters,
+  getWallPlanFootprint,
   nodeRegistry,
   resolveBuildingForLevel,
   sceneRegistry,
+  useScene,
+  type WallNode,
 } from '@pascal-app/core'
-import { Box3, Matrix4 } from 'three'
+import { Box3, type BufferGeometry, Matrix4, type Object3D, Vector3 } from 'three'
 
 // Shared plumbing for the group transform gizmos (rotate + move). Both operate
 // on the same multi-selection: classify each participant by how its placement
@@ -25,12 +29,15 @@ const isVec3 = (v: unknown): v is Vec3 =>
   Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === 'number')
 const isVec2 = (v: unknown): v is Vec2 =>
   Array.isArray(v) && v.length === 2 && v.every((n) => typeof n === 'number')
+const isVec2Array = (v: unknown): v is Vec2[] => Array.isArray(v) && v.length > 0 && v.every(isVec2)
 
 // How a participant's placement transforms rigidly around / with the group:
 //   - 'vec3'     position + [x,y,z] rotation (items, …)
 //   - 'scalar'   position + numeric rotation (columns)
 //   - 'endpoint' start/end tuples (walls, fences)
-export type ParticipantKind = 'vec3' | 'scalar' | 'endpoint'
+//   - 'polygon'  [x,z] vertex arrays (slabs, ceilings, zones) — the placement
+//                lives in the vertices themselves (plus optional hole rings)
+export type ParticipantKind = 'vec3' | 'scalar' | 'endpoint' | 'polygon'
 
 // A selected node qualifies when it belongs to the active level's horizontal
 // frame: either parented to that level, or declared building-scoped and parented
@@ -75,27 +82,39 @@ function getParticipantScalarRotation(node: AnyNode): number | null {
   return sceneRegistry.nodes.get(node.id)?.rotation.y ?? 0
 }
 
+// Shape-only classification of a positioned placement (no level-scope check).
+// Used for polygon hosts' attached children, whose parent is the host rather
+// than the level.
+function classifyPlacementShape(node: AnyNode): 'vec3' | 'scalar' | null {
+  const p = getParticipantPosition(node)
+  const r = (node as { rotation?: unknown }).rotation
+  if (isVec3(p) && isVec3(r)) return 'vec3'
+  if (isVec3(p) && getParticipantScalarRotation(node) !== null) return 'scalar'
+  return null
+}
+
 export function classifyParticipant(
   node: AnyNode | undefined,
   levelId: string | null,
   sceneNodes: Record<string, AnyNode | undefined>,
 ): ParticipantKind | null {
   if (!node || !isInGroupTransformScope(node, levelId, sceneNodes)) return null
-  const p = getParticipantPosition(node)
-  const r = (node as { rotation?: unknown }).rotation
+  const shape = classifyPlacementShape(node)
+  if (shape) return shape
   const start = (node as { start?: unknown }).start
   const end = (node as { end?: unknown }).end
-  if (isVec3(p) && isVec3(r)) return 'vec3'
-  if (isVec3(p) && getParticipantScalarRotation(node) !== null) return 'scalar'
   if (isVec2(start) && isVec2(end)) return 'endpoint'
+  if (isVec2Array((node as { polygon?: unknown }).polygon)) return 'polygon'
   return null
 }
 
-// Pre-drag placement snapshot + how to transform it.
+// Pre-drag placement snapshot + how to transform it. `holes` is null when the
+// kind carries no holes field (zone), so patches never write one onto it.
 export type ParticipantStart =
   | { id: AnyNodeId; kind: 'vec3'; position: Vec3; rotation: Vec3 }
   | { id: AnyNodeId; kind: 'scalar'; position: Vec3; rotation: number }
   | { id: AnyNodeId; kind: 'endpoint'; start: Vec2; end: Vec2 }
+  | { id: AnyNodeId; kind: 'polygon'; polygon: Vec2[]; holes: Vec2[][] | null }
 
 // An unselected wall/fence sharing a junction with a transforming endpoint. Only
 // the touching endpoint(s) follow, so the neighbour stays attached while its far
@@ -143,7 +162,7 @@ export function collectParticipants(
         position: [position[0], position[1], position[2]],
         rotation,
       })
-    } else {
+    } else if (kind === 'endpoint') {
       const n = node as AnyNode & { start: Vec2; end: Vec2 }
       starts.push({
         id: id as AnyNodeId,
@@ -151,6 +170,56 @@ export function collectParticipants(
         start: [n.start[0], n.start[1]],
         end: [n.end[0], n.end[1]],
       })
+    } else {
+      const n = node as AnyNode & { polygon: Vec2[]; holes?: Vec2[][] }
+      starts.push({
+        id: id as AnyNodeId,
+        kind,
+        polygon: n.polygon.map(([x, z]) => [x, z] as Vec2),
+        holes: Array.isArray(n.holes)
+          ? n.holes.map((hole) => hole.map(([x, z]) => [x, z] as Vec2))
+          : null,
+      })
+    }
+  }
+
+  // Polygon hosts (slab/ceiling) rebuild their geometry from vertices rather
+  // than transforming a group, so — unlike wall children, which ride the wall
+  // mesh — their attached children (ceiling-mounted items) must transform
+  // explicitly. Their positions are stored in the level frame (the host group
+  // sits at the origin), so the same rigid patches apply.
+  const includedIds = new Set<string>(starts.map((s) => s.id))
+  for (const s of [...starts]) {
+    if (s.kind !== 'polygon') continue
+    const host = sceneNodes[s.id]
+    const childIds = (host as { children?: string[] } | undefined)?.children
+    if (!Array.isArray(childIds)) continue
+    for (const childId of childIds) {
+      if (includedIds.has(childId)) continue
+      const child = sceneNodes[childId]
+      if (!child) continue
+      const shape = classifyPlacementShape(child)
+      const position = child ? getParticipantPosition(child) : null
+      if (!(shape && position)) continue
+      if (shape === 'vec3') {
+        const c = child as AnyNode & { rotation: Vec3 }
+        starts.push({
+          id: childId as AnyNodeId,
+          kind: 'vec3',
+          position: [position[0], position[1], position[2]],
+          rotation: [c.rotation[0], c.rotation[1], c.rotation[2]],
+        })
+      } else {
+        const rotation = getParticipantScalarRotation(child)
+        if (rotation === null) continue
+        starts.push({
+          id: childId as AnyNodeId,
+          kind: 'scalar',
+          position: [position[0], position[1], position[2]],
+          rotation,
+        })
+      }
+      includedIds.add(childId)
     }
   }
 
@@ -177,46 +246,283 @@ export function collectParticipants(
   return { starts, links }
 }
 
-// Grow a selection to the full connected component of walls/fences: any
-// endpoint node transitively reachable through shared junctions from a selected
-// endpoint node joins in, so the whole rigid structure transforms as one piece
-// (rather than tearing/stretching at the boundary). Non-endpoint selections
-// (items, columns) pass through unchanged.
-export function expandToComponent(
-  selectedIds: string[],
-  sceneNodes: Record<string, AnyNode | undefined>,
-  levelId: string | null,
-): string[] {
-  const endpoints: { id: string; start: Vec2; end: Vec2 }[] = []
-  for (const [id, node] of Object.entries(sceneNodes)) {
-    if (classifyParticipant(node, levelId, sceneNodes) === 'endpoint') {
-      const n = node as AnyNode & { start: Vec2; end: Vec2 }
-      endpoints.push({ id, start: [n.start[0], n.start[1]], end: [n.end[0], n.end[1]] })
+// Per-node field patch, keyed for `useLiveNodeOverrides.setMany` during a live
+// preview and for the single batched `updateNodes` on commit.
+export type GroupPatch = readonly [AnyNodeId, Record<string, unknown>]
+
+// Rigid group rotation: orbit each participant's anchor point(s) CCW by
+// `delta` (atan2 x→z sense) around `center` (level-frame XZ) and turn yaws by
+// `-delta` to match three.js Y-rotation handedness (same convention as the
+// single-item rotate handle in item/definition.ts). Endpoint nodes
+// (walls/fences) have no yaw — swinging both endpoints around the pivot
+// rotates them rigidly; their curveOffset sagitta is rotation-invariant, so
+// arcs are preserved. Linked neighbours' shared endpoints land exactly on the
+// selected wall's rotated endpoint (rot is deterministic), keeping junctions
+// welded while the far end stays put.
+export function rotateGroupPatches(
+  starts: ParticipantStart[],
+  links: LinkedNeighbor[],
+  center: { x: number; z: number },
+  delta: number,
+): GroupPatch[] {
+  const cos = Math.cos(delta)
+  const sin = Math.sin(delta)
+  const rot = (x: number, z: number): Vec2 => {
+    const dx = x - center.x
+    const dz = z - center.z
+    return [center.x + dx * cos - dz * sin, center.z + dx * sin + dz * cos]
+  }
+  const patches: GroupPatch[] = []
+  for (const s of starts) {
+    if (s.kind === 'endpoint') {
+      patches.push([s.id, { start: rot(s.start[0], s.start[1]), end: rot(s.end[0], s.end[1]) }])
+    } else if (s.kind === 'polygon') {
+      const patch: Record<string, unknown> = { polygon: s.polygon.map(([x, z]) => rot(x, z)) }
+      if (s.holes) patch.holes = s.holes.map((hole) => hole.map(([x, z]) => rot(x, z)))
+      patches.push([s.id, patch])
+    } else {
+      const [px, pz] = rot(s.position[0], s.position[2])
+      const position: Vec3 = [px, s.position[1], pz]
+      const rotation =
+        s.kind === 'vec3'
+          ? ([s.rotation[0], s.rotation[1] - delta, s.rotation[2]] as Vec3)
+          : s.rotation - delta
+      patches.push([s.id, { position, rotation }])
     }
   }
-  const included = new Set(selectedIds)
-  if (!endpoints.some((e) => included.has(e.id))) return selectedIds
+  for (const l of links) {
+    patches.push([
+      l.id,
+      {
+        start: l.startLinked ? rot(l.start[0], l.start[1]) : l.start,
+        end: l.endLinked ? rot(l.end[0], l.end[1]) : l.end,
+      },
+    ])
+  }
+  return patches
+}
 
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const e of endpoints) {
-      if (included.has(e.id)) continue
-      const touches = endpoints.some(
-        (o) =>
-          included.has(o.id) &&
-          (nearPoint(e.start, o.start) ||
-            nearPoint(e.start, o.end) ||
-            nearPoint(e.end, o.start) ||
-            nearPoint(e.end, o.end)),
-      )
-      if (touches) {
-        included.add(e.id)
-        changed = true
+// Rotate the SNAPSHOTS themselves (same math as `rotateGroupPatches`, but
+// producing new snapshot shapes instead of node patches). Lets an in-flight
+// group move re-seed its rest state after a mid-drag R/T: subsequent
+// translate patches then place the rotated layout at the live delta.
+export function rotateGroupSnapshots(
+  starts: ParticipantStart[],
+  links: LinkedNeighbor[],
+  center: { x: number; z: number },
+  delta: number,
+): { starts: ParticipantStart[]; links: LinkedNeighbor[] } {
+  const cos = Math.cos(delta)
+  const sin = Math.sin(delta)
+  const rot = (x: number, z: number): Vec2 => {
+    const dx = x - center.x
+    const dz = z - center.z
+    return [center.x + dx * cos - dz * sin, center.z + dx * sin + dz * cos]
+  }
+  const rotatedStarts = starts.map((s): ParticipantStart => {
+    if (s.kind === 'endpoint') {
+      return { ...s, start: rot(s.start[0], s.start[1]), end: rot(s.end[0], s.end[1]) }
+    }
+    if (s.kind === 'polygon') {
+      return {
+        ...s,
+        polygon: s.polygon.map(([x, z]) => rot(x, z)),
+        holes: s.holes ? s.holes.map((hole) => hole.map(([x, z]) => rot(x, z))) : null,
       }
     }
+    const [px, pz] = rot(s.position[0], s.position[2])
+    const position: Vec3 = [px, s.position[1], pz]
+    if (s.kind === 'vec3') {
+      return { ...s, position, rotation: [s.rotation[0], s.rotation[1] - delta, s.rotation[2]] }
+    }
+    return { ...s, position, rotation: s.rotation - delta }
+  })
+  // Only the welded (linked) endpoints follow the rotation; the far ends
+  // stay put, exactly like the per-tick patch path.
+  const rotatedLinks = links.map(
+    (l): LinkedNeighbor => ({
+      ...l,
+      start: l.startLinked ? rot(l.start[0], l.start[1]) : l.start,
+      end: l.endLinked ? rot(l.end[0], l.end[1]) : l.end,
+    }),
+  )
+  return { starts: rotatedStarts, links: rotatedLinks }
+}
+
+export type GroupPlanBounds = { minX: number; minZ: number; maxX: number; maxZ: number }
+
+const planCorner = new Vector3()
+const planMatrix = new Matrix4()
+
+/**
+ * The selection's footprint in the level frame — the plan's own coordinates,
+ * measured from node data wherever the plan draws from data: walls by their
+ * mitered outline, polygon hosts (slab, ceiling, zone) by their polygon, fences
+ * by their run. Only placed objects (items, columns, stairs…) measure their
+ * meshes: bounds go through `frameInv × matrixWorld` (a world box can't be
+ * carried into a rotated building's frame), placeholders — unbuilt while the
+ * 3D scene is paused in 2D-only view — are skipped, and a node with no built
+ * mesh falls back to its anchor.
+ */
+export function groupPlanBounds(
+  starts: ParticipantStart[],
+  frameInv: Matrix4,
+): GroupPlanBounds | null {
+  const nodes = useScene.getState().nodes
+  let minX = Number.POSITIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  const reach = (x: number, z: number) => {
+    minX = Math.min(minX, x)
+    minZ = Math.min(minZ, z)
+    maxX = Math.max(maxX, x)
+    maxZ = Math.max(maxZ, z)
   }
-  return Array.from(included)
+  const miters = new Map<string | null, ReturnType<typeof calculateLevelMiters>>()
+  const wallOutline = (wall: WallNode) => {
+    const levelId = wall.parentId ?? null
+    let levelMiters = miters.get(levelId)
+    if (!levelMiters) {
+      levelMiters = calculateLevelMiters(
+        Object.values(nodes).filter(
+          (node): node is WallNode => node?.type === 'wall' && (node.parentId ?? null) === levelId,
+        ),
+      )
+      miters.set(levelId, levelMiters)
+    }
+    return getWallPlanFootprint(wall, levelMiters)
+  }
+  const measureMeshes = (id: string) => {
+    const obj = sceneRegistry.nodes.get(id as AnyNodeId)
+    if (!obj) return false
+    obj.updateWorldMatrix(true, true)
+    let found = false
+    obj.traverse((child: Object3D) => {
+      const geometry = (child as Object3D & { geometry?: BufferGeometry }).geometry
+      if (!child.visible || !geometry || geometry.userData.placeholder) return
+      // Always fresh: geometries rebuilt in place keep a stale cached box.
+      geometry.computeBoundingBox()
+      const bounds = geometry.boundingBox
+      if (!bounds || bounds.isEmpty()) return
+      planMatrix.multiplyMatrices(frameInv, child.matrixWorld)
+      for (let corner = 0; corner < 8; corner++) {
+        planCorner
+          .set(
+            corner & 1 ? bounds.max.x : bounds.min.x,
+            corner & 2 ? bounds.max.y : bounds.min.y,
+            corner & 4 ? bounds.max.z : bounds.min.z,
+          )
+          .applyMatrix4(planMatrix)
+        reach(planCorner.x, planCorner.z)
+      }
+      found = true
+    })
+    return found
+  }
+  for (const s of starts) {
+    const node = nodes[s.id]
+    if (s.kind === 'endpoint') {
+      const outline = node?.type === 'wall' ? wallOutline(node) : []
+      if (outline.length > 0) {
+        for (const point of outline) reach(point.x, point.y)
+        continue
+      }
+      reach(s.start[0], s.start[1])
+      reach(s.end[0], s.end[1])
+      const path = (node as { path?: unknown } | undefined)?.path
+      if (isVec2Array(path)) for (const [x, z] of path) reach(x, z)
+    } else if (s.kind === 'polygon') {
+      for (const [x, z] of s.polygon) reach(x, z)
+    } else if (!measureMeshes(s.id)) {
+      reach(s.position[0], s.position[2])
+    }
+  }
+  return Number.isFinite(minX) ? { minX, minZ, maxX, maxZ } : null
+}
+
+/** `groupPlanBounds` for a selection: the dashed boxes and gizmos measure this. */
+export function computeGroupPlanBox(ids: string[], levelId: string | null): GroupPlanBounds | null {
+  const { starts } = collectParticipants(ids, useScene.getState().nodes, levelId)
+  return groupPlanBounds(starts, levelFrame(levelId).inverse)
+}
+
+export const planBoundsCenter = (b: GroupPlanBounds): Vec2 => [
+  (b.minX + b.maxX) / 2,
+  (b.minZ + b.maxZ) / 2,
+]
+
+// Re-seed the footprint after a mid-gesture rotation by orbiting the box
+// corners and re-fitting an axis-aligned box. Re-measuring the rotated DATA
+// extents instead would slide the centre off the pivot the snapshots turned
+// around, dragging the alignment anchors away from the group under the cursor.
+export function rotatePlanBounds(
+  b: GroupPlanBounds,
+  center: { x: number; z: number },
+  delta: number,
+): GroupPlanBounds {
+  const cos = Math.cos(delta)
+  const sin = Math.sin(delta)
+  let minX = Number.POSITIVE_INFINITY
+  let minZ = Number.POSITIVE_INFINITY
+  let maxX = Number.NEGATIVE_INFINITY
+  let maxZ = Number.NEGATIVE_INFINITY
+  const corners: Vec2[] = [
+    [b.minX, b.minZ],
+    [b.maxX, b.minZ],
+    [b.maxX, b.maxZ],
+    [b.minX, b.maxZ],
+  ]
+  for (const [x, z] of corners) {
+    const dx = x - center.x
+    const dz = z - center.z
+    const rx = center.x + dx * cos - dz * sin
+    const rz = center.z + dx * sin + dz * cos
+    minX = Math.min(minX, rx)
+    minZ = Math.min(minZ, rz)
+    maxX = Math.max(maxX, rx)
+    maxZ = Math.max(maxZ, rz)
+  }
+  return { minX, minZ, maxX, maxZ }
+}
+
+// Rigid group slide: shift every participant (and each linked neighbour's
+// shared endpoint) by the same level-frame XZ delta. Y is untouched; the
+// snapshot's rotation rides along because a mid-gesture R/T turns the
+// SNAPSHOTS — dropping it here would republish (and commit) the pre-rotation
+// facing, orbiting the layout while every member keeps its old bearing.
+export function translateGroupPatches(
+  starts: ParticipantStart[],
+  links: LinkedNeighbor[],
+  dx: number,
+  dz: number,
+): GroupPatch[] {
+  const patches: GroupPatch[] = []
+  const shift = ([x, z]: Vec2): Vec2 => [x + dx, z + dz]
+  for (const s of starts) {
+    if (s.kind === 'endpoint') {
+      patches.push([s.id, { start: shift(s.start), end: shift(s.end) }])
+    } else if (s.kind === 'polygon') {
+      const patch: Record<string, unknown> = { polygon: s.polygon.map(shift) }
+      if (s.holes) patch.holes = s.holes.map((hole) => hole.map(shift))
+      patches.push([s.id, patch])
+    } else {
+      const position: Vec3 = [s.position[0] + dx, s.position[1], s.position[2] + dz]
+      const rotation =
+        s.kind === 'vec3' ? ([s.rotation[0], s.rotation[1], s.rotation[2]] as Vec3) : s.rotation
+      patches.push([s.id, { position, rotation }])
+    }
+  }
+  for (const l of links) {
+    patches.push([
+      l.id,
+      {
+        start: l.startLinked ? [l.start[0] + dx, l.start[1] + dz] : l.start,
+        end: l.endLinked ? [l.end[0] + dx, l.end[1] + dz] : l.end,
+      },
+    ])
+  }
+  return patches
 }
 
 // Frozen world matrix of the level group + its inverse. A node's placement

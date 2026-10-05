@@ -11,7 +11,9 @@ import {
   type LevelNode,
   type NodeEvent,
   pointInPolygon,
+  resolveSelectionProxyId,
   sceneRegistry,
+  useRegistryVersion,
   useScene,
   type WallNode,
   type ZoneNode,
@@ -91,30 +93,15 @@ interface SelectionStrategy {
   isValid: (node: AnyNode) => boolean
 }
 
-// Check if a node belongs to the selected level (directly or via wall parent)
 const isNodeOnLevel = (node: AnyNode, levelId: string): boolean => {
   const nodes = useScene.getState().nodes
-
-  // Direct child of level
-  if (node.parentId === levelId) return true
-
-  // Wall-attached nodes (window/door/item): check if parent wall is on the level
-  if ((node.type === 'item' || node.type === 'window' || node.type === 'door') && node.parentId) {
-    const parentNode = nodes[node.parentId as keyof typeof nodes]
-    if (parentNode?.type === 'wall' && parentNode.parentId === levelId) {
-      return true
-    }
-    // Ceiling/slab/roof-attached items: check if parent structure is on the level
-    if (
-      (parentNode?.type === 'ceiling' ||
-        parentNode?.type === 'slab' ||
-        parentNode?.type === 'roof') &&
-      parentNode.parentId === levelId
-    ) {
-      return true
-    }
+  const seen = new Set<string>()
+  let parentId = node.parentId
+  while (parentId && !seen.has(parentId)) {
+    if (parentId === levelId) return true
+    seen.add(parentId)
+    parentId = nodes[parentId as AnyNodeId]?.parentId ?? null
   }
-
   return false
 }
 
@@ -184,18 +171,20 @@ const isNodeInZone = (node: AnyNode, levelId: string, zoneId: string): boolean =
 const getStrategy = (): SelectionStrategy | null => {
   const { buildingId, levelId, zoneId } = useViewer.getState().selection
 
-  const computeNextIds = (node: AnyNode, selectedIds: string[], event?: any): string[] => {
+  const computeNextIds = (nodeId: string, selectedIds: string[], event?: any): string[] => {
     const isMeta = event?.metaKey || event?.nativeEvent?.metaKey
     const isCtrl = event?.ctrlKey || event?.nativeEvent?.ctrlKey
+    // Shift toggles membership like Cmd/Ctrl.
+    const isShift = event?.shiftKey || event?.nativeEvent?.shiftKey
 
-    if (isMeta || isCtrl) {
-      if (selectedIds.includes(node.id)) {
-        return selectedIds.filter((id) => id !== node.id)
+    if (isMeta || isCtrl || isShift) {
+      if (selectedIds.includes(nodeId)) {
+        return selectedIds.filter((id) => id !== nodeId)
       }
-      return [...selectedIds, node.id]
+      return [...selectedIds, nodeId]
     }
 
-    return [node.id]
+    return [nodeId]
   }
 
   // No building selected -> can select buildings
@@ -253,6 +242,7 @@ const getStrategy = (): SelectionStrategy | null => {
       'roof-segment',
       'window',
       'door',
+      ...getSelectableKinds(),
     ],
     handleClick: (node, nativeEvent) => {
       let nodeToSelect = node
@@ -264,9 +254,13 @@ const getStrategy = (): SelectionStrategy | null => {
       }
 
       const { selectedIds } = useViewer.getState().selection
+      const proxyId = resolveSelectionProxyId(
+        nodeToSelect,
+        useScene.getState().nodes as Record<string, AnyNode | undefined>,
+      )
       useViewer
         .getState()
-        .setSelection({ selectedIds: computeNextIds(nodeToSelect, selectedIds, nativeEvent) })
+        .setSelection({ selectedIds: computeNextIds(proxyId, selectedIds, nativeEvent) })
     },
     handleDeselect: () => {
       const { selectedIds } = useViewer.getState().selection
@@ -289,6 +283,7 @@ const getStrategy = (): SelectionStrategy | null => {
         'roof-segment',
         'window',
         'door',
+        ...getSelectableKinds(),
       ]
       if (!validTypes.includes(node.type)) return false
       return isNodeInZone(node, levelId, zoneId)
@@ -299,8 +294,13 @@ const getStrategy = (): SelectionStrategy | null => {
 export const SelectionManager = () => {
   const selection = useViewer((s) => s.selection)
   const clickHandledRef = useRef(false)
+  // Plugin kinds register AFTER mount (async dynamic-import discovery) —
+  // re-derive the `getSelectableKinds()` subscription list when they land.
+  const registryVersion = useRegistryVersion()
 
   useEffect(() => {
+    // re-subscribe when plugin kinds register after mount (async plugin load)
+    void registryVersion
     const onEnter = (event: NodeEvent) => {
       const strategy = getStrategy()
       if (!strategy) return
@@ -315,7 +315,12 @@ export const SelectionManager = () => {
           useViewer.setState({ hoveredId: null })
           return
         }
-        useViewer.setState({ hoveredId: event.node.id })
+        useViewer.setState({
+          hoveredId: resolveSelectionProxyId(
+            event.node,
+            useScene.getState().nodes as Record<string, AnyNode | undefined>,
+          ),
+        })
       }
     }
 
@@ -325,7 +330,13 @@ export const SelectionManager = () => {
       if (event.node.type === 'ceiling') return
       if (strategy.isValid(event.node)) {
         event.stopPropagation()
-        useViewer.setState({ hoveredId: null })
+        const targetId = resolveSelectionProxyId(
+          event.node,
+          useScene.getState().nodes as Record<string, AnyNode | undefined>,
+        )
+        if (useViewer.getState().hoveredId === targetId) {
+          useViewer.setState({ hoveredId: null })
+        }
       }
     }
 
@@ -378,7 +389,7 @@ export const SelectionManager = () => {
         emitter.off(`${type}:click` as any, onClick as any)
       }
     }
-  }, [])
+  }, [registryVersion])
 
   return (
     <>
@@ -431,14 +442,17 @@ const PointerMissedHandler = ({
 
 const OutlinerSync = () => {
   const selection = useViewer((s) => s.selection)
+  const externalSelectedIds = useViewer((s) => s.externalSelectedIds)
   const hoveredId = useViewer((s) => s.hoveredId)
   const outliner = useViewer((s) => s.outliner)
+  const geometryRevision = useViewer((s) => s.geometryRevision)
   const nodes = useScene((s) => s.nodes)
 
   useEffect(() => {
+    void geometryRevision
     // Sync selected objects
     outliner.selectedObjects.length = 0
-    for (const id of selection.selectedIds) {
+    for (const id of new Set([...selection.selectedIds, ...externalSelectedIds])) {
       const node = nodes[id as AnyNodeId]
       if (node?.type === 'slab') continue
       const obj = sceneRegistry.nodes.get(id)
@@ -453,7 +467,7 @@ const OutlinerSync = () => {
       const obj = sceneRegistry.nodes.get(hoveredId)
       if (obj) outliner.hoveredObjects.push(obj)
     }
-  }, [selection, hoveredId, outliner, nodes])
+  }, [selection, externalSelectedIds, hoveredId, outliner, nodes, geometryRevision])
 
   return null
 }

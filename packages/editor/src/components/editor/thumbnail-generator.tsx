@@ -1,36 +1,50 @@
 'use client'
 
-import { emitter, sceneRegistry } from '@pascal-app/core'
-import { GRID_LAYER, SSGI_PARAMS, snapLevelsToTruePositions, useViewer } from '@pascal-app/viewer'
+import {
+  type AnyNodeId,
+  emitter,
+  sceneRegistry,
+  type ThumbnailGenerateEvent,
+  useScene,
+} from '@pascal-app/core'
+import {
+  computeHeroFraming,
+  createSnapshotPipeline,
+  GRID_LAYER,
+  getVisibleWallMaterials,
+  heroCameraPose,
+  refreshIsolation,
+  SNAPSHOT_MAX_EDGE,
+  SNAPSHOT_MIME,
+  SNAPSHOT_QUALITY,
+  type SnapshotPipeline,
+  snapLevelsToTruePositions,
+  THUMBNAIL_HEIGHT,
+  THUMBNAIL_WIDTH,
+  temporarilyHideNodeTypes,
+  temporarilyShowShadowOnly,
+  useSceneAtmosphere,
+  useViewer,
+} from '@pascal-app/viewer'
 import type { CameraControls } from '@react-three/drei'
 import { useThree } from '@react-three/fiber'
 import { useCallback, useEffect, useRef } from 'react'
 import * as THREE from 'three'
-import { UnsignedByteType } from 'three'
-import { ssgi } from 'three/addons/tsl/display/SSGINode.js'
-import { denoise } from 'three/examples/jsm/tsl/display/DenoiseNode.js'
-import { fxaa } from 'three/examples/jsm/tsl/display/FXAANode.js'
-import {
-  colorToDirection,
-  convertToTexture,
-  diffuseColor,
-  directionToColor,
-  float,
-  mrt,
-  normalView,
-  output,
-  pass,
-  sample,
-  vec4,
-} from 'three/tsl'
-import { RenderPipeline, RenderTarget, type WebGPURenderer } from 'three/webgpu'
+import type { WebGPURenderer } from 'three/webgpu'
 import { EDITOR_LAYER } from '../../lib/constants'
-
-const THUMBNAIL_WIDTH = 1920
-const THUMBNAIL_HEIGHT = 1080
+import {
+  applySnapshotCapturePose,
+  captureSnapshotScene,
+  createSnapshotQueue,
+  enqueueSnapshotCapture,
+  runSnapshotCapture,
+} from './snapshot-capture'
 
 export interface SnapshotCameraData {
+  requestId?: string
   position: [number, number, number]
+  quaternion?: [number, number, number, number]
+  fov?: number
   target: [number, number, number] | null
   type?: 'perspective' | 'orthographic'
   zoom?: number
@@ -42,24 +56,38 @@ interface ThumbnailGeneratorProps {
   onThumbnailCapture?: (blob: Blob, cameraData: SnapshotCameraData) => void
 }
 
+/** Metres ahead of a controls-less camera to place the stored snapshot target. */
+const FIRST_PERSON_TARGET_DISTANCE = 8
+
+function clampSnapshotSize(width: number, height: number): { w: number; h: number } {
+  const maxEdge = Math.max(width, height)
+  if (maxEdge <= SNAPSHOT_MAX_EDGE) return { w: width, h: height }
+
+  const scale = SNAPSHOT_MAX_EDGE / maxEdge
+  return { w: Math.round(width * scale), h: Math.round(height * scale) }
+}
+
 export const ThumbnailGenerator = ({ onThumbnailCapture }: ThumbnailGeneratorProps) => {
   const gl = useThree((state) => state.gl)
   const scene = useThree((state) => state.scene)
-  const mainCamera = useThree((state) => state.camera)
+  const atmosphere = useSceneAtmosphere()
+  const getThree = useThree((state) => state.get)
   const controls = useThree((state) => state.controls) as CameraControls | null
   const isGenerating = useRef(false)
+  const captureQueue = useRef(createSnapshotQueue())
   const onThumbnailCaptureRef = useRef(onThumbnailCapture)
 
   const thumbnailCameraRef = useRef<THREE.PerspectiveCamera | null>(null)
-  const pipelineRef = useRef<RenderPipeline | null>(null)
-  const renderTargetRef = useRef<RenderTarget | null>(null)
+  const pipelineRef = useRef<SnapshotPipeline | null>(null)
+  const captureVersion = useRef(0)
 
   useEffect(() => {
     onThumbnailCaptureRef.current = onThumbnailCapture
   }, [onThumbnailCapture])
 
-  // Build the thumbnail camera, SSGI pipeline, and render target once — reused on every capture.
+  // Reuse the camera and snapshot graph until the active atmosphere source changes.
   useEffect(() => {
+    captureVersion.current += 1
     const cam = new THREE.PerspectiveCamera(60, THUMBNAIL_WIDTH / THUMBNAIL_HEIGHT, 0.1, 1000)
     cam.layers.disable(EDITOR_LAYER)
     cam.layers.disable(GRID_LAYER)
@@ -68,392 +96,294 @@ export const ThumbnailGenerator = ({ onThumbnailCapture }: ThumbnailGeneratorPro
     let mounted = true
 
     const buildPipeline = async () => {
-      try {
-        if ((gl as any).init) await (gl as any).init()
-        if (!mounted) return
-
-        // pass() handles MRT internally for all material types, including custom
-        // shaders — unlike renderer.setMRT() which crashes on non-NodeMaterials.
-        // pass() also respects camera.layers, so EDITOR_LAYER + GRID_LAYER objects are filtered.
-        const scenePass = pass(scene, cam)
-        scenePass.setMRT(
-          mrt({
-            output,
-            diffuseColor,
-            normal: directionToColor(normalView),
-          }),
-        )
-
-        const scenePassColor = scenePass.getTextureNode('output')
-        const scenePassDepth = scenePass.getTextureNode('depth')
-        const scenePassNormal = scenePass.getTextureNode('normal')
-
-        scenePass.getTexture('diffuseColor').type = UnsignedByteType
-        scenePass.getTexture('normal').type = UnsignedByteType
-
-        const sceneNormal = sample((uv) => colorToDirection(scenePassNormal.sample(uv)))
-
-        const giPass = ssgi(scenePassColor, scenePassDepth, sceneNormal, cam as any)
-        giPass.sliceCount.value = SSGI_PARAMS.sliceCount
-        giPass.stepCount.value = SSGI_PARAMS.stepCount
-        giPass.radius.value = SSGI_PARAMS.radius
-        giPass.expFactor.value = SSGI_PARAMS.expFactor
-        giPass.thickness.value = SSGI_PARAMS.thickness
-        giPass.backfaceLighting.value = SSGI_PARAMS.backfaceLighting
-        giPass.aoIntensity.value = SSGI_PARAMS.aoIntensity
-        giPass.giIntensity.value = SSGI_PARAMS.giIntensity
-        giPass.useLinearThickness.value = SSGI_PARAMS.useLinearThickness
-        giPass.useScreenSpaceSampling.value = SSGI_PARAMS.useScreenSpaceSampling
-        giPass.useTemporalFiltering = SSGI_PARAMS.useTemporalFiltering
-
-        const giTexture = (giPass as any).getTextureNode()
-        const aoAsRgb = vec4(giTexture.a, giTexture.a, giTexture.a, float(1))
-        const denoisePass = denoise(aoAsRgb, scenePassDepth, sceneNormal, cam)
-        denoisePass.index.value = 0
-        denoisePass.radius.value = 4
-
-        const ao = (denoisePass as any).r
-        const finalOutput = vec4(scenePassColor.rgb.mul(ao), scenePassColor.a)
-
-        // FXAA requires a texture node as input; convertToTexture renders finalOutput
-        // into an intermediate RT so FXAA can sample it with neighbour UV offsets.
-        const aaOutput = fxaa(convertToTexture(finalOutput))
-
-        const pipeline = new RenderPipeline(gl as unknown as WebGPURenderer)
-        pipeline.outputNode = aaOutput
-        pipelineRef.current = pipeline
-
-        // Dedicated render target — pipeline outputs here instead of the canvas,
-        // so R3F's main render loop can never overwrite our capture.
-        const { width, height } = gl.domElement
-        renderTargetRef.current = new RenderTarget(width, height, { depthBuffer: true })
-      } catch (error) {
-        console.error(
-          '[thumbnail] Failed to build post-processing pipeline, will use fallback render.',
-          error,
-        )
+      const pipeline = await createSnapshotPipeline({
+        renderer: gl as unknown as WebGPURenderer,
+        scene,
+        camera: cam,
+        atmosphere,
+      })
+      if (!mounted) {
+        pipeline?.dispose()
+        return
       }
+      pipelineRef.current = pipeline
     }
 
-    buildPipeline()
+    void buildPipeline()
 
     return () => {
       mounted = false
+      captureVersion.current += 1
+      thumbnailCameraRef.current = null
       pipelineRef.current?.dispose()
       pipelineRef.current = null
-      renderTargetRef.current?.dispose()
-      renderTargetRef.current = null
     }
-  }, [gl, scene])
+  }, [gl, scene, atmosphere])
 
   const generate = useCallback(
-    async (
-      snapLevels: boolean,
-      captureMode?: 'standard' | 'viewport' | 'area',
-      cropRegion?: { x: number; y: number; width: number; height: number },
-    ) => {
-      if (isGenerating.current) return
-      if (!onThumbnailCaptureRef.current) return
-
-      isGenerating.current = true
-
-      try {
-        const thumbnailCamera = thumbnailCameraRef.current
-        if (!thumbnailCamera) return
-
-        // Copy the main camera's transform and projection so the thumbnail
-        // matches exactly what the user sees in the viewport.
-        thumbnailCamera.position.copy(mainCamera.position)
-        thumbnailCamera.quaternion.copy(mainCamera.quaternion)
-        if (mainCamera instanceof THREE.PerspectiveCamera) {
-          thumbnailCamera.fov = mainCamera.fov
-          thumbnailCamera.near = mainCamera.near
-          thumbnailCamera.far = mainCamera.far
-        }
-        const { width, height } = gl.domElement
-        thumbnailCamera.aspect = width / height
-        thumbnailCamera.updateProjectionMatrix()
-
-        // Capture camera data for snapshot storage
-        const pos = mainCamera.position
-        let tgt: [number, number, number] | null = null
-        if (controls && 'getTarget' in controls) {
-          const v = new THREE.Vector3()
-          ;(controls as any).getTarget(v)
-          tgt = [v.x, v.y, v.z]
-        }
-        const isOrtho = mainCamera instanceof THREE.OrthographicCamera
-        const cameraData: SnapshotCameraData = {
-          position: [pos.x, pos.y, pos.z],
-          target: tgt,
-          type: isOrtho ? 'orthographic' : 'perspective',
-          ...(isOrtho && { zoom: (mainCamera as THREE.OrthographicCamera).zoom }),
-        }
-
-        // For auto-save: snap levels to stacked positions and reset levelMode
-        let restoreLevelMode: (() => void) | null = null
-        let restoreLevels: () => void = () => {}
-        if (snapLevels) {
-          const prevMode = useViewer.getState().levelMode
-          if (prevMode !== 'stacked') {
-            useViewer.getState().setLevelMode('stacked')
-            restoreLevelMode = () => useViewer.getState().setLevelMode(prevMode)
+    async (event: ThumbnailGenerateEvent) => {
+      const { captureMode, cropRegion, standardSize, cameraPose, requestId } = event
+      const snapLevels = event.snapLevels === true
+      const transparent = event.transparent === true
+      const standardW = standardSize?.w ?? THUMBNAIL_WIDTH
+      const standardH = standardSize?.h ?? THUMBNAIL_HEIGHT
+      await runSnapshotCapture(
+        requestId,
+        isGenerating,
+        async () => {
+          const version = captureVersion.current
+          const onCapture = onThumbnailCaptureRef.current
+          if (!onCapture) throw new Error('Snapshot storage is unavailable')
+          if (cameraPose && event.projectId !== useViewer.getState().projectId)
+            throw new Error('The active project changed before capture')
+          const thumbnailCamera = thumbnailCameraRef.current
+          if (!thumbnailCamera) throw new Error('Snapshot camera is not ready')
+          const { camera: mainCamera, controls } = getThree()
+          if (cameraPose && (snapLevels || (captureMode && captureMode !== 'standard'))) {
+            throw new Error('An explicit snapshot camera requires standard capture mode')
           }
-          restoreLevels = snapLevelsToTruePositions()
-        }
+          if (cameraPose && !pipelineRef.current) {
+            throw new Error('Snapshot renderer is not ready. Try again.')
+          }
 
-        // Hide scan, guide, and spawn nodes directly so they are excluded from
-        // the thumbnail regardless of whether ScanSystem/GuideSystem listeners
-        // are registered. Spawn renders on SCENE_LAYER for occlusion, so the
-        // thumbnail camera's layer mask can't filter it either. Returns a
-        // function that restores the original visibility.
-        const restoreNodeVisibility = (() => {
-          const saved = new Map<THREE.Object3D, boolean>()
-          for (const type of ['scan', 'guide', 'spawn'] as const) {
-            const ids = sceneRegistry.byType[type]!
-            ids.forEach((id) => {
-              const node = sceneRegistry.nodes.get(id)
-              if (node) {
-                saved.set(node, node.visible)
-                node.visible = false
+          // Copy the main camera's transform and projection so the thumbnail
+          // matches exactly what the user sees in the viewport.
+          thumbnailCamera.position.copy(mainCamera.position)
+          thumbnailCamera.quaternion.copy(mainCamera.quaternion)
+          if (mainCamera instanceof THREE.PerspectiveCamera) {
+            thumbnailCamera.fov = mainCamera.fov
+            thumbnailCamera.near = mainCamera.near
+            thumbnailCamera.far = mainCamera.far
+          }
+          const { width, height } = gl.domElement
+          thumbnailCamera.aspect = width / height
+          if (cameraPose) {
+            applySnapshotCapturePose(
+              thumbnailCamera,
+              cameraPose,
+              { width, height },
+              {
+                w: standardW,
+                h: standardH,
+              },
+            )
+          }
+          thumbnailCamera.updateProjectionMatrix()
+          // The capture camera never joins the scene graph, so its matrixWorld
+          // is only refreshed by the render itself — too late for the backdrop
+          // uniforms below.
+          thumbnailCamera.updateMatrixWorld()
+
+          const pipeline = pipelineRef.current
+          pipeline?.applyEnvironment({
+            theme: useViewer.getState().sceneTheme,
+            transparent,
+            grade: useViewer.getState().shading === 'rendered',
+            // Preset/item captures stay clean; scene captures mirror the canvas.
+            edges: transparent ? 'off' : useViewer.getState().edges,
+            camera: thumbnailCamera,
+          })
+
+          // Capture camera data for snapshot storage
+          const pos = cameraPose ? thumbnailCamera.position : mainCamera.position
+          let tgt: [number, number, number] | null = null
+          if (!cameraPose && controls && 'getTarget' in controls) {
+            const v = new THREE.Vector3()
+            ;(controls as any).getTarget(v)
+            tgt = [v.x, v.y, v.z]
+          } else {
+            // Walk / drone captures run without orbit controls, so there is no orbit
+            // target to read. Synthesize one down the view axis — otherwise the
+            // saved snapshot carries no framing to return to.
+            const look = new THREE.Vector3(0, 0, -1)
+              .applyQuaternion(cameraPose ? thumbnailCamera.quaternion : mainCamera.quaternion)
+              .multiplyScalar(FIRST_PERSON_TARGET_DISTANCE)
+              .add(pos)
+            tgt = [look.x, look.y, look.z]
+          }
+          const isOrtho = !cameraPose && mainCamera instanceof THREE.OrthographicCamera
+          const cameraData: SnapshotCameraData = {
+            ...(requestId && { requestId }),
+            position: [pos.x, pos.y, pos.z],
+            ...(cameraPose && {
+              quaternion: [...cameraPose.quaternion] as [number, number, number, number],
+              fov: cameraPose.fov,
+            }),
+            target: tgt,
+            type: isOrtho ? 'orthographic' : 'perspective',
+            ...(isOrtho && { zoom: (mainCamera as THREE.OrthographicCamera).zoom }),
+          }
+
+          const capturePromise = captureSnapshotScene((restore) => {
+            if (snapLevels) {
+              const prevMode = useViewer.getState().levelMode
+              if (prevMode !== 'stacked') {
+                restore(() => useViewer.getState().setLevelMode(prevMode))
+                useViewer.getState().setLevelMode('stacked')
               }
-            })
-          }
-          return () => {
-            saved.forEach((wasVisible, node) => {
-              node.visible = wasVisible
-            })
-          }
-        })()
+              restore(snapLevelsToTruePositions())
+            }
+            restore(temporarilyHideNodeTypes(['scan', 'guide', 'spawn']))
 
-        let blob: Blob
+            // Auto-save uses the published hero framing. An authored shot keeps
+            // its own camera while sharing the same true level positions.
+            if (snapLevels) {
+              const framing = computeHeroFraming()
+              if (framing) {
+                const pose = heroCameraPose({
+                  boxes: framing.boxes,
+                  aim: framing.aim,
+                  azimuthRad: framing.azimuthRad,
+                  aspect: width / height,
+                })
+                thumbnailCamera.position.set(pose.position[0], pose.position[1], pose.position[2])
+                thumbnailCamera.lookAt(pose.target[0], pose.target[1], pose.target[2])
+                thumbnailCamera.updateMatrixWorld()
+                pipeline?.applyEnvironment({
+                  theme: useViewer.getState().sceneTheme,
+                  transparent,
+                  grade: useViewer.getState().shading === 'rendered',
+                  edges: transparent ? 'off' : useViewer.getState().edges,
+                  camera: thumbnailCamera,
+                })
+                cameraData.position = pose.position
+                cameraData.target = pose.target
+              }
+            }
 
-        if (pipelineRef.current && renderTargetRef.current) {
-          const rt = renderTargetRef.current
-
-          // Resize RT if the canvas dimensions changed
-          if (rt.width !== width || rt.height !== height) {
-            rt.setSize(width, height)
-          }
-
-          const renderer = gl as unknown as WebGPURenderer
-
-          // Notify other systems (wall cutouts, selection manager) to restore
-          // their overrides before capture and re-apply them after.
-          try {
+            restore(() => emitter.emit('thumbnail:after-capture', undefined))
             emitter.emit('thumbnail:before-capture', undefined)
-            ;(renderer as any).setClearAlpha(0)
-            renderer.setRenderTarget(rt)
-            pipelineRef.current.render()
-          } finally {
-            // Restore level positions, levelMode, and node visibility immediately
-            // after the render — before the async GPU readback. Runs in `finally`
-            // so a render failure can't leave helpers permanently hidden.
-            renderer.setRenderTarget(null)
-            emitter.emit('thumbnail:after-capture', undefined)
-            restoreLevels()
-            restoreLevelMode?.()
-            restoreNodeVisibility()
-          }
-
-          // Read pixels from the RT asynchronously.
-          // WebGPU copyTextureToBuffer aligns each row to 256 bytes, so we must
-          // depad the rows before constructing ImageData.
-          const pixels = (await (renderer as any).readRenderTargetPixelsAsync(
-            rt,
-            0,
-            0,
-            width,
-            height,
-          )) as Uint8Array
-
-          const actualBytesPerRow = width * 4
-          const tightTotal = actualBytesPerRow * height
-          const paddedBytesPerRow = Math.ceil(actualBytesPerRow / 256) * 256
-          // Two readback shapes to handle:
-          // - WebGPU (`copyTextureToBuffer`): top-down + 256-byte row padding
-          //   when width*4 isn't already a multiple of 256.
-          // - WebGL2 fallback (iOS Chrome, etc.): tightly-packed but bottom-up
-          //   (OpenGL framebuffer convention).
-          // `isWebGPURenderer` lies — it stays true even when the renderer
-          // falls back to the WebGL backend. Inspect the actual backend
-          // instead (presence of a GPU device, or backend constructor name).
-          const backend = (renderer as any).backend
-          const isWebGPU =
-            !!backend?.device ||
-            backend?.isWebGPUBackend === true ||
-            backend?.constructor?.name === 'WebGPUBackend'
-          let tightPixels: Uint8ClampedArray
-          if (isWebGPU) {
-            // WebGPU: depad rows if needed; orientation is already top-down.
-            if (paddedBytesPerRow === actualBytesPerRow) {
-              tightPixels = new Uint8ClampedArray(
-                pixels.buffer,
-                pixels.byteOffset,
-                Math.min(pixels.byteLength, tightTotal),
-              )
-            } else {
-              tightPixels = new Uint8ClampedArray(tightTotal)
-              for (let row = 0; row < height; row++) {
-                tightPixels.set(
-                  pixels.subarray(
-                    row * paddedBytesPerRow,
-                    row * paddedBytesPerRow + actualBytesPerRow,
-                  ),
-                  row * actualBytesPerRow,
+            if (cameraPose) {
+              restore(snapLevelsToTruePositions())
+              restore(temporarilyShowShadowOnly(scene))
+              const wallMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
+              restore(() => {
+                for (const [mesh, material] of wallMaterials) mesh.material = material
+              })
+              const state = useScene.getState()
+              const viewer = useViewer.getState()
+              for (const id of sceneRegistry.byType.wall ?? []) {
+                const node = state.nodes[id as AnyNodeId]
+                const mesh = sceneRegistry.nodes.get(id) as THREE.Mesh | undefined
+                if (node?.type !== 'wall' || !mesh?.isMesh) continue
+                wallMaterials.set(mesh, mesh.material)
+                mesh.material = getVisibleWallMaterials(
+                  node,
+                  viewer.shading,
+                  viewer.textures,
+                  viewer.colorPreset,
+                  viewer.sceneTheme,
+                  state.materials,
                 )
               }
             }
+
+            // Geometry and presentation systems may have mounted new meshes
+            // since the viewport's last frame. Apply the same isolation to
+            // those meshes before either snapshot render path submits them,
+            // and restore fog afterwards so the atmosphere never leaks in.
+            restore(refreshIsolation(scene))
+            if (pipeline) return pipeline.capture({ captureMode, cropRegion, standardSize })
+            gl.render(scene, thumbnailCamera)
+            return undefined
+          })
+
+          let blob: Blob
+          if (pipeline) {
+            const result = await capturePromise
+            if (!result) throw new Error('Snapshot capture produced no image')
+            blob = result.blob
+            if (captureMode !== undefined) cameraData.captureMode = captureMode
+            cameraData.resolution = { w: result.outW, h: result.outH }
           } else {
-            // WebGL2: tight buffer in bottom-up order — flip rows.
-            tightPixels = new Uint8ClampedArray(tightTotal)
-            for (let row = 0; row < height; row++) {
-              const srcStart = (height - 1 - row) * actualBytesPerRow
-              tightPixels.set(
-                pixels.subarray(srcStart, srcStart + actualBytesPerRow),
-                row * actualBytesPerRow,
+            await capturePromise
+            let outW: number
+            let outH: number
+
+            if (captureMode === 'viewport') {
+              ;({ w: outW, h: outH } = clampSnapshotSize(width, height))
+              const offscreen = document.createElement('canvas')
+              offscreen.width = outW
+              offscreen.height = outH
+              const ctx = offscreen.getContext('2d')!
+              if (outW !== width || outH !== height) ctx.imageSmoothingQuality = 'high'
+              ctx.drawImage(gl.domElement, 0, 0, width, height, 0, 0, outW, outH)
+              blob = await new Promise<Blob>((resolve, reject) =>
+                offscreen.toBlob(
+                  (b) => (b ? resolve(b) : reject(new Error('Canvas capture failed'))),
+                  SNAPSHOT_MIME,
+                  SNAPSHOT_QUALITY,
+                ),
+              )
+            } else if (captureMode === 'area' && cropRegion) {
+              const sx = Math.round(cropRegion.x * width)
+              const sy = Math.round(cropRegion.y * height)
+              const sourceW = Math.round(cropRegion.width * width)
+              const sourceH = Math.round(cropRegion.height * height)
+              ;({ w: outW, h: outH } = clampSnapshotSize(sourceW, sourceH))
+              const offscreen = document.createElement('canvas')
+              offscreen.width = outW
+              offscreen.height = outH
+              const ctx = offscreen.getContext('2d')!
+              if (outW !== sourceW || outH !== sourceH) ctx.imageSmoothingQuality = 'high'
+              ctx.drawImage(gl.domElement, sx, sy, sourceW, sourceH, 0, 0, outW, outH)
+              blob = await new Promise<Blob>((resolve, reject) =>
+                offscreen.toBlob(
+                  (b) => (b ? resolve(b) : reject(new Error('Canvas capture failed'))),
+                  SNAPSHOT_MIME,
+                  SNAPSHOT_QUALITY,
+                ),
+              )
+            } else {
+              const srcAspect = width / height
+              const dstAspect = standardW / standardH
+              let sx = 0,
+                sy = 0,
+                sWidth = width,
+                sHeight = height
+              if (srcAspect > dstAspect) {
+                sWidth = Math.round(height * dstAspect)
+                sx = Math.round((width - sWidth) / 2)
+              } else if (srcAspect < dstAspect) {
+                sHeight = Math.round(width / dstAspect)
+                sy = Math.round((height - sHeight) / 2)
+              }
+              outW = standardW
+              outH = standardH
+              const offscreen = document.createElement('canvas')
+              offscreen.width = outW
+              offscreen.height = outH
+              offscreen
+                .getContext('2d')!
+                .drawImage(gl.domElement, sx, sy, sWidth, sHeight, 0, 0, outW, outH)
+              blob = await new Promise<Blob>((resolve, reject) =>
+                offscreen.toBlob(
+                  (b) => (b ? resolve(b) : reject(new Error('Canvas capture failed'))),
+                  SNAPSHOT_MIME,
+                  SNAPSHOT_QUALITY,
+                ),
               )
             }
+
+            if (captureMode !== undefined) cameraData.captureMode = captureMode
+            cameraData.resolution = { w: outW, h: outH }
           }
 
-          const imageData = new ImageData(
-            tightPixels as unknown as Uint8ClampedArray<ArrayBuffer>,
-            width,
-            height,
-          )
-          const srcCanvas = new OffscreenCanvas(width, height)
-          srcCanvas.getContext('2d')!.putImageData(imageData, 0, 0)
-
-          let outW: number
-          let outH: number
-
-          if (captureMode === 'viewport') {
-            outW = width
-            outH = height
-            const offscreen = new OffscreenCanvas(outW, outH)
-            offscreen.getContext('2d')!.drawImage(srcCanvas, 0, 0)
-            blob = await offscreen.convertToBlob({ type: 'image/png' })
-          } else if (captureMode === 'area' && cropRegion) {
-            const sx = Math.round(cropRegion.x * width)
-            const sy = Math.round(cropRegion.y * height)
-            outW = Math.round(cropRegion.width * width)
-            outH = Math.round(cropRegion.height * height)
-            const offscreen = new OffscreenCanvas(outW, outH)
-            offscreen.getContext('2d')!.drawImage(srcCanvas, sx, sy, outW, outH, 0, 0, outW, outH)
-            blob = await offscreen.convertToBlob({ type: 'image/png' })
-          } else {
-            // Standard: center-crop to 1920×1080 aspect ratio
-            const srcAspect = width / height
-            const dstAspect = THUMBNAIL_WIDTH / THUMBNAIL_HEIGHT
-            let sx = 0,
-              sy = 0,
-              sWidth = width,
-              sHeight = height
-            if (srcAspect > dstAspect) {
-              sWidth = Math.round(height * dstAspect)
-              sx = Math.round((width - sWidth) / 2)
-            } else if (srcAspect < dstAspect) {
-              sHeight = Math.round(width / dstAspect)
-              sy = Math.round((height - sHeight) / 2)
-            }
-            outW = THUMBNAIL_WIDTH
-            outH = THUMBNAIL_HEIGHT
-            const offscreen = new OffscreenCanvas(outW, outH)
-            offscreen
-              .getContext('2d')!
-              .drawImage(srcCanvas, sx, sy, sWidth, sHeight, 0, 0, outW, outH)
-            blob = await offscreen.convertToBlob({ type: 'image/png' })
+          if (
+            version !== captureVersion.current ||
+            thumbnailCamera !== thumbnailCameraRef.current
+          ) {
+            throw new Error('The scene changed during capture. Try again.')
           }
-
-          if (captureMode !== undefined) cameraData.captureMode = captureMode
-          cameraData.resolution = { w: outW, h: outH }
-        } else {
-          // Fallback: plain render directly to the canvas
-          try {
-            emitter.emit('thumbnail:before-capture', undefined)
-            gl.render(scene, thumbnailCamera)
-          } finally {
-            emitter.emit('thumbnail:after-capture', undefined)
-            restoreLevels()
-            restoreLevelMode?.()
-            restoreNodeVisibility()
+          if (cameraPose && event.projectId !== useViewer.getState().projectId) {
+            throw new Error('The active project changed during capture')
           }
-
-          let outW: number
-          let outH: number
-
-          if (captureMode === 'viewport') {
-            outW = width
-            outH = height
-            const offscreen = document.createElement('canvas')
-            offscreen.width = outW
-            offscreen.height = outH
-            offscreen.getContext('2d')!.drawImage(gl.domElement, 0, 0)
-            blob = await new Promise<Blob>((resolve, reject) =>
-              offscreen.toBlob(
-                (b) => (b ? resolve(b) : reject(new Error('Canvas capture failed'))),
-                'image/png',
-              ),
-            )
-          } else if (captureMode === 'area' && cropRegion) {
-            const sx = Math.round(cropRegion.x * width)
-            const sy = Math.round(cropRegion.y * height)
-            outW = Math.round(cropRegion.width * width)
-            outH = Math.round(cropRegion.height * height)
-            const offscreen = document.createElement('canvas')
-            offscreen.width = outW
-            offscreen.height = outH
-            offscreen
-              .getContext('2d')!
-              .drawImage(gl.domElement, sx, sy, outW, outH, 0, 0, outW, outH)
-            blob = await new Promise<Blob>((resolve, reject) =>
-              offscreen.toBlob(
-                (b) => (b ? resolve(b) : reject(new Error('Canvas capture failed'))),
-                'image/png',
-              ),
-            )
-          } else {
-            const srcAspect = width / height
-            const dstAspect = THUMBNAIL_WIDTH / THUMBNAIL_HEIGHT
-            let sx = 0,
-              sy = 0,
-              sWidth = width,
-              sHeight = height
-            if (srcAspect > dstAspect) {
-              sWidth = Math.round(height * dstAspect)
-              sx = Math.round((width - sWidth) / 2)
-            } else if (srcAspect < dstAspect) {
-              sHeight = Math.round(width / dstAspect)
-              sy = Math.round((height - sHeight) / 2)
-            }
-            outW = THUMBNAIL_WIDTH
-            outH = THUMBNAIL_HEIGHT
-            const offscreen = document.createElement('canvas')
-            offscreen.width = outW
-            offscreen.height = outH
-            offscreen
-              .getContext('2d')!
-              .drawImage(gl.domElement, sx, sy, sWidth, sHeight, 0, 0, outW, outH)
-            blob = await new Promise<Blob>((resolve, reject) =>
-              offscreen.toBlob(
-                (b) => (b ? resolve(b) : reject(new Error('Canvas capture failed'))),
-                'image/png',
-              ),
-            )
-          }
-
-          if (captureMode !== undefined) cameraData.captureMode = captureMode
-          cameraData.resolution = { w: outW, h: outH }
-        }
-
-        onThumbnailCaptureRef.current?.(blob, cameraData)
-      } catch (error) {
-        console.error('❌ Failed to generate thumbnail:', error)
-      } finally {
-        isGenerating.current = false
-      }
+          await onCapture(blob, cameraData)
+        },
+        (failure) => emitter.emit('snapshot:capture-failed', failure),
+      )
     },
-    [gl, scene, mainCamera, controls],
+    [gl, scene, getThree],
   )
 
   // Thumbnail request via emitter. Two call shapes:
@@ -463,24 +393,23 @@ export const ThumbnailGenerator = ({ onThumbnailCapture }: ThumbnailGeneratorPro
   //    to their true positions first for a consistent auto-thumbnail angle.
   // The caller owns policy (when to fire, whether the tab is visible).
   useEffect(() => {
-    if (!onThumbnailCapture) return
-
-    const handleGenerateThumbnail = async (event: {
-      captureMode?: 'standard' | 'viewport' | 'area'
-      cropRegion?: { x: number; y: number; width: number; height: number }
-      snapLevels?: boolean
-      // `transparent` is informational here — the render pipeline already
-      // captures with alpha (see `setClearAlpha(0)` above) — the flag is
-      // forwarded so future tweaks (suppressing the ground occluder, theme
-      // background bits) can branch on it without touching the emitter.
-      transparent?: boolean
-    }) => {
-      await generate(event.snapLevels === true, event.captureMode, event.cropRegion)
+    const handleGenerateThumbnail = async (event: ThumbnailGenerateEvent) => {
+      // A saved-frame notification can enqueue the next shot frame before
+      // its predecessor's host callback returns and releases the renderer.
+      await enqueueSnapshotCapture(
+        captureQueue.current,
+        captureVersion,
+        event,
+        generate,
+        (failure) => emitter.emit('snapshot:capture-failed', failure),
+      )
     }
 
     emitter.on('camera-controls:generate-thumbnail', handleGenerateThumbnail)
-    return () => emitter.off('camera-controls:generate-thumbnail', handleGenerateThumbnail)
-  }, [generate, onThumbnailCapture])
+    return () => {
+      emitter.off('camera-controls:generate-thumbnail', handleGenerateThumbnail)
+    }
+  }, [generate])
 
   // Go-to-camera: animate camera to a saved snapshot position/target
   useEffect(() => {

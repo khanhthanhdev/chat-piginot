@@ -2,6 +2,8 @@
 
 import { useScene } from '@pascal-app/core'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { lingoUnitSpec, measurementHint, parseMeasurement } from '../../../lib/measurement-parser'
+import { useLinearDisplay } from '../../../lib/use-linear-display'
 import { cn } from '../../../lib/utils'
 
 interface SliderControlProps {
@@ -9,6 +11,8 @@ interface SliderControlProps {
   value: number
   onChange: (value: number) => void
   onCommit?: (value: number) => void
+  onCancel?: () => void
+  previewWhileTyping?: boolean
   min?: number
   max?: number
   precision?: number
@@ -16,6 +20,7 @@ interface SliderControlProps {
   className?: string
   unit?: string
   restoreOnCommit?: boolean
+  mixed?: boolean
 }
 
 function stepPrecision(s: number): number {
@@ -51,18 +56,29 @@ export function SliderControl({
   value,
   onChange,
   onCommit,
+  onCancel,
+  previewWhileTyping = false,
   min = Number.NEGATIVE_INFINITY,
   max = Number.POSITIVE_INFINITY,
-  precision = 0,
-  step = 1,
+  precision: storedPrecision = 0,
+  step: storedStep = 1,
   className,
   unit = '',
   restoreOnCommit = true,
+  mixed = false,
 }: SliderControlProps) {
+  // Values and bounds stay in meters; gestures and input use the displayed unit.
+  const { isImperial, displayUnit, parseUnit, precision, step, toDisplay, toStored } =
+    useLinearDisplay(unit, storedPrecision, storedStep)
+
   const [isEditing, setIsEditing] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   const [isHovered, setIsHovered] = useState(false)
-  const [inputValue, setInputValue] = useState(value.toFixed(precision))
+  const [inputValue, setInputValue] = useState(toDisplay(value).toFixed(precision))
+  // Live readout while dragging. Multi-edit previews write live overrides
+  // instead of the scene, so `value` would otherwise stay frozen even though
+  // the meshes are moving.
+  const [dragDisplay, setDragDisplay] = useState<number | null>(null)
 
   const dragRef = useRef<{
     // Original value at drag start — preserved across modifier re-anchors so
@@ -75,17 +91,34 @@ export function SliderControl({
     anchorValue: number
     stepMultiplier: number
   } | null>(null)
+  const cancelRef = useRef(onCancel)
+  cancelRef.current = onCancel
+  const editingRef = useRef(false)
   const labelRef = useRef<HTMLDivElement>(null)
-  const valueRef = useRef(value)
-  valueRef.current = value
+  const shown = dragDisplay ?? value
+  const valueRef = useRef(shown)
+  valueRef.current = shown
 
   const clamp = useCallback((val: number) => Math.min(Math.max(val, min), max), [min, max])
+  // Apply a signed display-unit delta to a stored value, rounding in the
+  // display unit and clamping in the stored unit.
+  const applyDisplayDelta = useCallback(
+    (storedValue: number, displayDelta: number, displayStep: number) =>
+      clamp(
+        toStored(
+          Number.parseFloat(
+            (toDisplay(storedValue) + displayDelta).toFixed(stepPrecision(displayStep)),
+          ),
+        ),
+      ),
+    [clamp, toDisplay, toStored],
+  )
 
   useEffect(() => {
     if (!isEditing) {
-      setInputValue(value.toFixed(precision))
+      setInputValue(toDisplay(value).toFixed(precision))
     }
-  }, [value, precision, isEditing])
+  }, [value, precision, isEditing, toDisplay])
 
   // Wheel support on the label
   useEffect(() => {
@@ -96,14 +129,13 @@ export function SliderControl({
       e.preventDefault()
       const direction = e.deltaY < 0 ? 1 : -1
       const s = getAdjustedStep(step, e)
-      const newValue = clamp(valueRef.current + direction * s)
-      const final = Number.parseFloat(newValue.toFixed(stepPrecision(s)))
+      const final = applyDisplayDelta(valueRef.current, direction * s, s)
       if (final !== valueRef.current) onChange(final)
       onCommit?.(final)
     }
     el.addEventListener('wheel', handleWheel, { passive: false })
     return () => el.removeEventListener('wheel', handleWheel)
-  }, [isEditing, step, clamp, onChange, onCommit])
+  }, [isEditing, step, applyDisplayDelta, onChange, onCommit])
 
   // Arrow key support while hovered
   useEffect(() => {
@@ -115,15 +147,14 @@ export function SliderControl({
       if (direction !== 0) {
         e.preventDefault()
         const s = getAdjustedStep(step, e)
-        const newValue = clamp(valueRef.current + direction * s)
-        const final = Number.parseFloat(newValue.toFixed(stepPrecision(s)))
+        const final = applyDisplayDelta(valueRef.current, direction * s, s)
         if (final !== valueRef.current) onChange(final)
         onCommit?.(final)
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isHovered, isEditing, step, clamp, onChange, onCommit])
+  }, [isHovered, isEditing, step, applyDisplayDelta, onChange, onCommit])
 
   const handleLabelPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
@@ -160,15 +191,14 @@ export function SliderControl({
       const dx = e.clientX - anchorX
       const s = step * multiplier
       // 4 px per step at default sensitivity
-      const newValue = clamp(
-        Number.parseFloat((anchorValue + (dx / 4) * s).toFixed(stepPrecision(s))),
-      )
+      const newValue = applyDisplayDelta(anchorValue, (dx / 4) * s, s)
       if (newValue !== valueRef.current) {
         valueRef.current = newValue
+        setDragDisplay(newValue)
         onChange(newValue)
       }
     },
-    [step, clamp, onChange],
+    [step, applyDisplayDelta, onChange],
   )
 
   const handleLabelPointerUp = useCallback(
@@ -189,54 +219,111 @@ export function SliderControl({
         useScene.temporal.getState().resume()
         onCommit?.(finalVal)
       }
+      setDragDisplay(null)
     },
     [onChange, onCommit, restoreOnCommit],
   )
 
+  const cancelEdit = useCallback(() => {
+    const drag = dragRef.current
+    dragRef.current = null
+    editingRef.current = false
+    if (drag) {
+      if (!onCancel) onChange(drag.originValue)
+      useScene.temporal.getState().resume()
+    }
+    onCancel?.()
+    setIsDragging(false)
+    setIsEditing(false)
+    setDragDisplay(null)
+  }, [onCancel, onChange])
+
+  useEffect(
+    () => () => {
+      if (dragRef.current) useScene.temporal.getState().resume()
+      if (dragRef.current || editingRef.current) cancelRef.current?.()
+    },
+    [],
+  )
+
+  useEffect(() => {
+    if (!isDragging) return
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') cancelEdit()
+    }
+    window.addEventListener('keydown', escape)
+    return () => window.removeEventListener('keydown', escape)
+  }, [isDragging, cancelEdit])
+
   const handleValueClick = useCallback(() => {
+    editingRef.current = true
     setIsEditing(true)
-    setInputValue(value.toFixed(precision))
-  }, [value, precision])
+    setInputValue(toDisplay(value).toFixed(precision))
+  }, [value, precision, toDisplay])
+
+  const parseInputValue = useCallback(
+    (text: string) => {
+      const spec = lingoUnitSpec(unit)
+      const parsed = spec
+        ? parseMeasurement(text, spec, {
+            bareUnit: parseUnit ?? spec.unitId,
+            system: isImperial ? 'us' : 'metric',
+          })
+        : null
+      const bare = Number(text)
+      const stored = parsed ?? (text.trim() && Number.isFinite(bare) ? toStored(bare) : null)
+      return stored === null
+        ? null
+        : clamp(toStored(Number.parseFloat(toDisplay(stored).toFixed(precision))))
+    },
+    [unit, parseUnit, isImperial, toStored, clamp, toDisplay, precision],
+  )
 
   const submitValue = useCallback(() => {
-    const numValue = Number.parseFloat(inputValue)
-    if (Number.isNaN(numValue)) {
-      setInputValue(value.toFixed(precision))
+    if (!editingRef.current) return
+    editingRef.current = false
+    const nextValue = parseInputValue(inputValue)
+    if (nextValue === null) {
+      onCancel?.()
+      setInputValue(toDisplay(value).toFixed(precision))
     } else {
-      const nextValue = clamp(Number.parseFloat(numValue.toFixed(precision)))
       onChange(nextValue)
       onCommit?.(nextValue)
     }
     setIsEditing(false)
-  }, [inputValue, onChange, onCommit, clamp, precision, value])
+  }, [inputValue, parseInputValue, onCancel, onChange, onCommit, toDisplay, value, precision])
+
+  const spec = lingoUnitSpec(unit)
+  const hint =
+    isEditing && spec
+      ? measurementHint(inputValue, spec, {
+          bareUnit: parseUnit ?? spec.unitId,
+          system: isImperial ? 'us' : 'metric',
+          displayUnit: parseUnit ?? spec.unitId,
+          precision,
+          clamp,
+        })
+      : null
 
   const handleInputKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
       if (e.key === 'Enter') {
         submitValue()
       } else if (e.key === 'Escape') {
-        setInputValue(value.toFixed(precision))
-        setIsEditing(false)
-      } else if (e.key === 'ArrowUp') {
+        cancelEdit()
+      } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault()
+        const direction = e.key === 'ArrowUp' ? 1 : -1
         const adjustedStep = getAdjustedStep(step, e)
-        const newV = clamp(
-          Number.parseFloat((value + adjustedStep).toFixed(stepPrecision(adjustedStep))),
-        )
+        const newV = applyDisplayDelta(value, direction * adjustedStep, adjustedStep)
         onChange(newV)
-        setInputValue(newV.toFixed(precision))
-      } else if (e.key === 'ArrowDown') {
-        e.preventDefault()
-        const adjustedStep = getAdjustedStep(step, e)
-        const newV = clamp(
-          Number.parseFloat((value - adjustedStep).toFixed(stepPrecision(adjustedStep))),
-        )
-        onChange(newV)
-        setInputValue(newV.toFixed(precision))
+        setInputValue(toDisplay(newV).toFixed(precision))
       }
     },
-    [submitValue, value, precision, step, clamp, onChange],
+    [submitValue, cancelEdit, value, precision, step, applyDisplayDelta, onChange, toDisplay],
   )
+
+  const displayValue = toDisplay(shown)
 
   return (
     <div
@@ -257,6 +344,10 @@ export function SliderControl({
         onPointerDown={handleLabelPointerDown}
         onPointerMove={handleLabelPointerMove}
         onPointerUp={handleLabelPointerUp}
+        onPointerCancel={cancelEdit}
+        onLostPointerCapture={() => {
+          if (dragRef.current) cancelEdit()
+        }}
         ref={labelRef}
       >
         {/* Grip dots — 2×3 grid */}
@@ -279,26 +370,53 @@ export function SliderControl({
       <div className="flex items-center text-xs">
         {isEditing ? (
           <>
+            {hint && (
+              <span className="mr-1 shrink-0 whitespace-nowrap text-[10px] text-muted-foreground/50 tabular-nums">
+                {hint}
+              </span>
+            )}
             <input
               autoFocus
               className="w-14 bg-transparent p-0 text-right font-mono text-foreground outline-none selection:bg-primary/30"
               onBlur={submitValue}
-              onChange={(e) => setInputValue(e.target.value)}
+              onChange={(e) => {
+                setInputValue(e.target.value)
+                if (previewWhileTyping) {
+                  const next = parseInputValue(e.target.value)
+                  if (next !== null) onChange(next)
+                }
+              }}
               onKeyDown={handleInputKeyDown}
               type="text"
               value={inputValue}
             />
-            {unit && <span className="ml-[1px] text-muted-foreground">{unit}</span>}
+            {displayUnit && (
+              <span
+                className={cn(
+                  'ml-[1px] transition-opacity duration-150',
+                  hint ? 'opacity-0' : 'text-muted-foreground/40',
+                )}
+              >
+                {displayUnit}
+              </span>
+            )}
           </>
+        ) : mixed && !isDragging ? (
+          <div
+            className="flex cursor-text items-center text-muted-foreground transition-colors hover:text-foreground"
+            onClick={handleValueClick}
+          >
+            <span className="font-mono tracking-tight">Mixed</span>
+          </div>
         ) : (
           <div
             className="flex cursor-text items-center text-foreground/60 transition-colors hover:text-foreground"
             onClick={handleValueClick}
           >
             <span className="font-mono tabular-nums tracking-tight" suppressHydrationWarning>
-              {Number(value.toFixed(precision)).toFixed(precision)}
+              {Number(displayValue.toFixed(precision)).toFixed(precision)}
             </span>
-            {unit && <span className="ml-[1px] text-muted-foreground">{unit}</span>}
+            {displayUnit && <span className="ml-[1px] text-muted-foreground">{displayUnit}</span>}
           </div>
         )}
       </div>

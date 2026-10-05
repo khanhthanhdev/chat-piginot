@@ -13,12 +13,14 @@ import {
   createMaterial,
   createMaterialFromPresetRef,
   createSurfaceRoleMaterial,
+  resolveMaterialRef,
   useNodeEvents,
   useViewer,
 } from '@pascal-app/viewer'
 import { useEffect, useMemo, useRef } from 'react'
 import * as THREE from 'three'
 import { getAnalyticalNormal, surfaceQuatFromNormal } from '../shared/roof-surface'
+import { useSegmentTrimClippedGeometry } from '../shared/use-segment-trim-clip'
 import { buildBoxVentGeometry } from './geometry'
 
 const defaultMaterial = new THREE.MeshStandardMaterial({
@@ -55,6 +57,7 @@ const BoxVentRenderer = ({ node: storeNode }: { node: BoxVentNode }) => {
   const textures = useViewer((s) => s.textures)
   const colorPreset: ColorPreset = useViewer((s) => s.colorPreset)
   const sceneTheme = useViewer((s) => s.sceneTheme)
+  const sceneMaterials = useScene((s) => s.materials)
 
   // Merge live overrides (panel slider drags) on top of the store node.
   // Sliders write here on every `onChange` and only flush to the scene
@@ -107,21 +110,36 @@ const BoxVentRenderer = ({ node: storeNode }: { node: BoxVentNode }) => {
     return surfaceQuatFromNormal(normal, new THREE.Quaternion())
   }, [segment, node.position[0], node.position[2]])
 
-  // Paint surface: explicit material wins, then preset, then the cached
-  // default. FrontSide everywhere — DoubleSide on the role material's
+  // Paint surfaces: the lower base and upper cover resolve independently.
+  // FrontSide everywhere — DoubleSide on the role material's
   // NodeMaterial poisons the MRT scene pass (see `materials.ts` line 77 /
   // glazing fix 9400f1c5). Earlier this path forced DoubleSide so back
   // faces of the vent body / hood wouldn't drop out when looking up at the
   // eaves; that's now a known visual tradeoff — a closed-solid extrude in
   // `geometry.ts` is the right fix if undersides become noticeable.
   const material = useMemo(() => {
-    if (!textures || (!node.material && !node.materialPreset)) {
-      return createSurfaceRoleMaterial('roof', colorPreset, THREE.FrontSide, sceneTheme)
+    const roleDefault = createSurfaceRoleMaterial('roof', colorPreset, THREE.FrontSide, sceneTheme)
+    if (!textures) return [roleDefault, roleDefault]
+    const resolve = (role: 'base' | 'top') => {
+      const slotMaterial = resolveMaterialRef(node.slots?.[role], sceneMaterials, shading)
+      if (slotMaterial) return slotMaterial
+      if (node.material) return createMaterial(node.material, shading)
+      if (node.materialPreset) {
+        return createMaterialFromPresetRef(node.materialPreset, shading) ?? defaultMaterial
+      }
+      return roleDefault
     }
-    return node.material
-      ? createMaterial(node.material, shading)
-      : (createMaterialFromPresetRef(node.materialPreset, shading) ?? defaultMaterial)
-  }, [textures, colorPreset, sceneTheme, shading, node.material, node.materialPreset])
+    return [resolve('base'), resolve('top')]
+  }, [
+    textures,
+    colorPreset,
+    sceneTheme,
+    shading,
+    node.slots,
+    node.material,
+    node.materialPreset,
+    sceneMaterials,
+  ])
 
   // Compose slope tilt + yaw onto a single quaternion so the registered
   // ref's local frame is vent-mesh-local. `NodeArrowHandles` reads this
@@ -133,6 +151,19 @@ const BoxVentRenderer = ({ node: storeNode }: { node: BoxVentNode }) => {
     const yawQuat = new THREE.Quaternion().setFromAxisAngle(yAxis, node.rotation ?? 0)
     return new THREE.Quaternion().copy(surfaceQuat).multiply(yawQuat)
   }, [surfaceQuat, node.rotation, yAxis])
+
+  // Map vent-local geometry into the host segment's local frame (the frame the
+  // trim cut prisms live in) — same pose the inner mesh group is mounted with.
+  const localToSegment = useMemo(
+    () =>
+      new THREE.Matrix4().compose(
+        new THREE.Vector3(node.position[0] ?? 0, node.position[1] ?? 0, node.position[2] ?? 0),
+        composedQuat,
+        new THREE.Vector3(1, 1, 1),
+      ),
+    [node.position[0], node.position[1], node.position[2], composedQuat],
+  )
+  const clippedGeometry = useSegmentTrimClippedGeometry(geometry, segment, localToSegment)
 
   if (!segment) return null
 
@@ -158,7 +189,7 @@ const BoxVentRenderer = ({ node: storeNode }: { node: BoxVentNode }) => {
       >
         <mesh
           castShadow
-          geometry={geometry}
+          geometry={clippedGeometry ?? geometry}
           material={material}
           name="box-vent-surface"
           receiveShadow

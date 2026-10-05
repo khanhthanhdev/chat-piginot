@@ -176,6 +176,16 @@ export const elevatorDefinition: NodeDefinition<typeof ElevatorNode> = {
   schemaVersion: 1,
   schema: ElevatorNode,
   category: 'structure',
+  snapProfile: 'structural',
+  // Placed as a footprint (R/T rotates), not a directional draw → no angle-lock
+  // mode. The toolHints presence routes it through the contextual HUD so the
+  // snapping chip shows during placement.
+  snapDraftDirectional: false,
+  toolHints: [
+    { key: 'Left click', label: 'Place elevator' },
+    { key: 'R / T', label: 'Rotate' },
+    { key: 'Esc', label: 'Cancel' },
+  ],
   surfaceRole: 'joinery',
 
   defaults: () => {
@@ -185,6 +195,7 @@ export const elevatorDefinition: NodeDefinition<typeof ElevatorNode> = {
   },
 
   capabilities: {
+    surfacePlacement: 'floor-only',
     selectable: { hitVolume: 'bbox' },
     // Generic XZ translate so the floating action menu's Move button
     // (and the side move-arrows emitted from `def.floorplan`) drive the
@@ -232,6 +243,10 @@ export const elevatorDefinition: NodeDefinition<typeof ElevatorNode> = {
   parametrics: elevatorParametrics,
   handles: elevatorHandles,
 
+  // No dirty consumer rebuilds this kind — see NodeDefinition.dirtyTracking.
+  dirtyTracking: false,
+
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),

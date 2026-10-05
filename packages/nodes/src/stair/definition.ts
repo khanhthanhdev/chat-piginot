@@ -1,12 +1,16 @@
 import {
+  type AnyNodeId,
   type HandleDescriptor,
   type NodeDefinition,
+  resolveStairTotalRise,
   type SceneApi,
   StairNode as StairNodeSchema,
   type StairNode as StairNodeType,
   type StairSegmentNode,
   stairFootprintAABB,
+  useScene,
 } from '@pascal-app/core'
+import type { FloorplanNodeExtension } from '@pascal-app/editor'
 
 const MIN_CURVED_RISE = 0.3
 const MIN_CURVED_WIDTH = 0.4
@@ -53,10 +57,14 @@ type StairMoveBounds = {
   height: number
 }
 
+function readTotalRise(node: StairNodeType): number {
+  return Math.max(resolveStairTotalRise(node, useScene.getState().nodes), 0.1)
+}
+
 function readCurvedStairGeometry(node: StairNodeType): CurvedStairGeom {
   const isSpiral = node.stairType === 'spiral'
   const stepCount = Math.max(2, Math.round(node.stepCount ?? 10))
-  const totalRise = Math.max(node.totalRise ?? 2.5, 0.1)
+  const totalRise = readTotalRise(node)
   const width = Math.max(node.width ?? 1, MIN_CURVED_WIDTH)
   const minInnerRadius = isSpiral ? MIN_CURVED_INNER_RADIUS_SPIRAL : MIN_CURVED_INNER_RADIUS_CURVED
   const innerRadius = Math.max(minInnerRadius, node.innerRadius ?? 0.9)
@@ -96,7 +104,7 @@ function fallbackStraightStairMoveBounds(node: StairNodeType): StairMoveBounds {
     maxX: width / 2,
     minZ: 0,
     maxZ: depth,
-    height: Math.max(node.totalRise ?? 2.5, 0.1),
+    height: readTotalRise(node),
   }
 }
 
@@ -161,7 +169,7 @@ function curvedRiseHandle(): HandleDescriptor<StairNodeType> {
     axis: 'y',
     anchor: 'min',
     min: MIN_CURVED_RISE,
-    currentValue: (n) => Math.max(n.totalRise ?? 2.5, 0.1),
+    currentValue: readTotalRise,
     apply: (_n, newRise) => ({ totalRise: newRise }),
     placement: {
       position: (n) => {
@@ -307,7 +315,7 @@ function stairRotateGizmoPosition(n: StairNodeType): [number, number, number] {
     return [radius * Math.cos(angle), g.totalRise / 2, radius * Math.sin(angle)]
   }
   const width = Math.max(n.width ?? 1, MIN_CURVED_WIDTH)
-  const yMid = Math.max(n.totalRise ?? 2.5, 0.1) / 2
+  const yMid = readTotalRise(n) / 2
   return [width / 2 + STAIR_ROTATE_CORNER_OFFSET, yMid, -STAIR_ROTATE_CORNER_OFFSET]
 }
 
@@ -345,7 +353,7 @@ function stairRotateHandle(): HandleDescriptor<StairNodeType> {
           STAIR_ROTATE_RING_OFFSET
         )
       },
-      y: (n) => Math.max(n.totalRise ?? 2.5, 0.1) / 2,
+      y: (n) => readTotalRise(n) / 2,
     },
   }
 }
@@ -421,6 +429,26 @@ export const stairDefinition: NodeDefinition<typeof StairNode> = {
   schemaVersion: 1,
   schema: StairNode,
   category: 'structure',
+  extensions: {
+    'pascal:editor/floorplan': {
+      linkedLevelIds: (node) =>
+        node.toLevelId && node.toLevelId !== node.parentId ? [node.toLevelId as AnyNodeId] : [],
+    } satisfies FloorplanNodeExtension<StairNodeType>,
+  },
+  snapProfile: 'structural',
+  // A footprint with a clear front: you approach a stair from the low end,
+  // which sits on the -Z side of the run (the run ascends along +Z). Show the
+  // floor facing triangle there, pointing out of the entry, while placing/moving.
+  facingIndicator: { reversed: true },
+  // Placed as a footprint (R/T rotates), not a directional draw → no angle-lock
+  // mode. The toolHints presence routes it through the contextual HUD so the
+  // snapping chip shows during placement.
+  snapDraftDirectional: false,
+  toolHints: [
+    { key: 'Left click', label: 'Place stairs' },
+    { key: 'R / T', label: 'Rotate' },
+    { key: 'Esc', label: 'Cancel' },
+  ],
   surfaceRole: 'joinery',
 
   defaults: () => {
@@ -430,6 +458,7 @@ export const stairDefinition: NodeDefinition<typeof StairNode> = {
   },
 
   capabilities: {
+    surfacePlacement: 'floor-only',
     selectable: { hitVolume: 'bbox' },
     // A stair has no centred box footprint: straight = a cumulative
     // `stair-segment` chain, curved / spiral = an annular sector. Hand the
@@ -440,7 +469,7 @@ export const stairDefinition: NodeDefinition<typeof StairNode> = {
       const aabb = stairFootprintAABB(node as StairNodeType, nodes)
       return aabb ? { shape: 'aabb', ...aabb } : null
     },
-    duplicable: true,
+    duplicable: { subtree: true },
     deletable: true,
     floorPlaced: {
       footprints: (node, ctx) =>
@@ -460,6 +489,7 @@ export const stairDefinition: NodeDefinition<typeof StairNode> = {
   parametrics: stairParametrics,
   handles: stairHandles,
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),

@@ -1,8 +1,27 @@
-import type { FenceNode as FenceNodeType, HandleDescriptor, NodeDefinition } from '@pascal-app/core'
+import {
+  type FenceNode as FenceNodeType,
+  getFenceControlHandle,
+  type HandleDescriptor,
+  isSplineFence,
+  type NodeDefinition,
+  type SceneApi,
+} from '@pascal-app/core'
+import {
+  clearStructuralElevationGuide,
+  publishStructuralElevationGuide,
+  resolveStructuralElevationSnap,
+} from '@pascal-app/editor'
 import { buildFenceFloorplan } from './floorplan'
-import { fenceCurveAffordance, fenceMoveEndpointAffordance } from './floorplan-affordances'
+import {
+  fenceControlPointAffordance,
+  fenceCurveAffordance,
+  fenceMoveEndpointAffordance,
+  fenceTangentAffordance,
+  fenceThicknessAffordance,
+} from './floorplan-affordances'
 import { fenceFloorplanMoveTarget } from './floorplan-move'
 import { buildFenceGeometry } from './geometry'
+import { resolveFenceLiftElevation, resolveFenceLiftElevationForNodes } from './lift'
 import { fencePaint } from './paint'
 import { fenceParametrics } from './parametrics'
 import { FenceNode } from './schema'
@@ -14,6 +33,13 @@ const SIDE_HANDLE_TOP_INSET = 0.08
 const SIDE_HANDLE_MIN_HEIGHT = 0.4
 const HEIGHT_HANDLE_OFFSET = 0.45
 const MIN_FENCE_HEIGHT = 0.3
+
+function fenceBaseElevation(n: FenceNodeType, sceneApi?: SceneApi): number {
+  const nodes = sceneApi?.nodes()
+  return nodes
+    ? resolveFenceLiftElevationForNodes(n, nodes)
+    : resolveFenceLiftElevation(n, () => undefined)
+}
 
 function fenceMidpointFrame(n: FenceNodeType): {
   midX: number
@@ -32,6 +58,15 @@ function fenceMidpointFrame(n: FenceNodeType): {
   }
 }
 
+function fenceElevationGuideSource(n: FenceNodeType) {
+  const { midX, midZ } = fenceMidpointFrame(n)
+  return {
+    nodeId: n.id,
+    levelId: n.parentId,
+    anchor: [midX, midZ] as const,
+  }
+}
+
 // Side-move arrows: click to hand the fence to its move tool. Same shape
 // as wall — front + back faces, positioned past the fence thickness near
 // the top so they don't compete with endpoint pickers in the floating
@@ -42,14 +77,16 @@ function fenceSideMoveHandle(side: 'front' | 'back'): HandleDescriptor<FenceNode
     kind: 'tap-action',
     onActivate: (node, _scene, editor) => editor.engageMove(node),
     placement: {
-      position: (n) => {
+      position: (n, sceneApi) => {
         const { midX, midZ, normalX, normalZ } = fenceMidpointFrame(n)
         const offset = Math.max(
           (n.thickness ?? 0.1) / 2 + SIDE_HANDLE_OFFSET,
           SIDE_HANDLE_MIN_OFFSET,
         )
         const h = n.height ?? 1.8
-        const handleY = Math.max(h - SIDE_HANDLE_TOP_INSET, SIDE_HANDLE_MIN_HEIGHT)
+        const handleY =
+          fenceBaseElevation(n, sceneApi) +
+          Math.max(h - SIDE_HANDLE_TOP_INSET, SIDE_HANDLE_MIN_HEIGHT)
         return [midX + sign * normalX * offset, handleY, midZ + sign * normalZ * offset]
       },
       rotationY: (n) => {
@@ -57,7 +94,9 @@ function fenceSideMoveHandle(side: 'front' | 'back'): HandleDescriptor<FenceNode
         return Math.atan2(-sign * normalZ, sign * normalX)
       },
     },
-    cursor: 'move',
+    // The move itself is constrained by `MoveFenceTool`; keep the visual as a
+    // one-direction chevron instead of the generic four-way move cross.
+    cursor: 'ew-resize',
   }
 }
 
@@ -79,13 +118,57 @@ function fenceHeightHandle(): HandleDescriptor<FenceNodeType> {
     currentValue: (n) => n.height ?? 1.8,
     apply: (_n, newHeight) => ({ height: newHeight }),
     placement: {
-      position: (n) => {
+      position: (n, sceneApi) => {
         const { midX, midZ } = fenceMidpointFrame(n)
-        return [midX, (n.height ?? 1.8) + HEIGHT_HANDLE_OFFSET, midZ]
+        return [
+          midX,
+          fenceBaseElevation(n, sceneApi) + (n.height ?? 1.8) + HEIGHT_HANDLE_OFFSET,
+          midZ,
+        ]
       },
       rotationY: (n) => {
         const { normalX, normalZ } = fenceMidpointFrame(n)
         return Math.atan2(-normalZ, normalX)
+      },
+    },
+  }
+}
+
+function fenceElevationHandle(currentBase: number): HandleDescriptor<FenceNodeType> {
+  return {
+    kind: 'linear-resize',
+    axis: 'y',
+    anchor: 'min',
+    shape: 'tracker',
+    gridSnap: true,
+    currentValue: () => currentBase,
+    magneticSnap: (n, newValue, sceneApi) =>
+      resolveStructuralElevationSnap(fenceElevationGuideSource(n), newValue, sceneApi.nodes()),
+    onDrag: (n, sceneApi) =>
+      publishStructuralElevationGuide(
+        fenceElevationGuideSource(n),
+        fenceBaseElevation(n, sceneApi),
+        sceneApi.nodes(),
+      ),
+    onDragEnd: (n) => clearStructuralElevationGuide(n.id),
+    apply: (initial, newBase, sceneApi) => {
+      // The offset is measured from the support WITHOUT the current offset —
+      // including the ground, so dragging a fence's base to an absolute height
+      // on a hillside stores the delta from that hillside and the fence keeps
+      // following it.
+      const supportBase = resolveFenceLiftElevationForNodes(
+        { ...initial, supportOffset: undefined },
+        sceneApi.nodes(),
+      )
+      const nextOffset = newBase - supportBase
+      return {
+        supportOffset: Math.abs(nextOffset) < 1e-6 ? undefined : nextOffset,
+      }
+    },
+    placement: {
+      position: (n, sceneApi) => {
+        const { midX, midZ } = fenceMidpointFrame(n)
+        return [midX, fenceBaseElevation(n, sceneApi), midZ]
       },
     },
   }
@@ -103,21 +186,83 @@ function fenceCornerPicker(endpoint: 'start' | 'end'): HandleDescriptor<FenceNod
     nodeHeight: (n) => n.height ?? 1.8,
     onActivate: (node, _scene, editor) => editor.engageEndpointMove(node, endpoint),
     placement: {
-      position: (n) => {
+      position: (n, sceneApi) => {
         const corner = endpoint === 'start' ? n.start : n.end
-        return [corner[0], 0, corner[1]]
+        return [corner[0], fenceBaseElevation(n, sceneApi), corner[1]]
       },
     },
   }
 }
 
-const fenceHandles: HandleDescriptor<FenceNodeType>[] = [
-  fenceSideMoveHandle('front'),
-  fenceSideMoveHandle('back'),
-  fenceHeightHandle(),
-  fenceCornerPicker('start'),
-  fenceCornerPicker('end'),
-]
+const TANGENT_HANDLE_ARM_SCALE = 3
+
+function fenceControlPointPicker(index: number): HandleDescriptor<FenceNodeType> {
+  return {
+    kind: 'tap-action',
+    shape: 'corner-picker',
+    cursor: 'move',
+    nodeHeight: (n) => n.height ?? 1.8,
+    onActivate: (node, _scene, editor) => editor.engageControlPointMove(node, index),
+    placement: {
+      position: (n, sceneApi) => {
+        const point = n.path?.[index] ?? n.start
+        return [point[0], fenceBaseElevation(n, sceneApi), point[1]]
+      },
+    },
+  }
+}
+
+function fenceTangentPicker(index: number, side: 'in' | 'out'): HandleDescriptor<FenceNodeType> {
+  const sign = side === 'out' ? 1 : -1
+  return {
+    kind: 'tap-action',
+    shape: 'corner-picker',
+    round: true,
+    cursor: 'move',
+    nodeHeight: (n) => (n.height ?? 1.8) * 0.6,
+    onActivate: (node, _scene, editor) => editor.engageTangentMove(node, index, side),
+    placement: {
+      position: (n, sceneApi) => {
+        const point = n.path?.[index] ?? n.start
+        const baseElevation = fenceBaseElevation(n, sceneApi)
+        if (!n.path) return [point[0], baseElevation, point[1]]
+        const handle = getFenceControlHandle(n.path, n.tangents, index)
+        return [
+          point[0] + sign * handle.x * TANGENT_HANDLE_ARM_SCALE,
+          baseElevation,
+          point[1] + sign * handle.y * TANGENT_HANDLE_ARM_SCALE,
+        ]
+      },
+    },
+  }
+}
+
+const fenceHandles = (
+  node: FenceNodeType,
+  sceneApi?: SceneApi,
+): HandleDescriptor<FenceNodeType>[] => {
+  const elevationHandle = fenceElevationHandle(fenceBaseElevation(node, sceneApi))
+  if (isSplineFence(node) && node.path) {
+    return [
+      elevationHandle,
+      fenceHeightHandle(),
+      ...node.path.flatMap((_, index) => [
+        fenceControlPointPicker(index),
+        fenceTangentPicker(index, 'out'),
+        fenceTangentPicker(index, 'in'),
+      ]),
+    ]
+  }
+
+  return [
+    fenceSideMoveHandle('front'),
+    fenceSideMoveHandle('back'),
+    elevationHandle,
+    fenceHeightHandle(),
+    fenceCornerPicker('start'),
+    fenceCornerPicker('end'),
+  ]
+}
 
 /**
  * Fence — Phase 5 batch kind. Stage B complete: `def.geometry` drives
@@ -134,7 +279,8 @@ const fenceHandles: HandleDescriptor<FenceNodeType>[] = [
  */
 export const fenceDefinition: NodeDefinition<typeof FenceNode> = {
   kind: 'fence',
-  schemaVersion: 1,
+  snapProfile: 'structural',
+  schemaVersion: 2,
   schema: FenceNode,
   category: 'structure',
   surfaceRole: 'wall',
@@ -163,6 +309,7 @@ export const fenceDefinition: NodeDefinition<typeof FenceNode> = {
   }),
 
   capabilities: {
+    surfacePlacement: 'floor-only',
     selectable: { hitVolume: 'bbox' },
     surfaces: { sides: { faces: 'all' } },
     duplicable: true,
@@ -192,8 +339,13 @@ export const fenceDefinition: NodeDefinition<typeof FenceNode> = {
 
   // Stage B: pure geometry function. Generic <GeometrySystem> rebuilds
   // on dirtyNodes; <ParametricNodeRenderer> mounts the empty group.
-  // `renderer` + `system` fields dropped along with their files.
   geometry: buildFenceGeometry,
+  // Dependency tracker only — a hosted railing (`supportSlabId`) renders at
+  // its slab's elevation, so host elevation edits must re-dirty the fence.
+  system: {
+    module: () => import('./system'),
+    priority: 4,
+  },
   // Stage C: floor-plan rendering. FloorplanRegistryLayer iterates kinds
   // with `floorplan` set and renders via FloorplanGeometryRenderer.
   // Legacy `floorplanFenceEntries` short-circuits to [] when fence is
@@ -208,7 +360,10 @@ export const fenceDefinition: NodeDefinition<typeof FenceNode> = {
   // pointer-up).
   floorplanAffordances: {
     'move-endpoint': fenceMoveEndpointAffordance,
+    'move-control-point': fenceControlPointAffordance,
+    'move-tangent': fenceTangentAffordance,
     curve: fenceCurveAffordance,
+    thickness: fenceThicknessAffordance,
   },
   // Body move on the fence is driven by the two `move-arrow` chevrons
   // the floor-plan builder emits at the midpoint. Pointer-down enters
@@ -224,12 +379,13 @@ export const fenceDefinition: NodeDefinition<typeof FenceNode> = {
   affordanceTools: {
     curve: () => import('./curve-tool'),
     'move-endpoint': () => import('./move-endpoint-tool'),
+    'move-control-point': () => import('./move-control-point-tool'),
+    'move-tangent': () => import('./move-tangent-tool'),
     move: () => import('./move-tool'),
   },
 
   toolHints: [
     { key: 'Left click', label: 'Set fence start / end' },
-    { key: 'Shift', label: 'Free angle (no 15° snap)' },
     { key: 'Esc', label: 'Cancel' },
   ],
 

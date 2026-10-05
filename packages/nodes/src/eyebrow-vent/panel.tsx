@@ -184,7 +184,7 @@ export default function EyebrowVentPanel() {
       <PanelSection title="Dimensions">
         <SliderControl
           label="Width"
-          max={3}
+          max={1000}
           min={0.4}
           onChange={(v) => previewProp({ width: v })}
           onCommit={(v) => handleUpdate({ width: v })}
@@ -192,11 +192,11 @@ export default function EyebrowVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round(node.width * 100) / 100}
+          value={node.width}
         />
         <SliderControl
           label="Depth"
-          max={1.5}
+          max={1000}
           min={0.2}
           onChange={(v) => previewProp({ depth: v })}
           onCommit={(v) => handleUpdate({ depth: v })}
@@ -204,11 +204,11 @@ export default function EyebrowVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round(node.depth * 100) / 100}
+          value={node.depth}
         />
         <SliderControl
           label="Height"
-          max={1}
+          max={1000}
           min={0.08}
           onChange={(v) => previewProp({ height: v })}
           onCommit={(v) => handleUpdate({ height: v })}
@@ -216,7 +216,7 @@ export default function EyebrowVentPanel() {
           restoreOnCommit={false}
           step={0.02}
           unit="m"
-          value={Math.round(node.height * 100) / 100}
+          value={node.height}
         />
       </PanelSection>
 
@@ -235,7 +235,7 @@ export default function EyebrowVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[0] ?? 0) * 100) / 100}
+          value={node.position[0] ?? 0}
         />
         <SliderControl
           label="Y"
@@ -254,7 +254,7 @@ export default function EyebrowVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[1] ?? 0) * 100) / 100}
+          value={node.position[1] ?? 0}
         />
         <SliderControl
           label="Z"
@@ -270,7 +270,7 @@ export default function EyebrowVentPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round((node.position[2] ?? 0) * 100) / 100}
+          value={node.position[2] ?? 0}
         />
         <SliderControl
           label="Rotation"

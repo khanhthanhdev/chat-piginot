@@ -1,32 +1,25 @@
 # AGENTS.md
 
 ## Build/Test Commands
-- **Run server**: `python -m app.main` or `uvicorn app.main:app --reload`
-- **Run all tests**: `python -m pytest tests/`
-- **Run single test**: `python -m pytest tests/test_mesh_pipeline.py::TestMeshPipeline::test_load_ascii_stl -v`
-- **Linting**: Uses standard Python style (no formal linter configured)
+- **Run server**: `uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`
+- **Run service parity test**: from `lgo/`, `python -m tests.test_serve --device cpu`
+- **Build image**: `docker build -t piginot-backend piginot-backend/`
+- **Package manager**: `uv`; Python 3.12 is required.
 
 ## Architecture
-TurboAPI-based CFD inference backend with PyTorch ML models.
+FastAPI inference API around the LGO trained indoor-airflow models from the
+`lgo/` source tree. The service predicts for trained, precomputed room cases;
+it does not generate CFD cases from arbitrary room geometry.
 
 **Key Components:**
-- `app/main.py` - TurboAPI app, CORS/rate-limit middleware, startup model loading
-- `app/api.py` - Main CFD inference endpoints
-- `app/api_mesh.py` - Mesh processing endpoints
-- `app/inference.py` - PyTorch model runtime & caching
-- `app/mesh.py` - Mesh utilities (normalize, sample points, load STL/OBJ)
-- `app/mesh_pipeline.py` - Mesh processing pipeline
-- `app/schemas.py` - Pydantic models (GinotInferenceRequest, DiffuserInput, MeshInferenceOptions)
-- `app/settings.py` - Environment config (CORS, rate limits, model path, device preference)
-- `app/middleware.py` - Request ID tracking
-- `app/rate_limit.py` - Memory-based rate limiting
-
-**Data**: STL/OBJ mesh files, PyTorch checkpoints in `saved_weights/`
+- `app/main.py` - Entrypoint that exposes the LGO FastAPI application
+- `lgo/serve/app.py` - HTTP endpoints, request validation, runtime readiness
+- `lgo/serve/engine.py` - Model loading, case preparation/cache, and prediction
+- `lgo/predict.py`, `lgo/evaluate.py`, `lgo/model/`, `lgo/legacy/` - Upstream inference implementation
+- `LGO_MODELS_DIR` - Mounted model-run folders
+- `LGO_CASES_DIRS` - Colon-separated roots containing precomputed CFD cases
 
 ## Code Style
-- **Imports**: `from __future__ import annotations` at top; stdlib, 3rd-party (TurboAPI, torch, numpy), local imports
-- **Types**: Pydantic models with Field validators; type hints required
-- **Naming**: snake_case for functions/vars, PascalCase for classes/models
-- **Error Handling**: Custom exception handlers for RequestValidationError; return JSONResponse with detail
-- **Logging**: basicConfig with ISO timestamp format
-- **Tests**: unittest.TestCase in `tests/` (e.g., test_mesh_pipeline.py)
+- Keep the upstream model/inference path intact; route changes belong in `lgo/serve/app.py`.
+- Use typed FastAPI/Pydantic request contracts and Python 3.12 syntax.
+- Model weights and case CSVs are external runtime assets and must not be committed.

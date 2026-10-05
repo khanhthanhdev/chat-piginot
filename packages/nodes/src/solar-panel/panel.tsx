@@ -255,7 +255,7 @@ export default function SolarPanelPanel() {
           restoreOnCommit={false}
           step={0.005}
           unit="m"
-          value={Math.round(num(node.gapX, 0.02) * 1000) / 1000}
+          value={num(node.gapX, 0.02)}
         />
         <SliderControl
           label="Gap Y"
@@ -267,7 +267,7 @@ export default function SolarPanelPanel() {
           restoreOnCommit={false}
           step={0.005}
           unit="m"
-          value={Math.round(num(node.gapY, 0.02) * 1000) / 1000}
+          value={num(node.gapY, 0.02)}
         />
         <ActionGroup>
           <ActionButton disabled={!segment} label="Auto-fit to roof" onClick={handleAutoFit} />
@@ -278,7 +278,7 @@ export default function SolarPanelPanel() {
       <PanelSection title="Panel">
         <SliderControl
           label="Width"
-          max={2.5}
+          max={1000}
           min={0.3}
           onChange={(v) => previewProp({ panelWidth: v })}
           onCommit={(v) => commitProp({ panelWidth: v })}
@@ -286,11 +286,11 @@ export default function SolarPanelPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round(num(node.panelWidth, 1) * 100) / 100}
+          value={num(node.panelWidth, 1)}
         />
         <SliderControl
           label="Height"
-          max={3}
+          max={1000}
           min={0.3}
           onChange={(v) => previewProp({ panelHeight: v })}
           onCommit={(v) => commitProp({ panelHeight: v })}
@@ -298,7 +298,7 @@ export default function SolarPanelPanel() {
           restoreOnCommit={false}
           step={0.05}
           unit="m"
-          value={Math.round(num(node.panelHeight, 1.65) * 100) / 100}
+          value={num(node.panelHeight, 1.65)}
         />
         <ActionGroup>
           <ActionButton label="Flip orientation" onClick={handleFlip} />
@@ -313,7 +313,7 @@ export default function SolarPanelPanel() {
           restoreOnCommit={false}
           step={0.005}
           unit="m"
-          value={Math.round(num(node.frameThickness, 0.04) * 1000) / 1000}
+          value={num(node.frameThickness, 0.04)}
         />
         <SliderControl
           label="Frame depth"
@@ -325,7 +325,7 @@ export default function SolarPanelPanel() {
           restoreOnCommit={false}
           step={0.005}
           unit="m"
-          value={Math.round(num(node.frameDepth, 0.04) * 1000) / 1000}
+          value={num(node.frameDepth, 0.04)}
         />
       </PanelSection>
 
@@ -362,7 +362,7 @@ export default function SolarPanelPanel() {
           restoreOnCommit={false}
           step={0.005}
           unit="m"
-          value={Math.round(num(node.standoffHeight, 0.05) * 1000) / 1000}
+          value={num(node.standoffHeight, 0.05)}
         />
       </PanelSection>
 

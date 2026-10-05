@@ -4,13 +4,21 @@ import { sceneRegistry, useScene, type ZoneNode } from '@pascal-app/core'
 import { useViewer } from '@pascal-app/viewer'
 import { useFrame } from '@react-three/fiber'
 import type { Mesh } from 'three'
+import { resolveOverlayPolicy } from '../lib/interaction/overlay-policy'
 import useEditor from '../store/use-editor'
+import useInteractionScope from '../store/use-interaction-scope'
 
 export const ViewerZoneSystem = () => {
   useFrame(() => {
     const { levelId, zoneId } = useViewer.getState().selection
     const structureLayer = useEditor.getState().structureLayer
     const nodes = useScene.getState().nodes
+    // Snapshot capture is a clean, camera-only surface — zone geometry and
+    // tags stay out of the framed shot (mirrors the editor ZoneSystem's gate).
+    const isCaptureMode = useEditor.getState().isCaptureMode
+    // During any active interaction zone labels step back entirely (Sims-light).
+    const zoneLabelsHidden =
+      resolveOverlayPolicy(useInteractionScope.getState().scope).zoneLabels === 'hidden'
 
     sceneRegistry.byType.zone!.forEach((id) => {
       const obj = sceneRegistry.nodes.get(id)
@@ -25,9 +33,14 @@ export const ViewerZoneSystem = () => {
       // Zone geometry: visible in zone mode on the right level, OR when this zone is selected.
       // The editor ZoneSystem handles the selected zone's opacity animation.
       const isSelected = id === zoneId
+      // A zone the author hid (sidebar eye) takes the group with it — this
+      // per-frame write would otherwise undo the renderer's `visible` prop.
+      const nodeVisible = zone.visible !== false
       const shouldShowGeometry =
-        (structureLayer === 'zones' && !!levelId && isOnSelectedLevel) || isSelected
-      if (!obj.visible) obj.visible = true
+        nodeVisible &&
+        !isCaptureMode &&
+        ((structureLayer === 'zones' && !!levelId && isOnSelectedLevel) || isSelected)
+      if (obj.visible !== nodeVisible) obj.visible = nodeVisible
       obj.traverse((child) => {
         if ((child as Mesh).isMesh) {
           child.visible = shouldShowGeometry
@@ -35,7 +48,8 @@ export const ViewerZoneSystem = () => {
       })
 
       // Labels: always visible on the current level (regardless of mode or zone selection)
-      const showLabel = !!levelId && isOnSelectedLevel
+      const showLabel =
+        nodeVisible && !isCaptureMode && !zoneLabelsHidden && !!levelId && isOnSelectedLevel
       const targetOpacity = showLabel ? '1' : '0'
       const labelEl = document.getElementById(`${id}-label`)
       if (labelEl && labelEl.style.opacity !== targetOpacity) {

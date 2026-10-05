@@ -100,7 +100,7 @@ export default function ItemPanel() {
 
   return (
     <PanelWrapper
-      icon={node.asset.thumbnail || '/icons/furniture.webp'}
+      icon={node.asset.thumbnail || '/icons/item.webp'}
       onClose={handleClose}
       title={node.name || node.asset.name}
       width={300}
@@ -120,7 +120,7 @@ export default function ItemPanel() {
           precision={2}
           step={0.01}
           unit="m"
-          value={Math.round(node.position[0] * 100) / 100}
+          value={node.position[0]}
         />
         <SliderControl
           label={
@@ -136,7 +136,7 @@ export default function ItemPanel() {
           precision={2}
           step={0.01}
           unit="m"
-          value={Math.round(node.position[1] * 100) / 100}
+          value={node.position[1]}
         />
         <SliderControl
           label={
@@ -152,7 +152,7 @@ export default function ItemPanel() {
           precision={2}
           step={0.01}
           unit="m"
-          value={Math.round(node.position[2] * 100) / 100}
+          value={node.position[2]}
         />
       </PanelSection>
 

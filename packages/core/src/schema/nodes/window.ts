@@ -17,6 +17,16 @@ export const WindowType = z.enum([
 ])
 export type WindowType = z.infer<typeof WindowType>
 
+export const WindowConstructionType = z.enum(['framed', 'masonry'])
+export const WindowDimensionReference = z.enum([
+  'nominal',
+  'rough-opening',
+  'masonry-opening',
+  'finish-opening',
+])
+export type WindowConstructionType = z.infer<typeof WindowConstructionType>
+export type WindowDimensionReference = z.infer<typeof WindowDimensionReference>
+
 export const WindowNode = BaseNode.extend({
   id: objectId('window'),
   type: nodeType('window'),
@@ -32,6 +42,10 @@ export const WindowNode = BaseNode.extend({
 
   // Wall reference
   wallId: z.string().optional(),
+  // Alternative host: a dormer's generated wall face. When set, `position`
+  // is FACE-LOCAL — [u along the face, v height, z from the wall mid-plane].
+  dormerId: z.string().optional(),
+  dormerFace: z.enum(['front', 'back', 'right', 'left']).optional(),
   // Alternative host: a roof-segment's generated wall face (base wall
   // under the roof or a coplanar gable end). When set, `position` is
   // FACE-LOCAL — [u along the face, v height, z from the wall mid-plane]
@@ -44,6 +58,18 @@ export const WindowNode = BaseNode.extend({
   // Overall dimensions
   width: z.number().default(1.5),
   height: z.number().default(1.5),
+
+  // Construction-document identity and optional manufacturer rough opening.
+  // Legacy scenes omit these fields and continue to parse unchanged.
+  mark: z.string().trim().max(16).optional(),
+  constructionType: WindowConstructionType.default('framed'),
+  dimensionReference: WindowDimensionReference.default('nominal'),
+  roughOpeningWidth: z.number().positive().optional(),
+  roughOpeningHeight: z.number().positive().optional(),
+  masonryOpeningWidth: z.number().positive().optional(),
+  masonryOpeningHeight: z.number().positive().optional(),
+  finishOpeningWidth: z.number().positive().optional(),
+  finishOpeningHeight: z.number().positive().optional(),
 
   // Opening mode - when set to "opening", the window is only a shaped cutout
   openingKind: z.enum(['window', 'opening']).default('window'),

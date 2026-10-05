@@ -1,14 +1,74 @@
-import { type AnyNode, type ItemNode, nodeRegistry } from '@pascal-app/core'
+import {
+  type AnyNode,
+  type AnyNodeId,
+  emitter,
+  type ItemNode,
+  nodeRegistry,
+  resolveSelectionProxyId,
+  useScene,
+} from '@pascal-app/core'
+import { useViewer } from '@pascal-app/viewer'
+import useEditor from '../store/use-editor'
+import { emitDeleteSFX } from './sfx-bus'
 
 export type SelectionModifierKeys = {
   meta: boolean
   ctrl: boolean
   shift: boolean
+  /** Alt alone: select one session-group member without expanding. */
+  alt: boolean
 }
 
 export type NodeSelectionTarget = {
   phase: 'site' | 'structure' | 'furnish'
   structureLayer?: 'zones' | 'elements'
+}
+
+export function emitCanvasNodeSelection(node: AnyNode): void {
+  if (useEditor.getState().mode === 'delete') {
+    const scene = useScene.getState()
+    if (scene.readOnly) return
+
+    emitDeleteSFX(node.type)
+    scene.deleteNode(node.id as AnyNodeId)
+    if (node.parentId) scene.dirtyNodes.add(node.parentId as AnyNodeId)
+    useViewer.getState().setSelection({ selectedIds: [] })
+    if (useViewer.getState().hoveredId === node.id) {
+      useViewer.setState({ hoveredId: null })
+    }
+    return
+  }
+
+  emitter.emit('selection:canvas-node-click', node)
+}
+
+function shouldBypassSelectionProxy(node: AnyNode, target: AnyNode): boolean {
+  if (node.id === target.id) return false
+  // Kind-declared bypass (`def.selectionProxy.bypassDirectPick`): the kind
+  // keeps a proxy for grouped affordances but wants a direct body click to
+  // select the clicked node itself.
+  return nodeRegistry.get(node.type)?.selectionProxy?.bypassDirectPick?.(node, target) ?? false
+}
+
+export function resolveCanvasSelectionNode({
+  node,
+  nodes,
+  selectedIds,
+}: {
+  node: AnyNode
+  nodes: Readonly<Record<string, AnyNode | undefined>>
+  selectedIds: readonly string[]
+}): AnyNode {
+  const proxiedTarget = nodes[resolveSelectionProxyId(node, nodes)] ?? node
+  let target = shouldBypassSelectionProxy(node, proxiedTarget) ? node : proxiedTarget
+  const parentFrame = nodeRegistry.get(target.type)?.capabilities?.movable?.parentFrame
+  if (parentFrame) {
+    const parent = parentFrame.resolveParent(target, nodes as Readonly<Record<string, AnyNode>>)
+    if (parent && selectedIds.length === 1 && selectedIds[0] === parent.id) {
+      target = parent
+    }
+  }
+  return target
 }
 
 export function isSelectionModifierActive(keys: SelectionModifierKeys): boolean {
@@ -20,17 +80,19 @@ export function selectionModifiersFromEvent(
     metaKey?: boolean
     ctrlKey?: boolean
     shiftKey?: boolean
+    altKey?: boolean
     nativeEvent?: {
       metaKey?: boolean
       ctrlKey?: boolean
       shiftKey?: boolean
+      altKey?: boolean
     }
   } | null,
   fallback?: Partial<SelectionModifierKeys>,
 ): SelectionModifierKeys {
   const fromEvent = (
     key: keyof SelectionModifierKeys,
-    eventKey: 'metaKey' | 'ctrlKey' | 'shiftKey',
+    eventKey: 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey',
   ) => {
     if (typeof event?.[eventKey] === 'boolean') return event[eventKey]
     if (typeof event?.nativeEvent?.[eventKey] === 'boolean') return event.nativeEvent[eventKey]
@@ -41,6 +103,7 @@ export function selectionModifiersFromEvent(
     meta: fromEvent('meta', 'metaKey'),
     ctrl: fromEvent('ctrl', 'ctrlKey'),
     shift: fromEvent('shift', 'shiftKey'),
+    alt: fromEvent('alt', 'altKey'),
   }
 }
 
@@ -49,11 +112,14 @@ export function resolveSelectedIdsForNodeClick({
   currentSelectedIds,
   modifierKeys,
   nodeId,
+  expandIdsForNode,
 }: {
   baseSelectedIds?: readonly string[]
   currentSelectedIds: readonly string[]
   modifierKeys: SelectionModifierKeys
   nodeId: string
+  /** Session-group expand on plain click (not on modifier/Alt). */
+  expandIdsForNode?: (nodeId: string) => string[] | null
 }): string[] {
   if (isSelectionModifierActive(modifierKeys)) {
     const selectedIds = baseSelectedIds ?? currentSelectedIds
@@ -63,7 +129,30 @@ export function resolveSelectedIdsForNodeClick({
     return [...selectedIds, nodeId]
   }
 
+  if (modifierKeys.alt) {
+    return [nodeId]
+  }
+
+  const expanded = expandIdsForNode?.(nodeId)
+  if (expanded && expanded.length > 1) return expanded
   return [nodeId]
+}
+
+export function shouldPreserveSelectedRoofHostTarget({
+  node,
+  selectedIds,
+  armedRoofId,
+}: {
+  node: AnyNode
+  selectedIds: readonly string[]
+  armedRoofId: string | null
+}): boolean {
+  return (
+    node.type === 'roof' &&
+    armedRoofId === node.id &&
+    selectedIds.length === 1 &&
+    selectedIds[0] === node.id
+  )
 }
 
 export function resolveNodeSelectionTarget(node: AnyNode): NodeSelectionTarget | null {

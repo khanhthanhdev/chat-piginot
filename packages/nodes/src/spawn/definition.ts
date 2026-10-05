@@ -47,6 +47,7 @@ function spawnMoveHandle(): HandleDescriptor<SpawnNodeType> {
 
 export const spawnDefinition: NodeDefinition<typeof SpawnNode> = {
   kind: 'spawn',
+  snapProfile: 'item',
   schemaVersion: 1,
   schema: SpawnNode,
   category: 'site',
@@ -81,6 +82,7 @@ export const spawnDefinition: NodeDefinition<typeof SpawnNode> = {
   parametrics: spawnParametrics,
   handles: [spawnRotateHandle(), spawnMoveHandle()],
 
+  rendersChildren: false,
   renderer: {
     kind: 'parametric',
     module: () => import('./renderer'),
@@ -100,7 +102,7 @@ export const spawnDefinition: NodeDefinition<typeof SpawnNode> = {
   tool: () => import('./tool'),
   toolHints: [
     { key: 'Left click', label: 'Place spawn point' },
-    { key: 'Shift', label: 'Free place' },
+    { key: 'R / T', label: 'Rotate spawn point' },
     { key: 'Esc', label: 'Cancel' },
   ],
 

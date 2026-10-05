@@ -6,7 +6,6 @@
   "scripts": {
     "dev": "mastra dev",
     "build": "mastra build",
-    "benchmark:hvac": "bun run scripts/benchmark-hvac.ts",
     "smoke:build": "bun run build && bun run scripts/smoke-build.ts",
     "start": "mastra start",
     "test": "node_modules/typescript-7/bin/tsc --noEmit && bun test"

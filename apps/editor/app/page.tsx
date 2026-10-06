@@ -5,6 +5,7 @@ import { PascalWebXRButton } from '@webxr/plugin/pascal-editor'
 import { Hammer, Layers, Package, Settings, Wind } from 'lucide-react'
 import Image from 'next/image'
 import Link from 'next/link'
+import { AirflowSceneOverlay } from '@/components/airflow-scene-overlay'
 import { AirflowTab } from '@/components/airflow-tab'
 import { BuildTab } from '@/components/build-tab'
 import {
@@ -129,6 +130,7 @@ export default function Home() {
                 layoutVersion="v2"
                 projectId={PROJECT_ID}
                 sidebarTabs={SIDEBAR_TABS}
+                viewerSceneSlot={<AirflowSceneOverlay />}
                 viewerToolbarLeft={<CommunityViewerToolbarLeft />}
                 viewerToolbarRight={
                   <CommunityViewerToolbarRight

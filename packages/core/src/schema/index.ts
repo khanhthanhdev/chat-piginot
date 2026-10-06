@@ -15,6 +15,11 @@ export { BaseNode, generateId, Material, nodeType, objectId } from './base'
 // Camera
 export { CameraSchema } from './camera'
 // Collections
+export {
+  COLLECTION_TEMPLATE_IDS,
+  COLLECTION_TEMPLATES,
+  type CollectionTemplateId,
+} from './collection-templates'
 export { type Collection, type CollectionId, generateCollectionId } from './collections'
 // Compiled per-kind parsers (opt-in)
 export {
@@ -168,7 +173,15 @@ export {
   ElevatorShaftStyle,
 } from './nodes/elevator'
 export { EyebrowVentMaterialRole, EyebrowVentNode } from './nodes/eyebrow-vent'
-export { FenceBaseStyle, FenceGuardInfill, FenceNode, FenceStyle } from './nodes/fence'
+export {
+  clampFencePicketRailProjection,
+  FenceBaseStyle,
+  FenceGuardInfill,
+  FenceNode,
+  FenceStyle,
+  maxFencePicketRailProjection,
+} from './nodes/fence'
+export { type FenceFeatureNode, FenceGateNode, FenceOpeningNode } from './nodes/fence-feature'
 export { FloorOpeningNode } from './nodes/floor-opening'
 export { GuideNode, GuideScaleReference } from './nodes/guide'
 export {

@@ -1,37 +1,171 @@
 # Pascal Editor
 
-A 3D building editor built with React Three Fiber and WebGPU.
+An open-source, local-first 3D building editor built with React Three Fiber and
+WebGPU. Run it in the browser or from the CLI, and connect AI agents through MCP.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![npm @pascal-app/core](https://img.shields.io/npm/v/@pascal-app/core?label=%40pascal-app%2Fcore)](https://www.npmjs.com/package/@pascal-app/core)
 [![npm @pascal-app/viewer](https://img.shields.io/npm/v/@pascal-app/viewer?label=%40pascal-app%2Fviewer)](https://www.npmjs.com/package/@pascal-app/viewer)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white)](https://discord.gg/SaBRA9t2)
+[![npm @pascal-app/cli](https://img.shields.io/npm/v/@pascal-app/cli?label=%40pascal-app%2Fcli)](https://www.npmjs.com/package/@pascal-app/cli)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white)](https://discord.gg/XRKsDcpqgS)
 [![X (Twitter)](https://img.shields.io/badge/follow-%40pascal__app-black?logo=x&logoColor=white)](https://x.com/pascal_app)
 
 https://github.com/user-attachments/assets/8b50e7cf-cebe-4579-9cf3-8786b35f7b6b
 
+## A first look at Pascal Next
+
+[Explore the live demo](https://editor.pascal.app/next) — a real home reconstructed
+in detail, from its rooms and finishes to the structure and systems behind the walls.
+This hosted preview explores the direction of the next Pascal editor; the experience
+shown here is not yet part of the open-source editor release.
+
+| Exploded view — see how the home fits together | Cut view — slice through the building |
+| --- | --- |
+| [![Roof lifted above the reconstructed home](docs/media/next-demo/exploded.gif)](https://editor.pascal.app/next) | [![A section cut reveals the roof framing and interior](docs/media/next-demo/cutview.gif)](https://editor.pascal.app/next) |
+| **X-ray — reveal the modeled systems** | **Walkthrough — step inside at eye level** |
+| [![Building systems isolated with the walls hidden](docs/media/next-demo/xray.gif)](https://editor.pascal.app/next) | [![Walking through the home toward the pool terrace](docs/media/next-demo/walkthrough.gif)](https://editor.pascal.app/next) |
+| **Interactions — open doors and explore** | **Environment — change the light and atmosphere** |
+| [![Interacting with doors in the reconstructed home](docs/media/next-demo/interactions.gif)](https://editor.pascal.app/next) | [![Changing the lighting around the reconstructed home](docs/media/next-demo/environment.gif)](https://editor.pascal.app/next) |
+
+We are exploring what this could make possible for facility management, home services,
+architecture, home building, and infrastructure.
+[Join the discussion on X](https://x.com/pascal_app/status/2102097655031558496)
+and tell us where you would use it.
+
+### Make something with these videos
+
+Making a video, tutorial, article, or social post about Pascal? You are welcome to
+use and edit this footage, including in monetized content, under
+[CC BY 4.0](docs/media/next-demo/LICENSE.md). Credit Pascal, link the license,
+and note your edits; no separate permission is needed.
+
+[Download the six original videos and see the creator guide](docs/media/next-demo/README.md).
+
+## Run the Editor Locally
+
+Node.js 22.13 or newer can create a persistent local Pascal installation without
+cloning this repository:
+
+```bash
+npx @pascal-app/cli editor
+```
+
+The CLI starts the editor and an authenticated MCP service in the background, selects
+collision-free loopback ports, and keeps projects in `~/.pascal/data/pascal.db`. The npm
+package holds the CLI and that MCP service; the web editor runtime is downloaded once per
+version on the first command that starts the editor and verified against a digest published
+inside the package. Configure an agent to launch `pascal mcp connect`, which needs neither
+the editor process nor that download. Install the `pascal` command with
+`npm install --global @pascal-app/cli`. See [Run Pascal locally](https://editor.pascal.app/docs/developers/local-editor)
+for pnpm/Bun commands, project management, MCP setup, updates, storage paths, and
+troubleshooting.
+
+Use one active agent client per local CLI service. The standalone local HTTP runtime shares active scene state between clients; use separate `PASCAL_HOME` directories and service processes when independent concurrent work is required.
+
+## Agent skills
+
+[![Install with skills](https://skills.sh/b/pascalorg/editor)](https://skills.sh/pascalorg/editor)
+
+Install Pascal's public agent workflows from this repository with [skills.sh](https://skills.sh):
+
+```bash
+npx skills add pascalorg/editor \
+  --skill pascal-3d \
+  --skill furniture-fit
+```
+
+Claude Code users can install the same canonical skill source as a plugin:
+
+```text
+/plugin marketplace add pascalorg/editor
+/plugin install pascal-agent-skills@pascal
+```
+
+The Claude plugin also supplies the local `pascal mcp connect` server. Install and start the Pascal CLI first, and keep `pascal` on the `PATH` used to launch Claude Code. This local connector needs no Pascal account or API key and does not upload projects automatically. Its plugin root is this repository's `skills/` directory, so an install copies only the skill bundles and their plugin metadata rather than the repository.
+
+The plugin bundles two servers: the local `pascal` connector above and a hosted `pascal-hosted` server for `https://editor.pascal.app/api/mcp`, which prompts for an optional Pascal API key at enable time and stores it in the OS keychain. Leave the key empty to run local-only.
+
+Claude Code 2.1.258 loads both the user-scoped `pascal` server created by `pascal mcp setup claude` and the plugin-provided server. Remove the manual entry before reloading or restarting Claude Code so only the plugin owns the connection lifecycle:
+
+```bash
+claude mcp remove --scope user pascal
+```
+
+Use `/mcp` to remove or disable any project- or local-scoped Pascal connection too. Leaving both connections active violates the one-active-agent-client-per-local-service requirement. When the intended project is hosted in a Pascal account or organization, disable the plugin-provided local server in `/mcp` and configure the hosted endpoint from the skill setup guide instead.
+
+Codex users can install the same plugin from the repository marketplace:
+
+```bash
+codex plugin marketplace add pascalorg/editor
+codex plugin add pascal-agent-skills@pascal
+```
+
+OpenClaw installation becomes available after the skills are published under Pascal's ClawHub publisher. See [skills/README.md](skills/README.md) for the owner-qualified install and verification commands.
+
+[`pascal-3d`](skills/pascal-3d/SKILL.md) covers safe local or hosted MCP setup and verified scene work. [`furniture-fit`](skills/furniture-fit/SKILL.md) produces a bounded, evidence-based footprint assessment without claiming unsupported height, swing, or delivery checks. See [skills/README.md](skills/README.md) for package details and validation.
+
+The skills inspect the connected MCP tool schemas before using optional fields. A capability present in this repository may be absent from an older installed or hosted release; the agent should report the narrower supported result instead of assuming source-only inputs are available.
+
+These workflows require a connected Pascal MCP server for their tool-backed actions. An OpenAI directory submission must therefore use **With MCP** and submit the production hosted MCP endpoint together with the skills. The repository package does not prove that the endpoint, OAuth flow, reviewer credentials, domain verification, or portal scan is ready for review.
+
+### MCP Registry
+
+[`server.json`](server.json) is Pascal's manifest for the official MCP Registry. Its
+version tracks the hosted MCP implementation independently of the npm package version.
+Pull requests validate the manifest and production endpoint. A Pascal organization
+owner publishes an approved version from `main` with the official registry publisher.
+
+## Using Published Packages
+
+The viewer runtime and built-in node definitions are separate packages. Install the full built-in
+viewer set, then load the built-in plugin once before mounting `<Viewer>`. Capture sessions are an
+optional extension shipped inside those packages as the `@pascal-app/core/capture` and
+`@pascal-app/viewer/capture` subpaths:
+
+```bash
+npm install @pascal-app/core @pascal-app/viewer @pascal-app/editor @pascal-app/nodes
+```
+
+```typescript
+import { loadPlugin } from '@pascal-app/core'
+import { builtinPlugin } from '@pascal-app/nodes'
+
+await loadPlugin(builtinPlugin)
+```
+
+See the [`@pascal-app/viewer` quick start](packages/viewer/README.md#usage) for a React example.
 
 
 ## Repository Architecture
 
-This is a Turborepo monorepo with three main packages:
+This is a Turborepo monorepo with the reusable editor packages, the standalone app,
+and the CLI that distributes it:
 
 ```
-editor-v2/
+editor/
 ├── apps/
 │   └── editor/          # Next.js application
 ├── packages/
-│   ├── core/            # Schema definitions, state management, systems
-│   └── viewer/          # 3D rendering components
+│   ├── core/            # Schemas, scene state, registry contracts, capture contracts
+│   ├── viewer/          # 3D rendering runtime, shared systems, capture runtime
+│   ├── editor/          # Editing tools and UI components
+│   ├── nodes/           # Built-in node definitions, renderers, and systems
+│   ├── cli/             # Persistent local editor installer and process manager
+│   ├── mcp/             # Model Context Protocol server and scene storage
+│   └── ui/              # Shared UI components
 ```
 
 ### Separation of Concerns
 
 | Package | Responsibility |
 |---------|---------------|
-| **@pascal-app/core** | Node schemas, scene state (Zustand), systems (geometry generation), spatial queries, event bus |
-| **@pascal-app/viewer** | 3D rendering via React Three Fiber, default camera/controls, post-processing |
-| **apps/editor** | UI components, tools, custom behaviors, editor-specific systems |
+| **@pascal-app/core** | Node schemas, scene state (Zustand), registry contracts, spatial queries, and event bus. `core/capture` adds versioned capture manifests, normalized streams, and transport-neutral static/live sources |
+| **@pascal-app/viewer** | 3D rendering via React Three Fiber, shared render systems, default camera/controls, and post-processing. `viewer/capture` adds the capture runtime and reference model, device-motion, point-cloud, and surface-mesh layers |
+| **@pascal-app/editor** | Editing tools, panels, selection, and direct-manipulation UI |
+| **@pascal-app/nodes** | Built-in registry plugin with node definitions, renderers, geometry, and systems |
+| **@pascal-app/cli** | Installs and manages a versioned standalone editor runtime and persistent local data |
+| **@pascal-app/mcp** | Exposes scene tools, resources, prompts, and local storage to MCP-compatible AI hosts |
+| **apps/editor** | Standalone Next.js host for the editor packages |
 
 The **viewer** renders the scene with sensible defaults. The **editor** extends it with interactive tools, selection management, and editing capabilities.
 
@@ -334,6 +468,15 @@ Clears dirty flag
 
 ---
 
+## Building a Plugin
+
+The editor is extensible: a plugin ships node kinds (schema, 3D/2D rendering, placement tools, inspector parametrics) and left-rail panels through the same `Plugin` manifest the built-ins use — there is no separate internal API.
+
+- **Developer guide** — [Create a plugin](https://editor.pascal.app/docs/developers/plugins): the `Plugin` shape, panel contributions, discovery, lifecycle, and what's in/out of v1.
+- **Worked example** — [`pascalorg/plugin-trees`](https://github.com/pascalorg/plugin-trees): a standalone plugin with procedural trees, flowers, grass, and a presets panel. Clone it as a starting point.
+
+---
+
 ## Technology Stack
 
 - **React 19** + **Next.js 16**
@@ -365,7 +508,7 @@ bun dev
 # 1. Build @pascal-app/core and @pascal-app/viewer
 # 2. Start watching both packages for changes
 # 3. Start the Next.js editor dev server
-# Open http://localhost:3000
+# Open http://localhost:3002
 ```
 
 **Important:** Always run `bun dev` from the root directory to ensure the package watchers are running. This enables hot reload when you edit files in `packages/core/src/` or `packages/viewer/src/`.
@@ -382,14 +525,14 @@ turbo build --filter=@pascal-app/core
 
 ### Publishing Packages
 
-```bash
-# Build packages
-turbo build --filter=@pascal-app/core --filter=@pascal-app/viewer
-
-# Publish to npm
-npm publish --workspace=@pascal-app/core --access public
-npm publish --workspace=@pascal-app/viewer --access public
-```
+Releases run from `.github/workflows/release.yml` (`workflow_dispatch`, with
+`bump` and `dry-run` inputs). Every package shares one version: the workflow
+bumps all seven, rewrites the internal `@pascal-app/*` ranges, builds, publishes
+in dependency order (`core` → `viewer` → `editor` → `nodes` → `mcp` →
+`ifc-converter` → `cli`), then commits the release and pushes one tag per
+package. A dry run validates the builds without touching the registry.
+[Releasing to npm](wiki/npm-release.md) covers authentication, recovering a
+partial run, publishing by hand and the follow-ups.
 
 ---
 
@@ -405,6 +548,17 @@ npm publish --workspace=@pascal-app/viewer --access public
 | `packages/viewer/src/components/viewer/` | Main Viewer component |
 | `apps/editor/components/tools/` | Editor tools |
 | `apps/editor/store/` | Editor-specific state |
+
+---
+
+## Contributing
+
+Bug fixes, features, docs and ideas are all welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup, code style and the PR flow.
+
+- New node kinds and sidebar panels ship as [plugins](https://editor.pascal.app/docs/developers/plugins) rather than edits to the built-ins — [`pascalorg/plugin-trees`](https://github.com/pascalorg/plugin-trees) is a worked example
+- Questions and ideas go to [Discussions](https://github.com/pascalorg/editor/discussions); reproducible bugs go to [Issues](https://github.com/pascalorg/editor/issues)
+- Participation is covered by our [Code of Conduct](CODE_OF_CONDUCT.md)
+- Security problems go to [SECURITY.md](SECURITY.md), not a public issue
 
 ---
 

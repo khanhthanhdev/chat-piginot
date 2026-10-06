@@ -1,7 +1,15 @@
 'use client'
 
-import { Activity, LoaderCircle, Wind } from 'lucide-react'
+import { Activity, FileText, Layers, LoaderCircle, Sliders, Sparkles, Wind } from 'lucide-react'
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { HvacReportModal } from '@/components/hvac-report-modal'
+import {
+  type CandidateResult,
+  type CaseDetails,
+  type HvacReportData,
+  type SliceResult,
+  useAirflowStore,
+} from '@/lib/airflow-store'
 
 type CaseSummary = { case: string; set: string }
 type AirflowModel = {
@@ -9,23 +17,6 @@ type AirflowModel = {
   architecture?: string | null
   recommended: boolean
   default: boolean
-}
-type Point2 = [number, number]
-type CaseDetails = {
-  room: { min: [number, number, number]; max: [number, number, number] }
-  supply_vents_xy: Point2[]
-  return_vents_xy: Point2[]
-}
-type SliceResult = {
-  run: string
-  case: string
-  value: number
-  shape: [number, number]
-  axes: { x: number[]; y: number[] }
-  u: number[][]
-  v: number[][]
-  w: number[][]
-  T: number[][]
 }
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -84,9 +75,77 @@ function FieldMap({
   const cellWidth = result.axes.x.length > 1 ? result.axes.x[1]! - result.axes.x[0]! : width
   const cellHeight = result.axes.y.length > 1 ? result.axes.y[1]! - result.axes.y[0]! : height
   const [rows, columns] = result.shape
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const w = 440
+    const h = Math.round((440 * height) / width)
+    canvas.width = w
+    canvas.height = h
+    ctx.fillStyle = '#020617'
+    ctx.fillRect(0, 0, w, h)
+
+    const scaleX = w / width
+    const scaleY = h / height
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < columns; c++) {
+        const val = values[r]?.[c]
+        const x = result.axes.x[r]
+        const y = result.axes.y[c]
+        if (val === undefined || x === undefined || y === undefined) continue
+        ctx.fillStyle = heatColor(val, minimum, maximum)
+        const rx = (x - details.room.min[0] - cellWidth / 2) * scaleX
+        const ry = (height - (y - details.room.min[1]) - cellHeight / 2) * scaleY
+        ctx.fillRect(rx, ry, cellWidth * scaleX + 0.5, cellHeight * scaleY + 0.5)
+      }
+    }
+
+    for (const [vx, vy] of details.supply_vents_xy) {
+      const cx = (vx - details.room.min[0]) * scaleX
+      const cy = (height - (vy - details.room.min[1])) * scaleY
+      ctx.beginPath()
+      ctx.arc(cx, cy, 6, 0, Math.PI * 2)
+      ctx.fillStyle = '#0284c7'
+      ctx.fill()
+      ctx.strokeStyle = '#ffffff'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+    }
+
+    for (const [vx, vy] of details.return_vents_xy) {
+      const cx = (vx - details.room.min[0]) * scaleX
+      const cy = (height - (vy - details.room.min[1])) * scaleY
+      ctx.beginPath()
+      ctx.arc(cx, cy, 6, 0, Math.PI * 2)
+      ctx.fillStyle = '#f97316'
+      ctx.fill()
+      ctx.strokeStyle = '#ffffff'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+    }
+  }, [
+    cellHeight,
+    cellWidth,
+    columns,
+    details,
+    height,
+    maximum,
+    minimum,
+    result.axes.x,
+    result.axes.y,
+    rows,
+    values,
+    width,
+  ])
 
   return (
     <div>
+      <canvas id="airflow-slice-canvas" ref={canvasRef} style={{ display: 'none' }} />
       <svg
         aria-label={`${metric === 'speed' ? 'Air speed' : 'Temperature'} at ${result.value} metres for ${result.case}`}
         className="block w-full overflow-hidden rounded-md border border-border bg-slate-950"
@@ -160,15 +219,36 @@ function FieldMap({
 }
 
 export function AirflowTab() {
+  const selectedCase = useAirflowStore((s) => s.selectedCase)
+  const setSelectedCase = useAirflowStore((s) => s.setSelectedCase)
+  const selectedModel = useAirflowStore((s) => s.selectedModel)
+  const setSelectedModel = useAirflowStore((s) => s.setSelectedModel)
+  const details = useAirflowStore((s) => s.details)
+  const setDetails = useAirflowStore((s) => s.setDetails)
+  const result = useAirflowStore((s) => s.sliceResult)
+  const setResult = useAirflowStore((s) => s.setSliceResult)
+  const sliceHeight = useAirflowStore((s) => s.sliceHeight)
+  const setSliceHeight = useAirflowStore((s) => s.setSliceHeight)
+  const spacing = useAirflowStore((s) => s.spacing)
+  const setSpacing = useAirflowStore((s) => s.setSpacing)
+  const metric = useAirflowStore((s) => s.metric)
+  const setMetric = useAirflowStore((s) => s.setMetric)
+  const show3DSlice = useAirflowStore((s) => s.show3DSlice)
+  const setShow3DSlice = useAirflowStore((s) => s.setShow3DSlice)
+  const sliceOpacity = useAirflowStore((s) => s.sliceOpacity)
+  const setSliceOpacity = useAirflowStore((s) => s.setSliceOpacity)
+  const optimizerPriority = useAirflowStore((s) => s.optimizerPriority)
+  const setOptimizerPriority = useAirflowStore((s) => s.setOptimizerPriority)
+  const isOptimizing = useAirflowStore((s) => s.isOptimizing)
+  const setIsOptimizing = useAirflowStore((s) => s.setIsOptimizing)
+  const rankedCandidates = useAirflowStore((s) => s.rankedCandidates)
+  const setRankedCandidates = useAirflowStore((s) => s.setRankedCandidates)
+  const setIsReportModalOpen = useAirflowStore((s) => s.setIsReportModalOpen)
+  const setReportData = useAirflowStore((s) => s.setReportData)
+  const isLoadingReport = useAirflowStore((s) => s.isLoadingReport)
+  const setIsLoadingReport = useAirflowStore((s) => s.setIsLoadingReport)
   const [cases, setCases] = useState<CaseSummary[]>([])
   const [models, setModels] = useState<AirflowModel[]>([])
-  const [selectedCase, setSelectedCase] = useState('')
-  const [selectedModel, setSelectedModel] = useState('')
-  const [details, setDetails] = useState<CaseDetails | null>(null)
-  const [result, setResult] = useState<SliceResult | null>(null)
-  const [sliceHeight, setSliceHeight] = useState('1.1')
-  const [spacing, setSpacing] = useState('0.2')
-  const [metric, setMetric] = useState<'speed' | 'temperature'>('speed')
   const [loadingCatalog, setLoadingCatalog] = useState(true)
   const [loadingDetails, setLoadingDetails] = useState(false)
   const [predicting, setPredicting] = useState(false)
@@ -181,7 +261,7 @@ export function AirflowTab() {
     setPredicting(false)
     setResult(null)
     setError('')
-  }, [])
+  }, [setResult])
 
   useEffect(
     () => () => {
@@ -199,12 +279,16 @@ export function AirflowTab() {
       .then(([availableCases, availableModels]) => {
         setCases(availableCases)
         setModels(availableModels)
-        setSelectedCase(availableCases[0]?.case ?? '')
-        setSelectedModel(
-          availableModels.find(({ default: isDefault }) => isDefault)?.run ??
+        if (!selectedCase && availableCases[0]?.case) {
+          setSelectedCase(availableCases[0].case)
+        }
+        if (!selectedModel) {
+          const defaultModel =
+            availableModels.find(({ default: isDefault }) => isDefault)?.run ??
             availableModels[0]?.run ??
-            '',
-        )
+            ''
+          setSelectedModel(defaultModel)
+        }
         setError('')
       })
       .catch((reason: unknown) => {
@@ -214,7 +298,7 @@ export function AirflowTab() {
         if (!controller.signal.aborted) setLoadingCatalog(false)
       })
     return () => controller.abort()
-  }, [])
+  }, [selectedCase, selectedModel, setSelectedCase, setSelectedModel])
 
   useEffect(() => {
     if (!selectedCase) return
@@ -233,33 +317,39 @@ export function AirflowTab() {
         if (!controller.signal.aborted) setLoadingDetails(false)
       })
     return () => controller.abort()
-  }, [clearPrediction, selectedCase])
+  }, [clearPrediction, selectedCase, setDetails])
 
-  const requestSlice = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!selectedCase || !selectedModel) return
+  const fetchSliceForCase = async (
+    targetCase: string,
+    targetModel: string,
+    heightVal: number,
+    spacingVal: number,
+  ) => {
     predictionController.current?.abort()
     const controller = new AbortController()
     predictionController.current = controller
     setPredicting(true)
     setError('')
-    setResult(null)
     try {
       const slice = await fetchJson<SliceResult>('/api/airflow/slice', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          case: selectedCase,
-          run: selectedModel,
+          case: targetCase,
+          run: targetModel,
           axis: 'z',
-          value: Number(sliceHeight),
-          spacing: Number(spacing),
+          value: heightVal,
+          spacing: spacingVal,
         }),
         signal: controller.signal,
       })
-      if (!controller.signal.aborted) setResult(slice)
+      if (!controller.signal.aborted) {
+        setResult(slice)
+      }
     } catch (reason) {
-      if (!controller.signal.aborted) setError(errorMessage(reason))
+      if (!controller.signal.aborted) {
+        setError(errorMessage(reason))
+      }
     } finally {
       if (predictionController.current === controller) {
         predictionController.current = null
@@ -268,6 +358,91 @@ export function AirflowTab() {
     }
   }
 
+  const requestSlice = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!selectedCase || !selectedModel) return
+    await fetchSliceForCase(selectedCase, selectedModel, sliceHeight, spacing)
+  }
+
+  const runOptimizer = async () => {
+    if (!selectedModel) return
+    setIsOptimizing(true)
+    setError('')
+    try {
+      const res = await fetchJson<{
+        run: string
+        height: number
+        priority: string
+        recommended_case: string | null
+        candidates: CandidateResult[]
+      }>('/api/airflow/cases/optimize', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          run: selectedModel,
+          height: sliceHeight,
+          spacing: 0.25,
+          priority: optimizerPriority,
+          limit: 5,
+        }),
+      })
+      setRankedCandidates(res.candidates)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    } finally {
+      setIsOptimizing(false)
+    }
+  }
+
+  const applyCandidate = async (candidate: CandidateResult) => {
+    setSelectedCase(candidate.case)
+    setLoadingDetails(true)
+    try {
+      const caseDetails = await fetchJson<CaseDetails>(
+        `/api/airflow/cases/${encodeURIComponent(candidate.case)}`,
+      )
+      setDetails(caseDetails)
+      await fetchSliceForCase(candidate.case, selectedModel, sliceHeight, spacing)
+    } catch (reason) {
+      setError(errorMessage(reason))
+    } finally {
+      setLoadingDetails(false)
+    }
+  }
+
+  const openCaseReport = useCallback(
+    async (caseId: string) => {
+      if (!caseId) return
+      setIsLoadingReport(true)
+      setError('')
+      try {
+        const query = new URLSearchParams({
+          run: selectedModel,
+          height: String(sliceHeight),
+          spacing: String(spacing),
+          priority: optimizerPriority,
+        })
+        const report = await fetchJson<HvacReportData>(
+          `/api/airflow/cases/${encodeURIComponent(caseId)}/report?${query.toString()}`,
+        )
+        setReportData(report)
+        setIsReportModalOpen(true)
+      } catch (reason) {
+        setError(errorMessage(reason))
+      } finally {
+        setIsLoadingReport(false)
+      }
+    },
+    [
+      selectedModel,
+      sliceHeight,
+      spacing,
+      optimizerPriority,
+      setIsLoadingReport,
+      setReportData,
+      setIsReportModalOpen,
+    ],
+  )
   const roomWidth = details ? details.room.max[0] - details.room.min[0] : 0
   const roomDepth = details ? details.room.max[1] - details.room.min[1] : 0
 
@@ -279,7 +454,7 @@ export function AirflowTab() {
           <h2 className="font-semibold text-sm">Airflow analysis</h2>
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
-          Explore predictions for available room and vent-layout cases.
+          Explore predictions and optimize diffuser layouts across precomputed CFD cases.
         </p>
       </div>
 
@@ -294,6 +469,7 @@ export function AirflowTab() {
           </p>
         ) : (
           <>
+            {/* Case and Model Selection */}
             <label className="block space-y-1.5 text-xs font-medium">
               Room and vent layout
               <select
@@ -343,10 +519,205 @@ export function AirflowTab() {
                     {details.supply_vents_xy.length} supply · {details.return_vents_xy.length}{' '}
                     return vents
                   </p>
+                  <div className="mt-2 pt-2 border-t border-border/60 flex justify-end">
+                    <button
+                      type="button"
+                      disabled={isLoadingReport}
+                      onClick={() => openCaseReport(selectedCase)}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-sky-600 hover:text-sky-500 cursor-pointer disabled:opacity-50"
+                    >
+                      <FileText className="h-3 w-3" />
+                      {isLoadingReport ? 'Generating report…' : 'View Engineering Report'}
+                    </button>
+                  </div>
                 </>
               ) : null}
             </div>
 
+            {/* 3D Viewport Controls Card */}
+            <div className="space-y-3 rounded-md border border-border bg-card p-3 shadow-xs">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <Layers className="h-3.5 w-3.5 text-primary" />
+                  <span className="font-medium text-xs">Render slice in 3D scene</span>
+                </div>
+                <input
+                  checked={show3DSlice}
+                  className="h-4 w-4 rounded border-input accent-primary"
+                  onChange={(e) => setShow3DSlice(e.target.checked)}
+                  type="checkbox"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-muted-foreground text-xs">
+                  <span className="flex items-center gap-1">
+                    <Sliders className="h-3 w-3" />
+                    3D Plane Opacity
+                  </span>
+                  <span>{Math.round(sliceOpacity * 100)}%</span>
+                </div>
+                <input
+                  className="w-full accent-primary"
+                  disabled={!show3DSlice}
+                  max="1.0"
+                  min="0.2"
+                  onChange={(e) => setSliceOpacity(Number(e.target.value))}
+                  step="0.05"
+                  type="range"
+                  value={sliceOpacity}
+                />
+              </div>
+            </div>
+
+            {/* HVAC Layout Optimizer Card */}
+            <div className="space-y-3 rounded-md border border-sky-500/30 bg-sky-950/10 p-3 shadow-xs">
+              <div className="flex items-center gap-1.5 text-sky-600">
+                <Sparkles className="h-4 w-4" />
+                <h3 className="font-semibold text-xs">
+                  Automated Layout Optimizer (LGO Neural Operator)
+                </h3>
+              </div>
+              <p className="text-[11px] text-muted-foreground leading-snug">
+                Scores ceiling diffuser configurations for ASHRAE 55 occupied-plane comfort:
+                air-sweep coverage, dead zones, and draft risks.
+              </p>
+
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-medium text-muted-foreground">
+                  Optimization Priority
+                  <select
+                    className="mt-1 w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-normal"
+                    onChange={(e) =>
+                      setOptimizerPriority(
+                        e.target.value as 'balanced' | 'minimize_draft' | 'eliminate_dead_zones',
+                      )
+                    }
+                    value={optimizerPriority}
+                  >
+                    <option value="balanced">Balanced Comfort</option>
+                    <option value="minimize_draft">Minimize Cold Drafts</option>
+                    <option value="eliminate_dead_zones">Eliminate Dead Zones</option>
+                  </select>
+                </label>
+              </div>
+
+              <button
+                className="flex w-full items-center justify-center gap-2 rounded-md bg-sky-600 px-3 py-2 font-medium text-white text-xs hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={isOptimizing || !selectedModel}
+                onClick={runOptimizer}
+                type="button"
+              >
+                {isOptimizing ? (
+                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5" />
+                )}
+                {isOptimizing ? 'Analyzing candidates…' : 'Run HVAC Layout Optimizer'}
+              </button>
+
+              {rankedCandidates.length > 0 && (
+                <button
+                  type="button"
+                  disabled={isLoadingReport}
+                  onClick={() => openCaseReport(selectedCase || rankedCandidates[0]?.case || '')}
+                  className="flex w-full items-center justify-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-xs font-semibold text-sky-700 dark:text-sky-300 hover:bg-sky-500/20 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {isLoadingReport ? (
+                    <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <FileText className="h-3.5 w-3.5" />
+                  )}
+                  {isLoadingReport ? 'Compiling Report…' : 'Generate ASHRAE 55 Compliance Report'}
+                </button>
+              )}
+
+              {rankedCandidates.length > 0 && (
+                <div className="mt-3 space-y-2 border-border/60 border-t pt-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-medium text-muted-foreground">
+                      Ranked Layout Candidates
+                    </span>
+                    <button
+                      type="button"
+                      disabled={isLoadingReport}
+                      onClick={() =>
+                        openCaseReport(selectedCase || rankedCandidates[0]?.case || '')
+                      }
+                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-sky-600 hover:text-sky-500 cursor-pointer disabled:opacity-50"
+                    >
+                      <FileText className="h-3 w-3" />
+                      {isLoadingReport ? 'Loading…' : 'Full Report'}
+                    </button>
+                  </div>
+                  <div className="space-y-1.5 max-h-56 overflow-y-auto">
+                    {rankedCandidates.map((candidate, idx) => (
+                      <div
+                        className={`rounded-md border p-2 text-xs transition-colors ${
+                          selectedCase === candidate.case
+                            ? 'border-sky-500 bg-sky-500/10'
+                            : 'border-border bg-card'
+                        }`}
+                        key={candidate.case}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                                idx === 0
+                                  ? 'bg-sky-500 text-white'
+                                  : 'bg-muted text-muted-foreground'
+                              }`}
+                            >
+                              {idx === 0 ? '#1 Recommended' : `#${idx + 1}`}
+                            </span>
+                            <span className="font-medium">{candidate.case}</span>
+                          </div>
+                          <span className="font-semibold text-sky-600 dark:text-sky-400">
+                            Score: {candidate.score.toFixed(1)} / 100
+                          </span>
+                        </div>
+
+                        <div className="mt-1.5 flex flex-wrap gap-1 text-[10px] text-muted-foreground">
+                          <span className="rounded bg-muted px-1.5 py-0.5">
+                            Sweep: {(candidate.kpis.air_sweep_coverage * 100).toFixed(0)}%
+                          </span>
+                          <span className="rounded bg-muted px-1.5 py-0.5">
+                            Dead Zone: {(candidate.kpis.dead_zone_ratio * 100).toFixed(0)}%
+                          </span>
+                          <span className="rounded bg-muted px-1.5 py-0.5">
+                            Draft Risk: {(candidate.kpis.draft_risk_ratio * 100).toFixed(0)}%
+                          </span>
+                        </div>
+
+                        <div className="mt-2 flex items-center justify-end gap-1.5">
+                          <button
+                            className="rounded border border-border bg-card px-2 py-1 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground transition-colors cursor-pointer"
+                            onClick={() => openCaseReport(candidate.case)}
+                            type="button"
+                            title="View and export compliance report for this layout"
+                          >
+                            Report
+                          </button>
+                          <button
+                            className={`rounded px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
+                              selectedCase === candidate.case
+                                ? 'bg-sky-600 text-white'
+                                : 'bg-secondary text-secondary-foreground hover:bg-secondary/80'
+                            }`}
+                            onClick={() => applyCandidate(candidate)}
+                            type="button"
+                          >
+                            {selectedCase === candidate.case ? 'Active Layout' : 'Apply Layout'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Slice Query Form */}
             <form className="space-y-3" onSubmit={requestSlice}>
               <div className="grid grid-cols-2 gap-3">
                 <label className="space-y-1.5 text-xs font-medium">
@@ -357,7 +728,7 @@ export function AirflowTab() {
                     min={details?.room.min[2] ?? 0}
                     onChange={(event) => {
                       clearPrediction()
-                      setSliceHeight(event.target.value)
+                      setSliceHeight(Number(event.target.value))
                     }}
                     required
                     step="0.05"
@@ -373,7 +744,7 @@ export function AirflowTab() {
                     min="0.05"
                     onChange={(event) => {
                       clearPrediction()
-                      setSpacing(event.target.value)
+                      setSpacing(Number(event.target.value))
                     }}
                     required
                     step="0.05"
@@ -438,10 +809,11 @@ export function AirflowTab() {
         )}
 
         <p className="border-t border-border pt-3 text-[11px] leading-relaxed text-muted-foreground">
-          Predictions are limited to the backend’s precomputed room and vent layouts. This panel
-          does not analyze the edited scene or generate new HVAC layouts.
+          Predictions are powered by the LGO neural operator surrogate model across CFD room and
+          vent layouts.
         </p>
       </div>
+      <HvacReportModal />
     </div>
   )
 }

@@ -124,6 +124,15 @@ class SliceRequest(BaseModel):
     spacing: float = Field(0.1, gt=0.005, le=2.0, description="grid spacing in metres")
 
 
+
+class OptimizeRequest(BaseModel):
+    run: Optional[str] = None
+    height: float = Field(1.1, ge=0.05, le=3.15, description="horizontal plane height in metres")
+    spacing: float = Field(0.25, gt=0.05, le=1.0, description="scoring grid spacing in metres")
+    priority: Literal["balanced", "minimize_draft", "eliminate_dead_zones"] = "balanced"
+    target_supply_vents: Optional[List[List[float]]] = None
+    limit: int = Field(5, ge=1, le=20)
+
 def _fields(out, mask=None):
     res = {}
     for k, v in out.items():
@@ -201,6 +210,21 @@ async def compare(case: str, run: Optional[str] = Query(None)):
     return {"run": run, "case": case, **(await _run(engine().compare, run, case))}
 
 
+
+@app.get("/cases/{case}/report")
+async def case_report(
+    case: str,
+    run: Optional[str] = Query(None),
+    height: float = Query(1.1, ge=0.05, le=3.15, description="evaluation plane height in metres"),
+    spacing: float = Query(0.25, gt=0.05, le=1.0, description="scoring grid spacing in metres"),
+    priority: Literal["balanced", "minimize_draft", "eliminate_dead_zones"] = "balanced",
+):
+    run = run or DEFAULT_RUN
+    try:
+        return await _run(engine().generate_case_report, run, case, height, spacing, priority)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
 @app.post("/predict")
 async def predict(req: PredictRequest, format: Literal["json", "npz"] = "json"):
     run = req.run or DEFAULT_RUN
@@ -245,3 +269,9 @@ async def slice_(req: SliceRequest):
             "shape": list(shape), "axes": {k: v.round(6).tolist() for k, v in axes.items()},
             **{k: np.asarray(v, dtype=np.float64).reshape(shape).round(6).tolist()
                for k, v in out.items()}}
+
+
+@app.post("/cases/optimize")
+async def optimize(req: OptimizeRequest):
+    run = req.run or DEFAULT_RUN
+    return await _run(engine().optimize_layouts, run, req.height, req.spacing, req.priority, req.target_supply_vents, req.limit)

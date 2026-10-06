@@ -75,7 +75,7 @@ class InferenceEngine:
         self._models = {}                 # run -> (model, args)
         self._loaded = OrderedDict()      # (run, case) -> _Case, LRU order
         self._lock = threading.RLock()    # the models and their lookup caches are not thread-safe
-
+        self._kpi_cache = {}
     @staticmethod
     def _discover(root, required):
         if not root or not os.path.isdir(root):
@@ -241,3 +241,286 @@ class InferenceEngine:
                 "max_cases": self.max_cases,
                 "seed": self.seed,
             }
+
+    # ------------------------------------------------------------------ #
+    #  Comfort KPIs & Layout Optimization
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def compute_comfort_kpis(slice_dict: dict[str, np.ndarray], priority: str = "balanced") -> dict[str, float]:
+        """Compute ASHRAE 55 occupied-plane comfort KPIs and composite score."""
+        u = slice_dict.get("u")
+        v = slice_dict.get("v")
+        w = slice_dict.get("w")
+        T = slice_dict.get("T")
+        if u is None or v is None or w is None:
+            return {
+                "composite_score": 0.0,
+                "mean_velocity": 0.0,
+                "max_velocity": 0.0,
+                "dead_zone_ratio": 0.0,
+                "air_sweep_coverage": 0.0,
+                "draft_risk_ratio": 0.0,
+                "temp_uniformity": 0.0,
+            }
+        V = np.sqrt(u**2 + v**2 + w**2)
+        valid = ~np.isnan(V)
+        if not np.any(valid):
+            return {
+                "composite_score": 0.0,
+                "mean_velocity": 0.0,
+                "max_velocity": 0.0,
+                "dead_zone_ratio": 0.0,
+                "air_sweep_coverage": 0.0,
+                "draft_risk_ratio": 0.0,
+                "temp_uniformity": 0.0,
+            }
+        total_pts = int(np.count_nonzero(valid))
+        mean_vel = float(np.mean(V[valid]))
+        max_vel = float(np.max(V[valid]))
+        dead_zone_ratio = float(np.count_nonzero(V[valid] < 0.10) / total_pts)
+        air_sweep_coverage = float(np.count_nonzero((V[valid] >= 0.10) & (V[valid] <= 0.30)) / total_pts)
+        draft_risk_ratio = float(np.count_nonzero(V[valid] > 0.25) / total_pts)
+
+        if T is not None and np.any(valid):
+            t_mean = float(np.mean(T[valid]))
+            t_std = float(np.std(T[valid]))
+            temp_uniformity = float(np.clip(1.0 - (t_std / max(1e-4, t_mean)), 0.0, 1.0))
+        else:
+            temp_uniformity = 1.0
+
+        if priority == "minimize_draft":
+            w_sweep, w_dead, w_draft, w_temp = 0.25, 0.15, 0.50, 0.10
+        elif priority == "eliminate_dead_zones":
+            w_sweep, w_dead, w_draft, w_temp = 0.30, 0.50, 0.10, 0.10
+        else:
+            w_sweep, w_dead, w_draft, w_temp = 0.35, 0.25, 0.25, 0.15
+
+        composite_score = round(float(100.0 * np.clip(
+            w_sweep * air_sweep_coverage
+            + w_dead * (1.0 - dead_zone_ratio)
+            + w_draft * (1.0 - draft_risk_ratio)
+            + w_temp * temp_uniformity,
+            0.0, 1.0
+        )), 1)
+
+        return {
+            "composite_score": composite_score,
+            "mean_velocity": round(mean_vel, 3),
+            "max_velocity": round(max_vel, 3),
+            "dead_zone_ratio": round(dead_zone_ratio, 3),
+            "air_sweep_coverage": round(air_sweep_coverage, 3),
+            "draft_risk_ratio": round(draft_risk_ratio, 3),
+            "temp_uniformity": round(temp_uniformity, 3),
+        }
+
+    def optimize_layouts(self, run: str, height: float = 1.1, spacing: float = 0.25,
+                         priority: str = "balanced", target_supply_vents: list[list[float]] | None = None,
+                         limit: int = 5) -> dict:
+        from data.splits_cfd_gap import panels
+        candidates = []
+        h_key = round(height, 2)
+        s_key = round(spacing, 2)
+
+        for case in self.cases:
+            cache_key = (run, case, h_key, s_key)
+            with self._lock:
+                if cache_key in self._kpi_cache:
+                    cached_kpi = self._kpi_cache[cache_key]
+                    kpi = dict(cached_kpi)
+                    if priority == "minimize_draft":
+                        w_sweep, w_dead, w_draft, w_temp = 0.25, 0.15, 0.50, 0.10
+                    elif priority == "eliminate_dead_zones":
+                        w_sweep, w_dead, w_draft, w_temp = 0.30, 0.50, 0.10, 0.10
+                    else:
+                        w_sweep, w_dead, w_draft, w_temp = 0.35, 0.25, 0.25, 0.15
+                    kpi["composite_score"] = round(float(100.0 * np.clip(
+                        w_sweep * kpi["air_sweep_coverage"]
+                        + w_dead * (1.0 - kpi["dead_zone_ratio"])
+                        + w_draft * (1.0 - kpi["draft_risk_ratio"])
+                        + w_temp * kpi["temp_uniformity"],
+                        0.0, 1.0
+                    )), 1)
+                else:
+                    pts, _, _ = self.slice_grid("z", height, spacing)
+                    slice_dict = self.predict(run, case, pts)
+                    kpi = self.compute_comfort_kpis(slice_dict, priority=priority)
+                    self._kpi_cache[cache_key] = kpi
+
+            sup, ret = panels(self.cases[case])
+            if target_supply_vents and len(target_supply_vents) > 0 and len(sup) > 0:
+                targets = np.asarray(target_supply_vents, dtype=np.float32)
+                dists = np.linalg.norm(targets[:, None, :] - sup[None, :, :], axis=-1)
+                min_dists = np.min(dists, axis=1)
+                d = float(np.mean(min_dists))
+                final_score = round(max(0.0, kpi["composite_score"] - min(25.0, d * 5.0)), 1)
+            else:
+                final_score = kpi["composite_score"]
+
+            candidate_record = {
+                "case": case,
+                "set": os.path.basename(os.path.dirname(self.cases[case])),
+                "score": final_score,
+                "kpis": kpi,
+                "supply_vents_xy": sup.tolist(),
+                "return_vents_xy": ret.tolist(),
+            }
+            candidates.append(candidate_record)
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        top_candidates = candidates[:limit]
+
+        return {
+            "run": run,
+            "height": height,
+            "priority": priority,
+            "recommended_case": top_candidates[0]["case"] if top_candidates else None,
+            "candidates": top_candidates,
+        }
+
+    def generate_case_report(self, run: str, case: str, height: float = 1.1, spacing: float = 0.25,
+                             priority: str = "balanced") -> dict:
+        from data.splits_cfd_gap import panels
+        if case not in self.cases:
+            raise KeyError(f"Unknown case: {case}")
+
+        h_key = round(height, 2)
+        s_key = round(spacing, 2)
+        cache_key = (run, case, h_key, s_key)
+
+        with self._lock:
+            if cache_key in self._kpi_cache:
+                cached_kpi = self._kpi_cache[cache_key]
+                kpi = dict(cached_kpi)
+                if priority == "minimize_draft":
+                    w_sweep, w_dead, w_draft, w_temp = 0.25, 0.15, 0.50, 0.10
+                elif priority == "eliminate_dead_zones":
+                    w_sweep, w_dead, w_draft, w_temp = 0.30, 0.50, 0.10, 0.10
+                else:
+                    w_sweep, w_dead, w_draft, w_temp = 0.35, 0.25, 0.25, 0.15
+                kpi["composite_score"] = round(float(100.0 * np.clip(
+                    w_sweep * kpi["air_sweep_coverage"]
+                    + w_dead * (1.0 - kpi["dead_zone_ratio"])
+                    + w_draft * (1.0 - kpi["draft_risk_ratio"])
+                    + w_temp * kpi["temp_uniformity"],
+                    0.0, 1.0
+                )), 1)
+            else:
+                pts, _, _ = self.slice_grid("z", height, spacing)
+                slice_dict = self.predict(run, case, pts)
+                kpi = self.compute_comfort_kpis(slice_dict, priority=priority)
+                self._kpi_cache[cache_key] = kpi
+
+        sup, ret = panels(self.cases[case])
+
+        terminals = []
+        for i, pt in enumerate(sup):
+            terminals.append({
+                "id": f"SUP-{i + 1:02d}",
+                "type": "Supply Diffuser",
+                "x": round(float(pt[0]), 2),
+                "y": round(float(pt[1]), 2),
+                "z": 3.20,
+                "function": "Conditioned Air Supply",
+            })
+        for i, pt in enumerate(ret):
+            terminals.append({
+                "id": f"RET-{i + 1:02d}",
+                "type": "Return Grille",
+                "x": round(float(pt[0]), 2),
+                "y": round(float(pt[1]), 2),
+                "z": 3.20,
+                "function": "Return Air Extraction",
+            })
+
+        sweep_pct = round(kpi["air_sweep_coverage"] * 100.0, 1)
+        dead_pct = round(kpi["dead_zone_ratio"] * 100.0, 1)
+        draft_pct = round(kpi["draft_risk_ratio"] * 100.0, 1)
+        temp_pct = round(kpi["temp_uniformity"] * 100.0, 1)
+
+        sweep_status = "PASS" if sweep_pct >= 60.0 else ("MARGINAL" if sweep_pct >= 45.0 else "FAIL")
+        dead_status = "PASS" if dead_pct <= 20.0 else ("MARGINAL" if dead_pct <= 35.0 else "FAIL")
+        draft_status = "PASS" if draft_pct <= 15.0 else ("MARGINAL" if draft_pct <= 25.0 else "FAIL")
+        temp_status = "PASS" if temp_pct >= 90.0 else ("MARGINAL" if temp_pct >= 80.0 else "FAIL")
+
+        score = kpi["composite_score"]
+        has_fail = any(s == "FAIL" for s in (sweep_status, dead_status, draft_status, temp_status))
+        if score >= 75.0 and not has_fail:
+            overall_verdict = "COMPLIANT"
+            summary_statement = (
+                f"Airflow distribution in Case {case} satisfies ASHRAE 55-2023 thermal comfort parameters "
+                f"with an effective air-sweep coverage of {sweep_pct}% and low draft discomfort risk ({draft_pct}%)."
+            )
+        elif score >= 55.0:
+            overall_verdict = "CONDITIONALLY COMPLIANT"
+            summary_statement = (
+                f"Case {case} meets conditional comfort benchmarks (Composite Score: {score}/100). "
+                f"Stagnant dead-zone ratio is {dead_pct}% with {draft_pct}% draft risk in occupied breathing zone."
+            )
+        else:
+            overall_verdict = "NON-COMPLIANT"
+            summary_statement = (
+                f"Case {case} fails acceptable occupant comfort thresholds (Composite Score: {score}/100) "
+                f"due to elevated dead zones ({dead_pct}%) or draft concentration."
+            )
+
+        compliance_checks = [
+            {
+                "parameter": "Occupied Air-Sweep Effective Circulation (0.10 - 0.30 m/s)",
+                "standard": "ASHRAE 55-2023 §5.3.3",
+                "target": "≥ 60.0%",
+                "measured": f"{sweep_pct}%",
+                "status": sweep_status,
+            },
+            {
+                "parameter": "Stagnant Air Dead-Zone Ratio (< 0.10 m/s)",
+                "standard": "ASHRAE 55-2023 §5.3.4",
+                "target": "≤ 20.0%",
+                "measured": f"{dead_pct}%",
+                "status": dead_status,
+            },
+            {
+                "parameter": "Occupant Draft Discomfort Risk (> 0.25 m/s)",
+                "standard": "ASHRAE 55-2023 §5.4.1",
+                "target": "≤ 15.0%",
+                "measured": f"{draft_pct}%",
+                "status": draft_status,
+            },
+            {
+                "parameter": "Breathing-Plane Thermal Uniformity (1 - σ_T / T̄)",
+                "standard": "ASHRAE 55-2023 §5.2.1",
+                "target": "≥ 90.0%",
+                "measured": f"{temp_pct}%",
+                "status": temp_status,
+            },
+        ]
+
+        return {
+            "report_id": f"REP-HVAC-{case}-{int(time.time())}",
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            "case": case,
+            "dataset_set": os.path.basename(os.path.dirname(self.cases[case])),
+            "run": run,
+            "standard": "ASHRAE Standard 55-2023",
+            "evaluation_plane": {
+                "axis": "z",
+                "height_m": height,
+                "spacing_m": spacing,
+                "description": "Seated Occupant Breathing Zone",
+            },
+            "room": {
+                "length_x_m": float(ROOM_MAX[0] - ROOM_MIN[0]),
+                "width_y_m": float(ROOM_MAX[1] - ROOM_MIN[1]),
+                "height_z_m": float(ROOM_MAX[2] - ROOM_MIN[2]),
+                "floor_area_m2": round(float((ROOM_MAX[0] - ROOM_MIN[0]) * (ROOM_MAX[1] - ROOM_MIN[1])), 2),
+                "volume_m3": round(float(np.prod(ROOM_MAX - ROOM_MIN)), 2),
+            },
+            "optimization_priority": priority,
+            "composite_score": score,
+            "overall_verdict": overall_verdict,
+            "summary_statement": summary_statement,
+            "kpis": kpi,
+            "compliance_checks": compliance_checks,
+            "terminal_schedule": terminals,
+            "supply_count": len(sup),
+            "return_count": len(ret),
+        }

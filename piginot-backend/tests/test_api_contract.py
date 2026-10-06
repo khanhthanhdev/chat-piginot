@@ -9,5 +9,7 @@ def test_lgo_api_contract_is_exposed() -> None:
     assert "/cases" in paths
     assert "/predict" in paths
     assert "/slice" in paths
+    assert "/cases/optimize" in paths
+    assert "/cases/{case}/report" in paths
     assert "/api/hvac-inference" not in paths
     assert "/api/v1/hvac-inference-batch" not in paths

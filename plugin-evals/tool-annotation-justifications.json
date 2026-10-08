@@ -553,6 +553,19 @@
       }
     },
     {
+      "name": "inspect_zone_comfort",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "justifications": {
+        "readOnlyHint": "Queries and evaluates ASHRAE 55 thermal comfort compliance metrics for a room occupant zone without modifying the scene.",
+        "destructiveHint": "It is read-only and does not mutate scene or project state.",
+        "openWorldHint": "It computes metrics using the local airflow surrogate model without accessing the public internet."
+      }
+    },
+    {
       "name": "list_collections",
       "annotations": {
         "readOnlyHint": true,
@@ -722,6 +735,19 @@
       }
     },
     {
+      "name": "query_airflow_point",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "justifications": {
+        "readOnlyHint": "Queries airflow velocity and temperature prediction at a specified 3D point without mutating scene state.",
+        "destructiveHint": "It is read-only and does not delete or overwrite scene nodes or project data.",
+        "openWorldHint": "It queries the local airflow neural operator without accessing the open internet."
+      }
+    },
+    {
       "name": "rebase_floor_reference",
       "annotations": {
         "readOnlyHint": false,
@@ -810,6 +836,19 @@
         "readOnlyHint": "It searches Pascal asset catalog data available to the connected service without placing an asset or changing a scene.",
         "destructiveHint": "It does not create, update, replace, delete, load, or save Pascal scene or project state.",
         "openWorldHint": "It operates only on data supplied by or already available inside the connected Pascal service and does not access the public internet."
+      }
+    },
+    {
+      "name": "set_airflow_visualization",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "justifications": {
+        "readOnlyHint": "Updates the 3D editor airflow visualization state parameters such as slice axis and visibility.",
+        "destructiveHint": "Adjusts visualization settings without deleting or modifying scene geometry or project data.",
+        "openWorldHint": "Operates entirely within the local editor visualization state without accessing the public internet."
       }
     },
     {

@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { SceneOperations } from '../operations'
 import { registerAddColumn } from './add-column'
 import { type GeometryScriptHost, registerAddObject, registerGetSource } from './add-object'
+import { registerAirflowTools } from './airflow-tools'
 import { registerApplyPatch } from './apply-patch'
 import { registerCheckCollisions } from './check-collisions'
 import { registerConstructionTools } from './construction-tools'
@@ -74,6 +75,8 @@ export function registerTools(
   registerValidateDesign(server, operations)
   registerCheckCollisions(server, operations)
   registerTemplateTools(server, operations)
+  registerAirflowTools(server)
+
   if (operations.hasStore) {
     registerSceneLifecycleTools(server, operations)
     registerVariantTools(server, operations)

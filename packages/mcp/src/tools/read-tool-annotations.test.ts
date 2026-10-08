@@ -28,6 +28,7 @@ const TOOL_POLICIES = [
       'get_scene',
       'get_walls',
       'get_zones',
+      'inspect_zone_comfort',
       'list_levels',
       'list_scenes',
       'list_templates',
@@ -35,6 +36,7 @@ const TOOL_POLICIES = [
       'measure',
       'get_source',
       'list_collections',
+      'query_airflow_point',
       'search_assets',
       'validate_design',
       'validate_scene',
@@ -78,6 +80,7 @@ const TOOL_POLICIES = [
       'set_zone_intent',
       'set_floor_foundation',
       'set_room_floor_construction',
+      'set_airflow_visualization',
     ],
   },
   {
@@ -162,7 +165,7 @@ describe('MCP tool annotations', () => {
     try {
       const listed = await client.listTools()
       const byName = new Map(listed.tools.map((tool) => [tool.name, tool]))
-      expect(byName.size).toBe(71)
+      expect(byName.size).toBe(74)
       expect([...byName.keys()].toSorted()).toEqual(EXPECTED_TOOL_NAMES)
 
       for (const policy of TOOL_POLICIES) {

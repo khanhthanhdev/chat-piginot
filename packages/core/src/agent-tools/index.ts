@@ -1,4 +1,9 @@
 import { addObjectTool, getSourceTool } from './add-object'
+import {
+  inspectZoneComfortTool,
+  queryAirflowPointTool,
+  setAirflowVisualizationTool,
+} from './airflow'
 import { editCollectionTool, listCollectionsTool } from './collections'
 import { addColumnTool } from './columns'
 import { findByTypeTool } from './find-by-type'
@@ -14,6 +19,7 @@ import { deleteNodeTool, getNodeTool } from './nodes'
 import { addDoorTool, addWindowTool } from './wall-openings'
 
 export * from './add-object'
+export * from './airflow'
 export * from './collections'
 export * from './columns'
 export * from './find-by-type'
@@ -46,4 +52,7 @@ export const AGENT_TOOL_CONTRACTS = [
   findByTypeTool,
   editCollectionTool,
   listCollectionsTool,
+  queryAirflowPointTool,
+  inspectZoneComfortTool,
+  setAirflowVisualizationTool,
 ] as const

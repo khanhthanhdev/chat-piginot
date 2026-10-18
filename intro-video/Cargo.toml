@@ -1,0 +1,35 @@
+[package]
+name = "aerotwin-intro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+default-run = "aerotwin-intro"
+
+[dependencies]
+fframes = { path = "C:/Users/Administrator/fframes-desktop/fframes", features = ["compile-time-svgtree", "cli"] }
+fframes-components = { git = "https://github.com/Bilaal0x/fframes-components", rev = "6730690d3d61123214b2bc01b8b1fbc357d51472", default-features = false, features = ["cinematic-text-swap", "prompt-zoom", "check-cycle"] }
+
+[target.'cfg(not(windows))'.dependencies]
+fframes = { path = "C:/Users/Administrator/fframes-desktop/fframes", features = ["h264", "libav-agree-gpl"] }
+
+# fframes-components asks for fframes from crates.io; point it at the same local fframes so both
+# crates share one `Svgr` type.
+[patch.crates-io]
+fframes = { path = "C:/Users/Administrator/fframes-desktop/fframes" }
+
+[lib]
+name = "aerotwin_intro"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "aerotwin-intro"
+path = "src/main.rs"
+
+[workspace]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

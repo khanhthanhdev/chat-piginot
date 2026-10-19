@@ -6,16 +6,20 @@ publish = false
 default-run = "aerotwin-intro"
 
 [dependencies]
-fframes = { path = "C:/Users/Administrator/fframes-desktop/fframes", features = ["compile-time-svgtree", "cli"] }
+fframes = { git = "https://github.com/dmtrKovalenko/fframes", rev = "28356c5b5473fc3281167e3b2baff12a0d204a67", features = ["compile-time-svgtree", "cli"] }
+fframes_skia_renderer = { git = "https://github.com/dmtrKovalenko/fframes", rev = "28356c5b5473fc3281167e3b2baff12a0d204a67", features = ["vulkan"] }
+fframes_native_player = { git = "https://github.com/dmtrKovalenko/fframes", rev = "28356c5b5473fc3281167e3b2baff12a0d204a67", default-features = false, features = ["vulkan", "audio"] }
 fframes-components = { git = "https://github.com/Bilaal0x/fframes-components", rev = "6730690d3d61123214b2bc01b8b1fbc357d51472", default-features = false, features = ["cinematic-text-swap", "prompt-zoom", "check-cycle"] }
 
-[target.'cfg(not(windows))'.dependencies]
-fframes = { path = "C:/Users/Administrator/fframes-desktop/fframes", features = ["h264", "libav-agree-gpl"] }
+# H.264 on macOS. Linux uses ffmpeg's built-in MPEG-4 encoder: the prebuilt ffmpeg links x264
+# ABI 163, which Ubuntu 24.04's libx264 (164) does not provide.
+[target.'cfg(target_os = "macos")'.dependencies]
+fframes = { git = "https://github.com/dmtrKovalenko/fframes", rev = "28356c5b5473fc3281167e3b2baff12a0d204a67", features = ["h264", "libav-agree-gpl"] }
 
-# fframes-components asks for fframes from crates.io; point it at the same local fframes so both
+# fframes-components asks for fframes from crates.io; point it at the same fframes revision so both
 # crates share one `Svgr` type.
 [patch.crates-io]
-fframes = { path = "C:/Users/Administrator/fframes-desktop/fframes" }
+fframes = { git = "https://github.com/dmtrKovalenko/fframes", rev = "28356c5b5473fc3281167e3b2baff12a0d204a67" }
 
 [lib]
 name = "aerotwin_intro"
